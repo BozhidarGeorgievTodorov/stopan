@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+_metadata.json
+_data_chunks/
+*.txt
+*.md

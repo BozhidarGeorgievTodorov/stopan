@@ -1,27 +1,31 @@
-from storage import StorageSystem
+from database import MetadataDB
 import sys
+
 
 def restore(filename, version, output_path):
     """
     Cliente de recuperación.
-    Reconstruye un archivo original solicitando los bloques al almacén local
-    en el orden especificado por la receta de la versión.
+    Reconstruye un archivo usando la receta de bloques de una versión concreta.
     """
-    storage = StorageSystem()
+    storage = MetadataDB()
     print(f"Restoring {filename} ({version}) to {output_path}")
-    
+
     try:
         recipe = storage.get_recipe(filename, version)
-        
+
         with open(output_path, 'wb') as f:
-            for c_hash in recipe:
-                data = storage.get_chunk(c_hash)
+            for chunk_hash in recipe:
+                data = storage.get_chunk(chunk_hash)
                 f.write(data)
-                
+
         print("Restore completed successfully")
-        
+
     except Exception as e:
         print(f"Error restoring file: {e}")
+
+    finally:
+        storage.close()
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 3:

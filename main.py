@@ -4,45 +4,61 @@ import sys
 from chunker import FileChunker
 from database import MetadataDB
 from repository import CASRepository
+from scanner import TreeWalker
 
 
-def backup(file_path):
-    """Crea un nuevo backup para un archivo."""
-    if not os.path.isfile(file_path):
-        print(f"File not found: {file_path}")
+def backup(source_path):
+    """Crea un snapshot de una carpeta."""
+    if not os.path.isdir(source_path):
+        print(f"Directory not found: {source_path}")
         return
 
     repo = CASRepository()
     db = MetadataDB()
-    chunker = FileChunker()
+    chunker = FileChunker(
+        avg_chunk_size=65536,
+        min_chunk_size=16384,
+        max_chunk_size=262144,
+    )
 
-    print(f"Starting backup for: {file_path}")
+    print(f"Starting backup for: {source_path}")
 
     try:
-        stat_info = os.stat(file_path)
-        version_id, version_number = db.create_version(file_path, stat_info)
+        root_path = os.path.abspath(source_path)
+        snapshot_id = db.create_snapshot(root_path)
+        walker = TreeWalker(root_path)
 
+        total_files = 0
+        total_size = 0
         chunks_new = 0
         chunks_existing = 0
-        total_size = 0
 
-        with open(file_path, 'rb') as f:
-            for order, (chunk_hash, chunk_data) in enumerate(chunker.chunk_stream(f)):
-                is_new = repo.put(chunk_hash, chunk_data)
-                if is_new:
-                    chunks_new += 1
-                else:
-                    chunks_existing += 1
+        for rel_path, full_path, stat_info, item_type in walker.walk():
+            item_id = db.add_item(snapshot_id, rel_path, stat_info, item_type)
 
-                chunk_size = len(chunk_data)
-                total_size += chunk_size
-                db.add_chunk_to_version(version_id, order, chunk_hash, chunk_size)
+            if item_type != "file":
+                continue
 
+            with open(full_path, 'rb') as f:
+                for order, (chunk_hash, chunk_data) in enumerate(chunker.chunk_stream(f)):
+                    is_new = repo.put(chunk_hash, chunk_data)
+                    if is_new:
+                        chunks_new += 1
+                    else:
+                        chunks_existing += 1
+
+                    db.add_chunk_to_item(item_id, order, chunk_hash, len(chunk_data))
+
+            total_files += 1
+            total_size += stat_info.st_size
+
+        db.finish_snapshot(snapshot_id, total_size, total_files)
         db.commit()
 
-        print(f"Backup completed: Version {version_number}")
-        print(f"Stats: {chunks_new} blocks stored, {chunks_existing} reused.")
+        print(f"Backup completed: Snapshot {snapshot_id}")
+        print(f"Files: {total_files}")
         print(f"Size: {total_size} bytes")
+        print(f"Stats: {chunks_new} blocks stored, {chunks_existing} reused.")
 
     except Exception as e:
         db.rollback()
@@ -52,43 +68,83 @@ def backup(file_path):
         db.close()
 
 
-def restore(filename, version, output_path):
-    """Reconstruye una versión de un archivo."""
+def restore(snapshot_id, output_dir):
+    """Reconstruye un snapshot dentro de una carpeta de destino."""
     repo = CASRepository()
     db = MetadataDB()
 
-    print(f"Restoring {filename} ({version}) to {output_path}")
+    print(f"Restoring snapshot {snapshot_id} to {output_dir}")
 
     try:
-        metadata, recipe = db.get_version(filename, version)
-        if metadata is None:
-            print(f"Version {version} of {filename} not found.")
+        items = db.get_snapshot_items(snapshot_id)
+        if not items:
+            print(f"Snapshot {snapshot_id} not found.")
             return
 
-        with open(output_path, 'wb') as f:
-            for chunk_hash in recipe:
-                data = repo.get(chunk_hash)
-                f.write(data)
+        output_root = os.path.abspath(output_dir)
+        os.makedirs(output_root, exist_ok=True)
+        directories = []
 
-        if metadata['mtime'] is not None:
-            os.utime(output_path, (metadata['mtime'], metadata['mtime']))
+        for item in items:
+            target_path = _safe_target_path(output_root, item['path'])
+            if target_path is None:
+                print(f"Skipping unsafe path: {item['path']}")
+                continue
 
-        if metadata['mode'] is not None:
-            os.chmod(output_path, metadata['mode'])
+            if item['item_type'] == 'dir':
+                os.makedirs(target_path, exist_ok=True)
+                directories.append((target_path, item))
+                continue
+
+            if item['item_type'] == 'file':
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                chunks = db.get_item_chunks(item['id'])
+
+                with open(target_path, 'wb') as f:
+                    for chunk_hash in chunks:
+                        f.write(repo.get(chunk_hash))
+
+                _restore_file_metadata(target_path, item)
+                print(f"Restored: {item['path']}")
+
+        directories.sort(key=lambda pair: len(pair[0]), reverse=True)
+        for dir_path, item in directories:
+            _restore_file_metadata(dir_path, item)
 
         print("Restore completed successfully")
 
     except Exception as e:
-        print(f"Error restoring file: {e}")
+        print(f"Error restoring snapshot: {e}")
 
     finally:
         db.close()
 
 
+def _safe_target_path(output_root, rel_path):
+    if rel_path == ".":
+        return output_root
+
+    normalized_path = os.path.normpath(rel_path)
+    target_path = os.path.abspath(os.path.join(output_root, normalized_path))
+
+    if os.path.commonpath([output_root, target_path]) != output_root:
+        return None
+
+    return target_path
+
+
+def _restore_file_metadata(path, item):
+    if item.get('mtime') is not None:
+        os.utime(path, (item['mtime'], item['mtime']))
+
+    if item.get('mode') is not None:
+        os.chmod(path, item['mode'])
+
+
 def print_usage():
     print("Usage:")
-    print("  python main.py backup <file_path>")
-    print("  python main.py restore <original_file> <version> <output_file>")
+    print("  python main.py backup <source_dir>")
+    print("  python main.py restore <snapshot_id> <output_dir>")
 
 
 if __name__ == "__main__":
@@ -100,8 +156,8 @@ if __name__ == "__main__":
 
     if command == "backup" and len(sys.argv) == 3:
         backup(sys.argv[2])
-    elif command == "restore" and len(sys.argv) == 5:
-        restore(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif command == "restore" and len(sys.argv) == 4:
+        restore(int(sys.argv[2]), sys.argv[3])
     else:
         print_usage()
         sys.exit(1)

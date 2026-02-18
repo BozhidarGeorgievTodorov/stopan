@@ -5,7 +5,7 @@ DB_FILE = "_metadata.db"
 
 class MetadataDB:
     """
-    Guarda la información lógica de archivos, versiones y recetas de bloques.
+    Guarda snapshots de directorios, sus elementos y las recetas de bloques.
     """
 
     def __init__(self, db_file=DB_FILE):
@@ -18,33 +18,37 @@ class MetadataDB:
         cursor = self.conn.cursor()
 
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS files (
+            CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT UNIQUE NOT NULL,
+                root_path TEXT NOT NULL,
+                total_size INTEGER NOT NULL DEFAULT 0,
+                total_files INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS versions (
+            CREATE TABLE IF NOT EXISTS snapshot_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL,
-                version_number INTEGER NOT NULL,
-                total_size INTEGER NOT NULL,
+                snapshot_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
                 mode INTEGER,
                 mtime REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(file_id) REFERENCES files(id)
+                uid INTEGER,
+                gid INTEGER,
+                FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)
             )
         ''')
 
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS file_chunks (
-                version_id INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS item_chunks (
+                item_id INTEGER NOT NULL,
                 chunk_order INTEGER NOT NULL,
                 chunk_hash TEXT NOT NULL,
                 chunk_size INTEGER NOT NULL,
-                FOREIGN KEY(version_id) REFERENCES versions(id)
+                FOREIGN KEY(item_id) REFERENCES snapshot_items(id)
             )
         ''')
 
@@ -58,32 +62,51 @@ class MetadataDB:
 
         self.conn.commit()
 
-    def create_version(self, filename, stat_info):
-        """Crea una versión nueva y guarda metadatos básicos del archivo."""
-        file_id = self._get_or_create_file(filename)
-        next_version = self._next_version_number(file_id)
-
+    def create_snapshot(self, root_path):
+        """Crea un snapshot nuevo para una carpeta raíz."""
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO versions (file_id, version_number, total_size, mode, mtime)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO snapshots (root_path)
+            VALUES (?)
+        ''', (root_path,))
+        return cursor.lastrowid
+
+    def finish_snapshot(self, snapshot_id, total_size, total_files):
+        """Actualiza el resumen de un snapshot al terminar el backup."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE snapshots
+            SET total_size = ?, total_files = ?
+            WHERE id = ?
+        ''', (total_size, total_files, snapshot_id))
+
+    def add_item(self, snapshot_id, rel_path, stat_info, item_type):
+        """Registra un archivo o directorio dentro de un snapshot."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO snapshot_items (
+                snapshot_id, path, item_type, size, mode, mtime, uid, gid
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            file_id,
-            next_version,
+            snapshot_id,
+            rel_path,
+            item_type,
             stat_info.st_size,
             stat_info.st_mode,
             stat_info.st_mtime,
+            getattr(stat_info, 'st_uid', None),
+            getattr(stat_info, 'st_gid', None),
         ))
+        return cursor.lastrowid
 
-        return cursor.lastrowid, str(next_version)
-
-    def add_chunk_to_version(self, version_id, order, chunk_hash, chunk_size):
-        """Añade un bloque a la receta de una versión."""
+    def add_chunk_to_item(self, item_id, order, chunk_hash, chunk_size):
+        """Añade un bloque a la receta de un archivo del snapshot."""
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO file_chunks (version_id, chunk_order, chunk_hash, chunk_size)
+            INSERT INTO item_chunks (item_id, chunk_order, chunk_hash, chunk_size)
             VALUES (?, ?, ?, ?)
-        ''', (version_id, order, chunk_hash, chunk_size))
+        ''', (item_id, order, chunk_hash, chunk_size))
 
         cursor.execute('''
             INSERT INTO chunks (hash, size, ref_count)
@@ -91,36 +114,27 @@ class MetadataDB:
             ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
         ''', (chunk_hash, chunk_size))
 
-    def get_version(self, filename, version):
-        """Devuelve los metadatos y la receta de una versión concreta."""
+    def get_snapshot_items(self, snapshot_id):
+        """Devuelve los elementos de un snapshot en orden de ruta."""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT v.*
-            FROM versions v
-            JOIN files f ON v.file_id = f.id
-            WHERE f.path = ? AND v.version_number = ?
-        ''', (filename, int(version)))
+            SELECT *
+            FROM snapshot_items
+            WHERE snapshot_id = ?
+            ORDER BY path ASC
+        ''', (snapshot_id,))
+        return [dict(row) for row in cursor.fetchall()]
 
-        metadata = cursor.fetchone()
-        if metadata is None:
-            return None, []
-
+    def get_item_chunks(self, item_id):
+        """Devuelve la receta de hashes de un archivo del snapshot."""
+        cursor = self.conn.cursor()
         cursor.execute('''
             SELECT chunk_hash
-            FROM file_chunks
-            WHERE version_id = ?
+            FROM item_chunks
+            WHERE item_id = ?
             ORDER BY chunk_order ASC
-        ''', (metadata['id'],))
-
-        recipe = [row['chunk_hash'] for row in cursor.fetchall()]
-        return metadata, recipe
-
-    def get_recipe(self, filename, version):
-        """Devuelve solo la receta de hashes de una versión."""
-        metadata, recipe = self.get_version(filename, version)
-        if metadata is None:
-            raise ValueError(f"Version {version} of {filename} not found.")
-        return recipe
+        ''', (item_id,))
+        return [row['chunk_hash'] for row in cursor.fetchall()]
 
     def commit(self):
         self.conn.commit()
@@ -130,24 +144,3 @@ class MetadataDB:
 
     def close(self):
         self.conn.close()
-
-    def _get_or_create_file(self, filename):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id FROM files WHERE path = ?", (filename,))
-        row = cursor.fetchone()
-
-        if row:
-            return row['id']
-
-        cursor.execute("INSERT INTO files (path) VALUES (?)", (filename,))
-        return cursor.lastrowid
-
-    def _next_version_number(self, file_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT MAX(version_number) AS last_version
-            FROM versions
-            WHERE file_id = ?
-        ''', (file_id,))
-        row = cursor.fetchone()
-        return (row['last_version'] or 0) + 1

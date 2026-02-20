@@ -1,10 +1,15 @@
 import os
 import sys
+import time
 
 from chunker import FileChunker
 from database import MetadataDB
 from repository import CASRepository
 from scanner import TreeWalker
+
+AVG_CHUNK_SIZE = 1024 * 1024
+MIN_CHUNK_SIZE = 512 * 1024
+MAX_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 def backup(source_path):
@@ -16,12 +21,13 @@ def backup(source_path):
     repo = CASRepository()
     db = MetadataDB()
     chunker = FileChunker(
-        avg_chunk_size=65536,
-        min_chunk_size=16384,
-        max_chunk_size=262144,
+        avg_chunk_size=AVG_CHUNK_SIZE,
+        min_chunk_size=MIN_CHUNK_SIZE,
+        max_chunk_size=MAX_CHUNK_SIZE,
     )
 
     print(f"Starting backup for: {source_path}")
+    start_time = time.perf_counter()
 
     try:
         root_path = os.path.abspath(source_path)
@@ -55,9 +61,14 @@ def backup(source_path):
         db.finish_snapshot(snapshot_id, total_size, total_files)
         db.commit()
 
+        elapsed = time.perf_counter() - start_time
+        speed = _format_speed(total_size, elapsed)
+
         print(f"Backup completed: Snapshot {snapshot_id}")
         print(f"Files: {total_files}")
         print(f"Size: {total_size} bytes")
+        print(f"Time: {elapsed:.2f} seconds")
+        print(f"Speed: {speed}")
         print(f"Stats: {chunks_new} blocks stored, {chunks_existing} reused.")
 
     except Exception as e:
@@ -139,6 +150,14 @@ def _restore_file_metadata(path, item):
 
     if item.get('mode') is not None:
         os.chmod(path, item['mode'])
+
+
+def _format_speed(total_size, elapsed):
+    if elapsed <= 0:
+        return "n/a"
+
+    mb_per_second = total_size / (1024 * 1024) / elapsed
+    return f"{mb_per_second:.2f} MB/s"
 
 
 def print_usage():

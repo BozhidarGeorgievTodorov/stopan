@@ -1,22 +1,25 @@
 import hashlib
 import os
 
-from rabin import RabinKarpRollingHash
-
-READ_SIZE = 4096
+try:
+    import fast_rabin
+except ImportError as exc:
+    raise ImportError(
+        "fast_rabin is required. Compile it with: python setup.py build_ext --inplace"
+    ) from exc
 
 
 class FileChunker:
     """
     Divide archivos en bloques de tamaño variable usando Content-Defined Chunking.
+    La búsqueda de puntos de corte se delega en la extensión nativa fast_rabin.
     """
 
-    def __init__(self, avg_chunk_size=1024, min_chunk_size=512, max_chunk_size=2048):
+    def __init__(self, avg_chunk_size=4096, min_chunk_size=None, max_chunk_size=None):
         self.avg_chunk_size = avg_chunk_size
-        self.min_chunk_size = min_chunk_size
-        self.max_chunk_size = max_chunk_size
+        self.min_chunk_size = min_chunk_size or avg_chunk_size // 4
+        self.max_chunk_size = max_chunk_size or avg_chunk_size * 4
         self.mask = avg_chunk_size - 1
-        self.window_size = 48
 
     def chunk_file(self, file_path):
         """Lee un archivo y genera pares (hash, datos) para cada bloque."""
@@ -28,28 +31,22 @@ class FileChunker:
 
     def chunk_stream(self, file_stream):
         """Genera bloques desde un stream binario."""
-        rolling_hash = RabinKarpRollingHash(window_size=self.window_size)
-        buffer = bytearray()
+        data = file_stream.read()
+        if not data:
+            return
 
-        while True:
-            data = file_stream.read(READ_SIZE)
-            if not data:
-                break
+        boundaries = fast_rabin.get_chunk_boundaries(
+            data,
+            self.mask,
+            self.min_chunk_size,
+            self.max_chunk_size,
+        )
 
-            for byte in data:
-                buffer.append(byte)
-                current_len = len(buffer)
-                hash_value = rolling_hash.update(byte)
-
-                if current_len < self.min_chunk_size:
-                    continue
-
-                if (hash_value & self.mask) == 0 or current_len >= self.max_chunk_size:
-                    yield self._create_chunk(buffer)
-                    buffer = bytearray()
-
-        if buffer:
-            yield self._create_chunk(buffer)
+        start = 0
+        for end in boundaries:
+            chunk_data = data[start:end]
+            yield self._create_chunk(chunk_data)
+            start = end
 
     def _create_chunk(self, buffer_data):
         """Calcula el SHA-256 del bloque finalizado y devuelve ambos."""

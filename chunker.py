@@ -44,11 +44,14 @@ class FileChunker:
                 self.max_chunk_size,
             )
 
-            start = 0
-            for end in boundaries:
-                chunk_data = mapped_file[start:end]
-                yield self._create_chunk(chunk_data)
-                start = end
+            try:
+                start = 0
+                for end in boundaries:
+                    chunk_data = mapped_file[start:end]
+                    yield self._create_chunk(chunk_data)
+                    start = end
+            finally:
+                del boundaries
 
     def _create_chunk(self, buffer_data):
         """Calcula el SHA-256 del bloque finalizado y devuelve ambos."""

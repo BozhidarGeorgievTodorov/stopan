@@ -63,6 +63,16 @@ class MetadataDB:
             )
         ''')
 
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot_path
+            ON snapshot_items(snapshot_id, path)
+        ''')
+
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_item_chunks_item_order
+            ON item_chunks(item_id, chunk_order)
+        ''')
+
         self.conn.commit()
 
     def create_snapshot(self, root_path):

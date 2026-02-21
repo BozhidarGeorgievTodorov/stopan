@@ -3,7 +3,6 @@
 #include <stdint.h>
 
 static uint64_t gear_table[256];
-static int table_ready = 0;
 
 static void init_tables(void) {
     uint64_t value = 0x123456789abcdef0ULL;
@@ -14,13 +13,95 @@ static void init_tables(void) {
         value ^= value << 17;
         gear_table[i] = value;
     }
-
-    table_ready = 1;
 }
+
+typedef struct {
+    PyObject_HEAD
+    Py_buffer view;
+    unsigned long long mask;
+    Py_ssize_t min_size;
+    Py_ssize_t max_size;
+    Py_ssize_t current_pos;
+    Py_ssize_t last_split;
+    uint64_t fingerprint;
+    int buffer_active;
+} ChunkIterator;
+
+static void ChunkIterator_dealloc(ChunkIterator *self) {
+    if (self->buffer_active) {
+        PyBuffer_Release(&self->view);
+        self->buffer_active = 0;
+    }
+
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *ChunkIterator_iter(PyObject *self) {
+    Py_INCREF(self);
+    return self;
+}
+
+static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
+    ChunkIterator *self = (ChunkIterator *)self_obj;
+    const uint8_t *data = (const uint8_t *)self->view.buf;
+    Py_ssize_t data_len = self->view.len;
+
+    if (self->last_split >= data_len) {
+        return NULL;
+    }
+
+    Py_ssize_t remaining = data_len - self->last_split;
+    if (remaining <= self->min_size) {
+        self->last_split = data_len;
+        self->current_pos = data_len;
+        return PyLong_FromSsize_t(data_len);
+    }
+
+    self->fingerprint = 0;
+    self->current_pos = self->last_split;
+
+    Py_ssize_t first_check = self->last_split + self->min_size - 1;
+    Py_ssize_t max_split = self->last_split + self->max_size;
+
+    if (max_split > data_len) {
+        max_split = data_len;
+    }
+
+    while (self->current_pos < first_check) {
+        self->fingerprint = (self->fingerprint << 1) + gear_table[data[self->current_pos]];
+        self->current_pos++;
+    }
+
+    while (self->current_pos < max_split) {
+        self->fingerprint = (self->fingerprint << 1) + gear_table[data[self->current_pos]];
+
+        if ((self->fingerprint & self->mask) == 0) {
+            Py_ssize_t split_point = self->current_pos + 1;
+            self->last_split = split_point;
+            self->current_pos = split_point;
+            return PyLong_FromSsize_t(split_point);
+        }
+
+        self->current_pos++;
+    }
+
+    self->last_split = max_split;
+    self->current_pos = max_split;
+    return PyLong_FromSsize_t(max_split);
+}
+
+static PyTypeObject ChunkIteratorType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "fast_rabin.ChunkIterator",
+    .tp_basicsize = sizeof(ChunkIterator),
+    .tp_dealloc = (destructor)ChunkIterator_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_iter = ChunkIterator_iter,
+    .tp_iternext = ChunkIterator_iternext,
+};
 
 static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
     PyObject *buffer_obj = NULL;
-    Py_buffer view;
     unsigned long long mask;
     Py_ssize_t min_size;
     Py_ssize_t max_size;
@@ -34,71 +115,31 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (PyObject_GetBuffer(buffer_obj, &view, PyBUF_CONTIG_RO) != 0) {
+    ChunkIterator *iterator = PyObject_New(ChunkIterator, &ChunkIteratorType);
+    if (iterator == NULL) {
         return NULL;
     }
 
-    const uint8_t *data = (const uint8_t *)view.buf;
-    Py_ssize_t data_len = view.len;
+    iterator->buffer_active = 0;
 
-    PyObject *boundaries = PyList_New(0);
-    if (boundaries == NULL) {
-        PyBuffer_Release(&view);
+    if (PyObject_GetBuffer(buffer_obj, &iterator->view, PyBUF_CONTIG_RO) != 0) {
+        Py_DECREF(iterator);
         return NULL;
     }
 
-    if (data_len == 0) {
-        PyBuffer_Release(&view);
-        return boundaries;
-    }
+    iterator->mask = mask;
+    iterator->min_size = min_size;
+    iterator->max_size = max_size;
+    iterator->current_pos = 0;
+    iterator->last_split = 0;
+    iterator->fingerprint = 0;
+    iterator->buffer_active = 1;
 
-    if (!table_ready) {
-        init_tables();
-    }
-
-    uint64_t fingerprint = 0;
-    Py_ssize_t last_split = 0;
-
-    for (Py_ssize_t i = 0; i < data_len; i++) {
-        fingerprint = (fingerprint << 1) + gear_table[data[i]];
-        Py_ssize_t current_size = i - last_split + 1;
-
-        if (current_size < min_size) {
-            continue;
-        }
-
-        if (((fingerprint & mask) == 0) || current_size >= max_size) {
-            PyObject *boundary = PyLong_FromSsize_t(i + 1);
-            if (boundary == NULL || PyList_Append(boundaries, boundary) < 0) {
-                Py_XDECREF(boundary);
-                Py_DECREF(boundaries);
-                PyBuffer_Release(&view);
-                return NULL;
-            }
-
-            Py_DECREF(boundary);
-            last_split = i + 1;
-            fingerprint = 0;
-        }
-    }
-
-    if (last_split < data_len) {
-        PyObject *boundary = PyLong_FromSsize_t(data_len);
-        if (boundary == NULL || PyList_Append(boundaries, boundary) < 0) {
-            Py_XDECREF(boundary);
-            Py_DECREF(boundaries);
-            PyBuffer_Release(&view);
-            return NULL;
-        }
-        Py_DECREF(boundary);
-    }
-
-    PyBuffer_Release(&view);
-    return boundaries;
+    return (PyObject *)iterator;
 }
 
 static PyMethodDef FastRabinMethods[] = {
-    {"get_chunk_boundaries", get_chunk_boundaries, METH_VARARGS, "Calculate CDC chunk boundaries."},
+    {"get_chunk_boundaries", get_chunk_boundaries, METH_VARARGS, "Return an iterator with CDC chunk boundaries."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -112,5 +153,22 @@ static struct PyModuleDef fast_rabin_module = {
 
 PyMODINIT_FUNC PyInit_fast_rabin(void) {
     init_tables();
-    return PyModule_Create(&fast_rabin_module);
+
+    if (PyType_Ready(&ChunkIteratorType) < 0) {
+        return NULL;
+    }
+
+    PyObject *module = PyModule_Create(&fast_rabin_module);
+    if (module == NULL) {
+        return NULL;
+    }
+
+    Py_INCREF(&ChunkIteratorType);
+    if (PyModule_AddObject(module, "ChunkIterator", (PyObject *)&ChunkIteratorType) < 0) {
+        Py_DECREF(&ChunkIteratorType);
+        Py_DECREF(module);
+        return NULL;
+    }
+
+    return module;
 }

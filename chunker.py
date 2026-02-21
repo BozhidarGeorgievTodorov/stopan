@@ -1,4 +1,5 @@
 import hashlib
+import mmap
 import os
 
 try:
@@ -31,22 +32,23 @@ class FileChunker:
 
     def chunk_stream(self, file_stream):
         """Genera bloques desde un stream binario."""
-        data = file_stream.read()
-        if not data:
+        file_size = os.fstat(file_stream.fileno()).st_size
+        if file_size == 0:
             return
 
-        boundaries = fast_rabin.get_chunk_boundaries(
-            data,
-            self.mask,
-            self.min_chunk_size,
-            self.max_chunk_size,
-        )
+        with mmap.mmap(file_stream.fileno(), length=0, access=mmap.ACCESS_READ) as mapped_file:
+            boundaries = fast_rabin.get_chunk_boundaries(
+                mapped_file,
+                self.mask,
+                self.min_chunk_size,
+                self.max_chunk_size,
+            )
 
-        start = 0
-        for end in boundaries:
-            chunk_data = data[start:end]
-            yield self._create_chunk(chunk_data)
-            start = end
+            start = 0
+            for end in boundaries:
+                chunk_data = mapped_file[start:end]
+                yield self._create_chunk(chunk_data)
+                start = end
 
     def _create_chunk(self, buffer_data):
         """Calcula el SHA-256 del bloque finalizado y devuelve ambos."""

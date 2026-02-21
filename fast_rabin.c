@@ -19,22 +19,36 @@ static void init_tables(void) {
 }
 
 static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
-    const uint8_t *data;
-    Py_ssize_t data_len;
+    PyObject *buffer_obj = NULL;
+    Py_buffer view;
     unsigned long long mask;
     Py_ssize_t min_size;
     Py_ssize_t max_size;
 
-    if (!PyArg_ParseTuple(args, "y#Knn", &data, &data_len, &mask, &min_size, &max_size)) {
+    if (!PyArg_ParseTuple(args, "OKnn", &buffer_obj, &mask, &min_size, &max_size)) {
         return NULL;
     }
 
+    if (min_size <= 0 || max_size < min_size) {
+        PyErr_SetString(PyExc_ValueError, "Invalid chunk size limits.");
+        return NULL;
+    }
+
+    if (PyObject_GetBuffer(buffer_obj, &view, PyBUF_CONTIG_RO) != 0) {
+        return NULL;
+    }
+
+    const uint8_t *data = (const uint8_t *)view.buf;
+    Py_ssize_t data_len = view.len;
+
     PyObject *boundaries = PyList_New(0);
     if (boundaries == NULL) {
+        PyBuffer_Release(&view);
         return NULL;
     }
 
     if (data_len == 0) {
+        PyBuffer_Release(&view);
         return boundaries;
     }
 
@@ -58,6 +72,7 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
             if (boundary == NULL || PyList_Append(boundaries, boundary) < 0) {
                 Py_XDECREF(boundary);
                 Py_DECREF(boundaries);
+                PyBuffer_Release(&view);
                 return NULL;
             }
 
@@ -72,11 +87,13 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
         if (boundary == NULL || PyList_Append(boundaries, boundary) < 0) {
             Py_XDECREF(boundary);
             Py_DECREF(boundaries);
+            PyBuffer_Release(&view);
             return NULL;
         }
         Py_DECREF(boundary);
     }
 
+    PyBuffer_Release(&view);
     return boundaries;
 }
 

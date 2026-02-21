@@ -1,4 +1,5 @@
 import sqlite3
+from collections import defaultdict
 
 DB_FILE = "_metadata.db"
 
@@ -12,6 +13,8 @@ class MetadataDB:
         self.db_file = db_file
         self.conn = sqlite3.connect(self.db_file)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
         self._init_db()
 
     def _init_db(self):
@@ -102,17 +105,31 @@ class MetadataDB:
 
     def add_chunk_to_item(self, item_id, order, chunk_hash, chunk_size):
         """Añade un bloque a la receta de un archivo del snapshot."""
-        cursor = self.conn.cursor()
-        cursor.execute('''
+        self.add_chunks_batch([(item_id, order, chunk_hash, chunk_size)])
+
+    def add_chunks_batch(self, chunks):
+        """Añade en bloque la receta de chunks de un archivo."""
+        if not chunks:
+            return
+
+        self.conn.executemany('''
             INSERT INTO item_chunks (item_id, chunk_order, chunk_hash, chunk_size)
             VALUES (?, ?, ?, ?)
-        ''', (item_id, order, chunk_hash, chunk_size))
+        ''', chunks)
 
-        cursor.execute('''
+        ref_counts = defaultdict(lambda: [0, 0])
+        for _, _, chunk_hash, chunk_size in chunks:
+            ref_counts[chunk_hash][0] = chunk_size
+            ref_counts[chunk_hash][1] += 1
+
+        self.conn.executemany('''
             INSERT INTO chunks (hash, size, ref_count)
-            VALUES (?, ?, 1)
-            ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
-        ''', (chunk_hash, chunk_size))
+            VALUES (?, ?, ?)
+            ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + excluded.ref_count
+        ''', (
+            (chunk_hash, chunk_size, ref_count)
+            for chunk_hash, (chunk_size, ref_count) in ref_counts.items()
+        ))
 
     def get_snapshot_items(self, snapshot_id):
         """Devuelve los elementos de un snapshot en orden de ruta."""

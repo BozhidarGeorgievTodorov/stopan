@@ -45,6 +45,7 @@ def backup(source_path):
             if item_type != "file":
                 continue
 
+            chunk_rows = []
             with open(full_path, 'rb') as f:
                 for order, (chunk_hash, chunk_data) in enumerate(chunker.chunk_stream(f)):
                     is_new = repo.put(chunk_hash, chunk_data)
@@ -53,8 +54,9 @@ def backup(source_path):
                     else:
                         chunks_existing += 1
 
-                    db.add_chunk_to_item(item_id, order, chunk_hash, len(chunk_data))
+                    chunk_rows.append((item_id, order, chunk_hash, len(chunk_data)))
 
+            db.add_chunks_batch(chunk_rows)
             total_files += 1
             total_size += stat_info.st_size
 
@@ -85,6 +87,7 @@ def restore(snapshot_id, output_dir):
     db = MetadataDB()
 
     print(f"Restoring snapshot {snapshot_id} to {output_dir}")
+    start_time = time.perf_counter()
 
     try:
         items = db.get_snapshot_items(snapshot_id)
@@ -122,7 +125,9 @@ def restore(snapshot_id, output_dir):
         for dir_path, item in directories:
             _restore_file_metadata(dir_path, item)
 
+        elapsed = time.perf_counter() - start_time
         print("Restore completed successfully")
+        print(f"Time: {elapsed:.2f} seconds")
 
     except Exception as e:
         print(f"Error restoring snapshot: {e}")

@@ -25,9 +25,7 @@ TreeWalker -> FileChunker -> CASRepository
 │   └── scanner.py
 └── protos/
     ├── __init__.py
-    ├── p2p_storage.proto
-    ├── p2p_storage_pb2.py
-    └── p2p_storage_pb2_grpc.py
+    └── p2p_storage.proto
 ```
 
 ## Requisitos locales

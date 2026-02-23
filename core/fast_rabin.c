@@ -92,7 +92,7 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
 
 static PyTypeObject ChunkIteratorType = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "fast_rabin.ChunkIterator",
+    .tp_name = "core.fast_rabin.ChunkIterator",
     .tp_basicsize = sizeof(ChunkIterator),
     .tp_dealloc = (destructor)ChunkIterator_dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,
@@ -145,7 +145,7 @@ static PyMethodDef FastRabinMethods[] = {
 
 static struct PyModuleDef fast_rabin_module = {
     PyModuleDef_HEAD_INIT,
-    "fast_rabin",
+    "core.fast_rabin",
     NULL,
     -1,
     FastRabinMethods

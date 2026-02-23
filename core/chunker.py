@@ -2,12 +2,7 @@ import hashlib
 import mmap
 import os
 
-try:
-    import fast_rabin
-except ImportError as exc:
-    raise ImportError(
-        "fast_rabin is required. Compile it with: python setup.py build_ext --inplace"
-    ) from exc
+from core import fast_rabin
 
 
 class FileChunker:

@@ -15,6 +15,7 @@ class MetadataDB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_db()
 
     def _init_db(self):
@@ -59,9 +60,12 @@ class MetadataDB:
             CREATE TABLE IF NOT EXISTS chunks (
                 hash TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
-                ref_count INTEGER NOT NULL DEFAULT 0
+                ref_count INTEGER NOT NULL DEFAULT 0,
+                is_synced INTEGER NOT NULL DEFAULT 0
             )
         ''')
+
+        self._ensure_chunks_sync_column(cursor)
 
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot_path
@@ -73,7 +77,18 @@ class MetadataDB:
             ON item_chunks(item_id, chunk_order)
         ''')
 
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chunks_sync
+            ON chunks(is_synced)
+        ''')
+
         self.conn.commit()
+
+    def _ensure_chunks_sync_column(self, cursor):
+        cursor.execute("PRAGMA table_info(chunks)")
+        columns = {row['name'] for row in cursor.fetchall()}
+        if 'is_synced' not in columns:
+            cursor.execute("ALTER TABLE chunks ADD COLUMN is_synced INTEGER NOT NULL DEFAULT 0")
 
     def create_snapshot(self, root_path):
         """Crea un snapshot nuevo para una carpeta raíz."""
@@ -133,8 +148,8 @@ class MetadataDB:
             ref_counts[chunk_hash][1] += 1
 
         self.conn.executemany('''
-            INSERT INTO chunks (hash, size, ref_count)
-            VALUES (?, ?, ?)
+            INSERT INTO chunks (hash, size, ref_count, is_synced)
+            VALUES (?, ?, ?, 0)
             ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + excluded.ref_count
         ''', (
             (chunk_hash, chunk_size, ref_count)
@@ -162,6 +177,25 @@ class MetadataDB:
             ORDER BY chunk_order ASC
         ''', (item_id,))
         return [row['chunk_hash'] for row in cursor.fetchall()]
+
+    def get_pending_sync_chunks(self):
+        """Devuelve los bloques que todavía no se han marcado como sincronizados."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT hash
+            FROM chunks
+            WHERE is_synced = 0
+            ORDER BY hash ASC
+        ''')
+        return [row['hash'] for row in cursor.fetchall()]
+
+    def mark_chunk_as_synced(self, chunk_hash):
+        """Marca un bloque como enviado correctamente a la red."""
+        self.conn.execute('''
+            UPDATE chunks
+            SET is_synced = 1
+            WHERE hash = ?
+        ''', (chunk_hash,))
 
     def commit(self):
         self.conn.commit()

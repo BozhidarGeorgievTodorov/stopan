@@ -16,14 +16,19 @@ class CASRepository:
         os.makedirs(self.data_folder, exist_ok=True)
 
     def put(self, chunk_hash, chunk_data):
-        """Guarda un bloque si todavía no existe en el repositorio."""
+        """Comprime y guarda un bloque si todavía no existe."""
+        compressed_data = zlib.compress(chunk_data)
+        return self.put_compressed(chunk_hash, compressed_data)
+
+    def put_compressed(self, chunk_hash, compressed_data):
+        """Guarda un bloque ya comprimido, validando antes su hash."""
+        self._validate_compressed_block(chunk_hash, compressed_data)
         path = self._chunk_path(chunk_hash)
 
         if os.path.exists(path):
             return False
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        compressed_data = zlib.compress(chunk_data)
         temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
 
         try:
@@ -40,13 +45,22 @@ class CASRepository:
 
     def get(self, chunk_hash):
         """Recupera, descomprime y verifica un bloque guardado por hash."""
+        compressed_data = self.get_compressed(chunk_hash)
+        return self._decompress_and_validate(chunk_hash, compressed_data)
+
+    def get_compressed(self, chunk_hash):
+        """Devuelve el bloque comprimido tal como está almacenado."""
         path = self._chunk_path(chunk_hash)
         if not os.path.exists(path):
-            raise ValueError(f"Missing block: {chunk_hash}")
+            raise FileNotFoundError(f"Missing block: {chunk_hash}")
 
         with open(path, 'rb') as f:
-            compressed_data = f.read()
+            return f.read()
 
+    def _validate_compressed_block(self, chunk_hash, compressed_data):
+        self._decompress_and_validate(chunk_hash, compressed_data)
+
+    def _decompress_and_validate(self, chunk_hash, compressed_data):
         try:
             data = zlib.decompress(compressed_data)
         except zlib.error as exc:

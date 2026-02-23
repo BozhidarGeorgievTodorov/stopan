@@ -1,0 +1,38 @@
+services:
+  node1:
+    build: .
+    ports:
+      - "50051:50051"
+    volumes:
+      - node1_data:/app/node_store
+    container_name: p2p_node_1
+
+  node2:
+    build: .
+    ports:
+      - "50052:50051"
+    volumes:
+      - node2_data:/app/node_store
+    container_name: p2p_node_2
+
+  node3:
+    build: .
+    ports:
+      - "50053:50051"
+    volumes:
+      - node3_data:/app/node_store
+    container_name: p2p_node_3
+
+  node4:
+    build: .
+    ports:
+      - "50054:50051"
+    volumes:
+      - node4_data:/app/node_store
+    container_name: p2p_node_4
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+  node4_data:

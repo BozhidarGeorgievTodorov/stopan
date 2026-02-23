@@ -1,6 +1,10 @@
 venv/
 __pycache__/
-_metadata.json
+_metadata.db
 _data_chunks/
 *.txt
-*.md
+test_data/
+*.so
+build/
+restored/protos/*_pb2.py
+protos/*_pb2_grpc.py

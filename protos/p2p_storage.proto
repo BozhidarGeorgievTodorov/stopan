@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package p2p;
+
+service P2PStorage {
+  rpc StoreChunk (StoreRequest) returns (StoreResponse);
+  rpc RetrieveChunk (RetrieveRequest) returns (RetrieveResponse);
+}
+
+message StoreRequest {
+  string chunk_hash = 1;
+  bytes chunk_data = 2;
+}
+
+message StoreResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RetrieveRequest {
+  string chunk_hash = 1;
+}
+
+message RetrieveResponse {
+  bool success = 1;
+  bytes chunk_data = 2;
+  string message = 3;
+}

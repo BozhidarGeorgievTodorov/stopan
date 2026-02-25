@@ -16,6 +16,8 @@ NODES = [
     "localhost:50054",
 ]
 
+COMMIT_EVERY = 100
+
 
 class ConsistentHashRing:
     """Mapa simple de hashes de chunk a nodos de almacenamiento."""
@@ -51,6 +53,8 @@ def push():
     repo = CASRepository()
     db = MetadataDB()
     ring = ConsistentHashRing(NODES)
+    channels = {}
+    stubs = {}
 
     try:
         pending_chunks = db.get_pending_sync_chunks()
@@ -58,8 +62,14 @@ def push():
             print("No pending chunks to sync.")
             return
 
+        for node in NODES:
+            channel = grpc.insecure_channel(node)
+            channels[node] = channel
+            stubs[node] = p2p_storage_pb2_grpc.P2PStorageStub(channel)
+
         print(f"Syncing {len(pending_chunks)} chunks")
         sent = 0
+        synced_batch = []
 
         for chunk_hash in pending_chunks:
             node = ring.get_node(chunk_hash)
@@ -72,29 +82,33 @@ def push():
                     chunk_hash=chunk_hash,
                     chunk_data=compressed_data,
                 )
+                response = stubs[node].StoreChunk(request, timeout=10)
 
-                with grpc.insecure_channel(node) as channel:
-                    stub = p2p_storage_pb2_grpc.P2PStorageStub(channel)
-                    response = stub.StoreChunk(request, timeout=10)
-
-                if response.success:
-                    db.mark_chunk_as_synced(chunk_hash)
-                    sent += 1
-
-                    if sent % 100 == 0:
-                        db.commit()
-                else:
+                if not response.success:
                     print(f"Node {node} rejected {chunk_hash[:8]}: {response.message}")
                     break
+
+                synced_batch.append(chunk_hash)
+                sent += 1
+
+                if len(synced_batch) >= COMMIT_EVERY:
+                    db.mark_chunks_as_synced(synced_batch)
+                    db.commit()
+                    synced_batch = []
 
             except grpc.RpcError as exc:
                 print(f"Network error with {node}: {exc.details()}")
                 break
 
+        if synced_batch:
+            db.mark_chunks_as_synced(synced_batch)
+
         db.commit()
         print(f"Push completed: {sent}/{len(pending_chunks)} chunks sent")
 
     finally:
+        for channel in channels.values():
+            channel.close()
         db.close()
 
 

@@ -2,6 +2,12 @@
 #include <Python.h>
 #include <stdint.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+    #define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+    #define UNLIKELY(x) (x)
+#endif
+
 static uint64_t gear_table[256];
 
 static void init_tables(void) {
@@ -18,8 +24,10 @@ static void init_tables(void) {
 typedef struct {
     PyObject_HEAD
     Py_buffer view;
-    unsigned long long mask;
+    uint64_t strong_mask;
+    uint64_t relaxed_mask;
     Py_ssize_t min_size;
+    Py_ssize_t avg_size;
     Py_ssize_t max_size;
     Py_ssize_t current_pos;
     Py_ssize_t last_split;
@@ -61,7 +69,12 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
     self->current_pos = self->last_split;
 
     Py_ssize_t first_check = self->last_split + self->min_size - 1;
+    Py_ssize_t avg_split = self->last_split + self->avg_size;
     Py_ssize_t max_split = self->last_split + self->max_size;
+
+    if (avg_split > data_len) {
+        avg_split = data_len;
+    }
 
     if (max_split > data_len) {
         max_split = data_len;
@@ -72,10 +85,23 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
         self->current_pos++;
     }
 
+    while (self->current_pos < avg_split) {
+        self->fingerprint = (self->fingerprint << 1) + gear_table[data[self->current_pos]];
+
+        if (UNLIKELY((self->fingerprint & self->strong_mask) == 0)) {
+            Py_ssize_t split_point = self->current_pos + 1;
+            self->last_split = split_point;
+            self->current_pos = split_point;
+            return PyLong_FromSsize_t(split_point);
+        }
+
+        self->current_pos++;
+    }
+
     while (self->current_pos < max_split) {
         self->fingerprint = (self->fingerprint << 1) + gear_table[data[self->current_pos]];
 
-        if ((self->fingerprint & self->mask) == 0) {
+        if (UNLIKELY((self->fingerprint & self->relaxed_mask) == 0)) {
             Py_ssize_t split_point = self->current_pos + 1;
             self->last_split = split_point;
             self->current_pos = split_point;
@@ -102,15 +128,23 @@ static PyTypeObject ChunkIteratorType = {
 
 static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
     PyObject *buffer_obj = NULL;
-    unsigned long long mask;
+    unsigned long long strong_mask;
+    unsigned long long relaxed_mask;
     Py_ssize_t min_size;
+    Py_ssize_t avg_size;
     Py_ssize_t max_size;
 
-    if (!PyArg_ParseTuple(args, "OKnn", &buffer_obj, &mask, &min_size, &max_size)) {
+    if (!PyArg_ParseTuple(args, "OKKnnn",
+            &buffer_obj,
+            &strong_mask,
+            &relaxed_mask,
+            &min_size,
+            &avg_size,
+            &max_size)) {
         return NULL;
     }
 
-    if (min_size <= 0 || max_size < min_size) {
+    if (min_size <= 0 || avg_size < min_size || max_size < avg_size) {
         PyErr_SetString(PyExc_ValueError, "Invalid chunk size limits.");
         return NULL;
     }
@@ -127,8 +161,10 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    iterator->mask = mask;
+    iterator->strong_mask = (uint64_t)strong_mask;
+    iterator->relaxed_mask = (uint64_t)relaxed_mask;
     iterator->min_size = min_size;
+    iterator->avg_size = avg_size;
     iterator->max_size = max_size;
     iterator->current_pos = 0;
     iterator->last_split = 0;

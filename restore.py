@@ -1,5 +1,6 @@
 import bisect
 import hashlib
+import itertools
 import os
 import sys
 import time
@@ -51,27 +52,60 @@ class ConsistentHashRing:
         return self.node_map[self.ring[index]]
 
 
+class StubCache:
+    """Mantiene abiertos los canales gRPC usados durante una restauración."""
+
+    def __init__(self):
+        self.channels = {}
+        self.stubs = {}
+
+    def get(self, node):
+        if node not in self.stubs:
+            channel = grpc.insecure_channel(node)
+            self.channels[node] = channel
+            self.stubs[node] = p2p_storage_pb2_grpc.P2PStorageStub(channel)
+
+        return self.stubs[node]
+
+    def close(self):
+        for channel in self.channels.values():
+            channel.close()
+
+
 def restore(snapshot_id, output_dir):
     """Reconstruye un snapshot usando caché local y nodos P2P si faltan bloques."""
     db = MetadataDB()
     repo = CASRepository()
     ring = ConsistentHashRing(NODES)
+    stubs = StubCache()
 
-    print(f"Restoring snapshot {snapshot_id} to {output_dir}")
+    output_root = os.path.abspath(output_dir)
+    work_root = f"{output_root}.incomplete"
+    current_temp_path = None
+
+    print(f"Restoring snapshot {snapshot_id} to {output_root}")
     start_time = time.perf_counter()
 
     try:
-        items = db.get_snapshot_items(snapshot_id)
-        if not items:
+        if os.path.exists(output_root):
+            print(f"Output directory already exists: {output_root}")
+            return
+
+        items_iter = iter(db.get_snapshot_items(snapshot_id))
+        try:
+            first_item = next(items_iter)
+        except StopIteration:
             print(f"Snapshot {snapshot_id} not found.")
             return
 
-        output_root = os.path.abspath(output_dir)
-        os.makedirs(output_root, exist_ok=True)
+        os.makedirs(work_root, exist_ok=True)
         directories = []
+        processed = 0
+        restored = 0
 
-        for item in items:
-            target_path = _safe_target_path(output_root, item['path'])
+        for item in itertools.chain([first_item], items_iter):
+            processed += 1
+            target_path = _safe_target_path(work_root, item['path'])
             if target_path is None:
                 print(f"Skipping unsafe path: {item['path']}")
                 continue
@@ -79,32 +113,49 @@ def restore(snapshot_id, output_dir):
             if item['item_type'] == 'dir':
                 os.makedirs(target_path, exist_ok=True)
                 directories.append((target_path, item))
+                restored += 1
                 continue
 
             if item['item_type'] == 'file':
-                _restore_file(item, target_path, db, repo, ring)
+                current_temp_path = _restore_file(item, target_path, db, repo, ring, stubs)
+                current_temp_path = None
+                restored += 1
 
         directories.sort(key=lambda pair: len(pair[0]), reverse=True)
         for dir_path, item in directories:
             _restore_metadata(dir_path, item)
 
-        elapsed = time.perf_counter() - start_time
-        print("Restore completed successfully")
-        print(f"Time: {elapsed:.2f} seconds")
+        if restored == processed:
+            os.replace(work_root, output_root)
+            elapsed = time.perf_counter() - start_time
+            print("Restore completed successfully")
+            print(f"Time: {elapsed:.2f} seconds")
+        else:
+            print(f"Restore incomplete: {restored}/{processed} items restored")
+            print(f"Work directory: {work_root}")
+
+    except KeyboardInterrupt:
+        if current_temp_path and os.path.exists(current_temp_path):
+            os.remove(current_temp_path)
+        print(f"Restore interrupted. Work directory kept at: {work_root}")
 
     except Exception as e:
+        if current_temp_path and os.path.exists(current_temp_path):
+            os.remove(current_temp_path)
         print(f"Error restoring snapshot: {e}")
+        print(f"Work directory kept at: {work_root}")
 
     finally:
+        stubs.close()
         db.close()
 
 
-def _restore_file(item, target_path, db, repo, ring):
+def _restore_file(item, target_path, db, repo, ring, stubs):
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     if os.path.exists(target_path) and os.path.getsize(target_path) == item['size']:
         print(f"Skipping existing file: {item['path']}")
-        return
+        return None
 
     chunks = db.get_item_chunks(item['id'])
     temp_path = f"{target_path}.tmp"
@@ -112,11 +163,12 @@ def _restore_file(item, target_path, db, repo, ring):
     try:
         with open(temp_path, 'wb') as f:
             for chunk_hash in chunks:
-                f.write(_fetch_chunk(chunk_hash, repo, ring))
+                f.write(_fetch_chunk(chunk_hash, repo, ring, stubs))
 
         os.replace(temp_path, target_path)
         _restore_metadata(target_path, item)
         print(f"Restored: {item['path']}")
+        return None
 
     except Exception:
         if os.path.exists(temp_path):
@@ -124,7 +176,7 @@ def _restore_file(item, target_path, db, repo, ring):
         raise
 
 
-def _fetch_chunk(chunk_hash, repo, ring):
+def _fetch_chunk(chunk_hash, repo, ring, stubs):
     try:
         return repo.get(chunk_hash)
     except FileNotFoundError:
@@ -138,9 +190,8 @@ def _fetch_chunk(chunk_hash, repo, ring):
 
     for attempt in range(MAX_RETRIES):
         try:
-            with grpc.insecure_channel(node) as channel:
-                stub = p2p_storage_pb2_grpc.P2PStorageStub(channel)
-                response = stub.RetrieveChunk(request, timeout=5)
+            stub = stubs.get(node)
+            response = stub.RetrieveChunk(request, timeout=5)
 
             if not response.success:
                 raise RuntimeError(response.message or f"Chunk not found on node {node}")

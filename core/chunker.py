@@ -15,7 +15,8 @@ class FileChunker:
         self.avg_chunk_size = avg_chunk_size
         self.min_chunk_size = min_chunk_size or avg_chunk_size // 4
         self.max_chunk_size = max_chunk_size or avg_chunk_size * 4
-        self.mask = avg_chunk_size - 1
+        self.relaxed_mask = avg_chunk_size - 1
+        self.strong_mask = (avg_chunk_size * 2) - 1
 
     def chunk_file(self, file_path):
         """Lee un archivo y genera pares (hash, datos) para cada bloque."""
@@ -34,8 +35,10 @@ class FileChunker:
         with mmap.mmap(file_stream.fileno(), length=0, access=mmap.ACCESS_READ) as mapped_file:
             boundaries = fast_rabin.get_chunk_boundaries(
                 mapped_file,
-                self.mask,
+                self.strong_mask,
+                self.relaxed_mask,
                 self.min_chunk_size,
+                self.avg_chunk_size,
                 self.max_chunk_size,
             )
 

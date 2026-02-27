@@ -1,6 +1,7 @@
-import hashlib
 import mmap
 import os
+
+import blake3
 
 from core import fast_rabin
 
@@ -52,7 +53,7 @@ class FileChunker:
                 del boundaries
 
     def _create_chunk(self, buffer_data):
-        """Calcula el SHA-256 del bloque finalizado y devuelve ambos."""
+        """Calcula el BLAKE3 del bloque finalizado y devuelve ambos."""
         data = bytes(buffer_data)
-        sha256 = hashlib.sha256(data).hexdigest()
-        return sha256, data
+        chunk_hash = blake3.blake3(data).hexdigest()
+        return chunk_hash, data

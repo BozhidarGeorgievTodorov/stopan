@@ -1,9 +1,11 @@
-import hashlib
 import os
 import uuid
-import zlib
+
+import blake3
+import zstandard as zstd
 
 DATA_FOLDER = "_data_chunks"
+ZSTD_LEVEL = 3
 
 
 class CASRepository:
@@ -13,11 +15,13 @@ class CASRepository:
 
     def __init__(self, data_folder=DATA_FOLDER):
         self.data_folder = data_folder
+        self.compressor = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+        self.decompressor = zstd.ZstdDecompressor()
         os.makedirs(self.data_folder, exist_ok=True)
 
     def put(self, chunk_hash, chunk_data):
         """Comprime y guarda un bloque si todavía no existe."""
-        compressed_data = zlib.compress(chunk_data)
+        compressed_data = self.compressor.compress(chunk_data)
         return self.put_compressed(chunk_hash, compressed_data)
 
     def put_compressed(self, chunk_hash, compressed_data):
@@ -62,11 +66,11 @@ class CASRepository:
 
     def _decompress_and_validate(self, chunk_hash, compressed_data):
         try:
-            data = zlib.decompress(compressed_data)
-        except zlib.error as exc:
+            data = self.decompressor.decompress(compressed_data)
+        except zstd.ZstdError as exc:
             raise ValueError(f"Corrupt compressed block: {chunk_hash}") from exc
 
-        calculated_hash = hashlib.sha256(data).hexdigest()
+        calculated_hash = blake3.blake3(data).hexdigest()
         if calculated_hash != chunk_hash:
             raise ValueError(f"Corrupt block: {chunk_hash}")
 

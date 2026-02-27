@@ -33,7 +33,7 @@ TreeWalker -> FileChunker -> CASRepository
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install grpcio grpcio-tools
+pip install grpcio grpcio-tools blake3 zstandard
 ```
 
 
@@ -66,6 +66,12 @@ Crear un snapshot:
 
 ```bash
 python main.py backup test_data
+```
+
+También se puede indicar el número de hilos para procesar archivos:
+
+```bash
+python main.py backup test_data 4
 ```
 
 Restaurar el snapshot 1 en otra carpeta:

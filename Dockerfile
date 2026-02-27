@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir grpcio grpcio-tools
+RUN pip install --no-cache-dir grpcio grpcio-tools blake3 zstandard
 
 COPY setup.py /app/
 COPY core/ /app/core/

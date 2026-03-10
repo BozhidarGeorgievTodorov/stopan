@@ -19,6 +19,10 @@ class CASRepository:
         self.decompressor = zstd.ZstdDecompressor()
         os.makedirs(self.data_folder, exist_ok=True)
 
+    def exists_local(self, chunk_hash):
+        """Comprueba si el bloque ya existe en el repositorio local."""
+        return os.path.exists(self._chunk_path(chunk_hash))
+
     def put(self, chunk_hash, chunk_data):
         """Comprime y guarda un bloque si todavía no existe."""
         compressed_data = self.compressor.compress(chunk_data)
@@ -34,18 +38,27 @@ class CASRepository:
 
         os.makedirs(os.path.dirname(path), exist_ok=True)
         temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+        written = False
 
         try:
             with open(temp_path, 'wb') as f:
                 f.write(compressed_data)
 
             os.replace(temp_path, path)
+            written = True
             return True
 
         except Exception:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if os.path.exists(path):
+                return False
             raise
+
+        finally:
+            if not written:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     def get(self, chunk_hash):
         """Recupera, descomprime y verifica un bloque guardado por hash."""

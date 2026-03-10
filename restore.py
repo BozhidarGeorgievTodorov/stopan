@@ -78,15 +78,30 @@ def restore(snapshot_id, output_dir):
     repo = CASRepository()
     ring = ConsistentHashRing(NODES)
     stubs = StubCache()
-
-    output_root = os.path.abspath(output_dir)
-    work_root = f"{output_root}.incomplete"
     current_temp_path = None
 
-    print(f"Restoring snapshot {snapshot_id} to {output_root}")
+    print(f"Restoring snapshot {snapshot_id} to {output_dir}")
     start_time = time.perf_counter()
 
     try:
+        status, error = db.get_snapshot_status(snapshot_id)
+        if status is None:
+            print(f"Snapshot {snapshot_id} not found.")
+            return
+
+        if status != "COMPLETE":
+            print(f"Snapshot {snapshot_id} is not restorable: {status}")
+            if error:
+                print(f"Reason: {error}")
+            return
+
+        snapshot_uuid = db.get_snapshot_uuid(snapshot_id)
+        if not snapshot_uuid:
+            snapshot_uuid = str(snapshot_id)
+
+        output_root = os.path.abspath(os.path.join(output_dir, f"snapshot_{snapshot_uuid}"))
+        work_root = f"{output_root}.incomplete"
+
         if os.path.exists(output_root):
             print(f"Output directory already exists: {output_root}")
             return
@@ -95,7 +110,7 @@ def restore(snapshot_id, output_dir):
         try:
             first_item = next(items_iter)
         except StopIteration:
-            print(f"Snapshot {snapshot_id} not found.")
+            print(f"Snapshot {snapshot_id} has no items.")
             return
 
         os.makedirs(work_root, exist_ok=True)
@@ -129,6 +144,7 @@ def restore(snapshot_id, output_dir):
             os.replace(work_root, output_root)
             elapsed = time.perf_counter() - start_time
             print("Restore completed successfully")
+            print(f"Output: {output_root}")
             print(f"Time: {elapsed:.2f} seconds")
         else:
             print(f"Restore incomplete: {restored}/{processed} items restored")
@@ -154,6 +170,7 @@ def _restore_file(item, target_path, db, repo, ring, stubs):
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     if os.path.exists(target_path) and os.path.getsize(target_path) == item['size']:
+        _restore_metadata(target_path, item)
         print(f"Skipping existing file: {item['path']}")
         return None
 

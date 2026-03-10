@@ -10,7 +10,6 @@ COPY protos/ /app/protos/
 COPY node_server.py /app/
 
 RUN python setup.py build_protos
-RUN python setup.py build_ext --inplace
 
 EXPOSE 50051
 

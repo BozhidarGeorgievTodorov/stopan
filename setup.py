@@ -9,7 +9,7 @@ import sys
 
 
 class BuildProtos(Command):
-    description = "genera los módulos Python de gRPC a partir de protos/p2p_storage.proto"
+    description = "genera los módulos Python de gRPC a partir de los .proto"
     user_options = []
 
     def initialize_options(self):
@@ -28,6 +28,7 @@ class BuildProtos(Command):
             "--python_out=.",
             "--grpc_python_out=.",
             "protos/p2p_storage.proto",
+            "protos/membership.proto",
         ])
 
 

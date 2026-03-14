@@ -6,6 +6,12 @@ services:
     volumes:
       - node1_data:/app/node_store
     container_name: p2p_node_1
+    environment:
+      - ADVERTISE_ADDR=node1:50051
+      - BIND_ADDR=[::]:50051
+      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
+      - CLUSTER_TOKEN=oficina-demo
+      - REPO_STORE_DIR=/app/node_store
 
   node2:
     build: .
@@ -14,6 +20,12 @@ services:
     volumes:
       - node2_data:/app/node_store
     container_name: p2p_node_2
+    environment:
+      - ADVERTISE_ADDR=node2:50051
+      - BIND_ADDR=[::]:50051
+      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
+      - CLUSTER_TOKEN=oficina-demo
+      - REPO_STORE_DIR=/app/node_store
 
   node3:
     build: .
@@ -22,6 +34,12 @@ services:
     volumes:
       - node3_data:/app/node_store
     container_name: p2p_node_3
+    environment:
+      - ADVERTISE_ADDR=node3:50051
+      - BIND_ADDR=[::]:50051
+      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
+      - CLUSTER_TOKEN=oficina-demo
+      - REPO_STORE_DIR=/app/node_store
 
   node4:
     build: .
@@ -30,6 +48,12 @@ services:
     volumes:
       - node4_data:/app/node_store
     container_name: p2p_node_4
+    environment:
+      - ADVERTISE_ADDR=node4:50051
+      - BIND_ADDR=[::]:50051
+      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
+      - CLUSTER_TOKEN=oficina-demo
+      - REPO_STORE_DIR=/app/node_store
 
 volumes:
   node1_data:

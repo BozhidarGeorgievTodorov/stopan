@@ -14,34 +14,21 @@ Por cada archivo encontrado, `FileChunker` lo divide en chunks de tamaño variab
 
 Antes de escribir un chunk, `ChunkPlanner` decide si hace falta procesarlo o si se puede reutilizar. Para eso consulta el repositorio local, la metadata guardada en SQLite y una caché en memoria llamada `ChunkIndex`.
 
-La metadata del snapshot se guarda en SQLite. Cada snapshot contiene los archivos y carpetas recorridos, sus metadatos básicos y una referencia a la receta de chunks necesaria para reconstruir cada archivo.
+La metadata del snapshot se guarda en SQLite. Cada snapshot contiene los archivos y carpetas recorridos, sus metadatos básicos, el estado del snapshot y una referencia a la receta de chunks necesaria para reconstruir cada archivo.
 
-Durante el backup intervienen principalmente:
+### Protección P2P
 
-```text
-TreeWalker
-FileChunker
-ChunkPlanner
-ChunkIndex
-CASRepository
-MetadataDB
-```
+Después de crear un snapshot, los chunks quedan registrados en SQLite con estado de protección.
 
-### Sincronización P2P
+`replicator.py` lee los chunks pendientes, obtiene una vista de nodos mediante membership y calcula los nodos destino usando HRW / rendezvous hashing. El replication factor indica cuántos nodos deben recibir cada chunk.
 
-Después de crear un snapshot, los chunks nuevos quedan registrados en SQLite como pendientes de sincronización.
-
-`sync_cli.py` lee esos chunks pendientes, calcula a qué nodo corresponde cada uno mediante hashing consistente y los envía por gRPC ya comprimidos.
-
-Los nodos no crean snapshots ni recorren carpetas. Solo reciben, guardan y sirven chunks.
-
-El estado de sincronización se guarda en SQLite, así que si el proceso se corta se puede volver a ejecutar el `push` y continuar con los chunks que falten.
+`store_service.py` mantiene un repositorio CAS propio, recibe chunks comprimidos por gRPC, valida su BLAKE3 antes de guardarlos y los devuelve cuando otro proceso los necesita.
 
 ### Restauración
 
 `restore.py` reconstruye un snapshot a partir de la metadata guardada en SQLite.
 
-Primero consulta los archivos y recetas del snapshot. Para cada chunk intenta leerlo desde el repositorio local. Si no está disponible, calcula qué nodo debería tenerlo y lo solicita por gRPC.
+Primero consulta los archivos y recetas del snapshot. Para cada chunk intenta leerlo desde el repositorio local. Si no está disponible, obtiene la vista de nodos y lo solicita a los nodos que deberían tenerlo según el mismo algoritmo de placement.
 
 La restauración se hace en una carpeta temporal `.incomplete`. Cada archivo se escribe primero como temporal y solo se mueve a su ruta final cuando se ha reconstruido completo.
 
@@ -53,22 +40,26 @@ Cuando todos los archivos se han restaurado correctamente, la carpeta incompleta
 .
 ├── main.py                 # crea snapshots locales de una carpeta
 ├── restore.py              # restaura snapshots desde caché local o nodos P2P
-├── sync_cli.py             # sincroniza chunks pendientes con la red P2P
-├── node_server.py          # servidor gRPC de un nodo de almacenamiento
+├── replicator.py           # protege chunks pendientes en la red P2P
+├── store_service.py        # servidor gRPC de almacenamiento y membership
 ├── setup.py                # compila core.fast_rabin y regenera protos
 ├── Dockerfile
 ├── docker-compose.yml
 ├── core/
 │   ├── __init__.py
-│   ├── chunker.py
 │   ├── chunk_index.py
+│   ├── chunker.py
+│   ├── cluster_view.py
 │   ├── database.py
 │   ├── fast_rabin.c
+│   ├── placement.py
 │   ├── planner.py
+│   ├── protection.py
 │   ├── repository.py
 │   └── scanner.py
 └── protos/
     ├── __init__.py
+    ├── membership.proto
     └── p2p_storage.proto
 ```
 
@@ -110,7 +101,7 @@ Crear un snapshot:
 python main.py backup test_data
 ```
 
-Crear un snapshot usando varios hilos:
+Se puede indicar el número de hilos para procesar archivos:
 
 ```bash
 python main.py backup test_data 4
@@ -162,20 +153,20 @@ Primero crea al menos un snapshot local:
 python main.py backup test_data
 ```
 
-Con los nodos levantados, enviar los chunks pendientes:
+Con los nodos levantados, enviar los chunks pendientes usando replication factor 3:
 
 ```bash
-python sync_cli.py push
+python replicator.py push --seed localhost:50051 --rf 3
 ```
 
-El estado de sincronización se guarda en SQLite, así que si el proceso se corta, se puede reanudar volviendo a ejecutar el comando.
+El estado de protección se guarda en SQLite, así que si el proceso se corta, se puede reanudar volviendo a ejecutar el comando.
 
 ## Restaurar usando caché local o red
 
-Si el bloque existe en el repositorio local, `restore.py` lo usa directamente. Si falta, intenta recuperarlo desde el nodo P2P que le corresponde.
+Si el bloque existe en el repositorio local, `restore.py` lo usa directamente. Si falta, intenta recuperarlo desde los nodos P2P que le corresponden.
 
 ```bash
-python restore.py 1 restored
+python restore.py 1 restored --seed localhost:50051 --rf 3
 ```
 
 Para probar la recuperación desde red, una vez hecho `push`, borramos el repositorio local `_data_chunks`.

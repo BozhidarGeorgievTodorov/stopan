@@ -26,8 +26,10 @@ INDIRECT_PING_FANOUT = int(os.getenv("SWIM_INDIRECT_FANOUT", "3"))
 MAX_GOSSIP_EVENTS = int(os.getenv("SWIM_MAX_GOSSIP", "20"))
 GOSSIP_TTL_S = float(os.getenv("SWIM_GOSSIP_TTL_S", "60.0"))
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", str(8 * 1024 * 1024)))
+STORAGE_RPC_WORKERS = int(os.getenv("STORAGE_RPC_WORKERS", "64"))
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
-CLUSTER_TokEN = os.getenv("CLUSTER_TokEN", "")
+CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
 ADVERTISE_ADDR = os.getenv("ADVERTISE_ADDR", "")
 BIND_ADDR = os.getenv("BIND_ADDR", "[::]:50051")
 REPO_STORE_DIR = os.getenv("REPO_STORE_DIR", "node_store")
@@ -139,7 +141,7 @@ class MembershipManager:
                 continue
             try:
                 stub = self.channels.get(seed)
-                resp = stub.Join(membership_pb2.JoinRequest(self=me, cluster_token=CLUSTER_TokEN), timeout=2.0)
+                resp = stub.Join(membership_pb2.JoinRequest(self=me, cluster_token=CLUSTER_TOKEN), timeout=2.0)
                 for n in resp.members:
                     self._apply_nodeinfo(n, state=membership_pb2.ALIVE, ts_ms=now_ms(), source="join")
                 for ev in resp.gossip:
@@ -339,7 +341,7 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
         self.mgr = mgr
 
     def Join(self, request, context):
-        if CLUSTER_TokEN and request.cluster_token != CLUSTER_TokEN:
+        if CLUSTER_TOKEN and request.cluster_token != CLUSTER_TOKEN:
             return membership_pb2.JoinResponse(members=[], gossip=[])
 
         self.mgr._apply_nodeinfo(request.self, state=membership_pb2.ALIVE, ts_ms=now_ms(), source="join")
@@ -383,10 +385,20 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
 
 
 class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
+    """Servicio gRPC que recibe y sirve chunks comprimidos."""
+
     def __init__(self, repo_store_dir: str):
         self.repo = CASRepository(repo_store_dir)
-        self.decompressor = zstd.ZstdDecompressor()
+        self._thread_local = threading.local()
         print(f"Storage node using repository: {os.path.abspath(repo_store_dir)}")
+
+    def _get_thread_local_decompressor(self):
+        """Devuelve un descompresor Zstandard propio del hilo actual."""
+        decomp = getattr(self._thread_local, "decompressor", None)
+        if decomp is None:
+            decomp = zstd.ZstdDecompressor()
+            self._thread_local.decompressor = decomp
+        return decomp
 
     def StoreChunk(self, request, context):
         try:
@@ -394,11 +406,11 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
                 return p2p_storage_pb2.StoreResponse(success=True, message="already present")
 
             try:
-                raw = self.decompressor.decompress(request.chunk_data, max_output_size=MAX_CHUNK_SIZE)
+                raw = self._get_thread_local_decompressor().decompress(request.chunk_data, max_output_size=MAX_CHUNK_SIZE)
             except zstd.ZstdError:
                 return p2p_storage_pb2.StoreResponse(success=False, message="rejected: corrupt zstd data")
             except Exception:
-                return p2p_storage_pb2.StoreResponse(success=False, message="rejected: decompressed size too large")
+                return p2p_storage_pb2.StoreResponse(success=False, message="rejected: decompressed output too large")
 
             h = blake3.blake3(raw).hexdigest()
             if h != request.chunk_hash:
@@ -411,6 +423,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             return p2p_storage_pb2.StoreResponse(success=False, message=str(e))
 
     def RetrieveChunk(self, request, context):
+        """Devuelve el chunk comprimido tal como está almacenado."""
         try:
             data = self.repo.get_compressed(request.chunk_hash)
             return p2p_storage_pb2.RetrieveResponse(success=True, chunk_data=data, message="ok")
@@ -419,6 +432,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
 
 
 def load_or_create_node_id(path: str) -> str:
+    """Carga un identificador persistente del nodo o crea uno nuevo."""
     os.makedirs(path, exist_ok=True)
     f = os.path.join(path, "node_id.txt")
     if os.path.exists(f):
@@ -440,13 +454,23 @@ def serve():
     node_id = load_or_create_node_id(repo_store_dir)
     mgr = MembershipManager(node_id=node_id, address=ADVERTISE_ADDR)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=20))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=STORAGE_RPC_WORKERS),
+        options=[
+            ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_BYTES),
+            ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_BYTES),
+            ("grpc.keepalive_time_ms", 30_000),
+            ("grpc.keepalive_timeout_ms", 10_000),
+            ("grpc.http2.max_pings_without_data", 0),
+            ("grpc.keepalive_permit_without_calls", 1),
+        ],
+    )
     p2p_storage_pb2_grpc.add_P2PStorageServicer_to_server(StorageNodeServicer(repo_store_dir), server)
     membership_pb2_grpc.add_MembershipServicer_to_server(MembershipServicer(mgr), server)
 
     server.add_insecure_port(BIND_ADDR)
     server.start()
-    print(f"Storage node {node_id[:8]} listening on {BIND_ADDR} (advertise={ADVERTISE_ADDR})")
+    print(f"Node {node_id[:8]} listening on {BIND_ADDR} (advertise={ADVERTISE_ADDR})")
 
     mgr.bootstrap_join(SEEDS)
     mgr.start()

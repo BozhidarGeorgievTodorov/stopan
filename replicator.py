@@ -1,172 +1,171 @@
 import argparse
 import os
-
-import grpc
+import time
 
 from core.cluster_view import ClusterMembershipClient
 from core.database import MetadataDB
+from core.replication import ReplicationCoordinator
 from core.repository import CASRepository
-from protos import p2p_storage_pb2
-from protos import p2p_storage_pb2_grpc
 
 
 LOCAL_SHARD_DIR = os.getenv("LOCAL_SHARD_DIR", "_data_chunks")
 DB_FILE = os.getenv("DB_FILE", "_metadata.db")
 CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
-DEFAULT_RF = int(os.getenv("RF", os.getenv("REPLICATION_FACTOR", "3")))
-DEFAULT_SEED = os.getenv("MEMBERSHIP_SEED", "localhost:50051")
-COMMIT_EVERY = 100
+
+DEFAULT_RPC_TIMEOUT_S = float(os.getenv("REPLICATION_RPC_TIMEOUT_S", "10.0"))
+DEFAULT_CHUNK_WORKERS = int(os.getenv("REPLICATION_CHUNK_WORKERS", "8"))
+DEFAULT_TARGET_WORKERS = int(os.getenv("REPLICATION_TARGET_WORKERS", "4"))
+DEFAULT_TARGET_INFLIGHT = int(os.getenv("REPLICATION_TARGET_INFLIGHT", "32"))
+DEFAULT_MAX_PENDING_CHUNKS = int(os.getenv("REPLICATION_MAX_PENDING_CHUNKS", "128"))
+DEFAULT_COMMIT_EVERY = int(os.getenv("REPLICATION_COMMIT_EVERY", "100"))
+DEFAULT_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
 
-class StorageStubPool:
-    """Reutiliza conexiones gRPC durante el push."""
-
-    def __init__(self):
-        self.channels = {}
-        self.stubs = {}
-
-    def get(self, address):
-        if address not in self.stubs:
-            channel = grpc.insecure_channel(address)
-            self.channels[address] = channel
-            self.stubs[address] = p2p_storage_pb2_grpc.P2PStorageStub(channel)
-        return self.stubs[address]
-
-    def close(self):
-        for channel in self.channels.values():
-            channel.close()
-        self.channels.clear()
-        self.stubs.clear()
-
-
-def push(seed=DEFAULT_SEED, *, rf=DEFAULT_RF, limit=None):
-    """Envía chunks pendientes hasta cubrir el replication factor indicado."""
+def push_to_network(
+    seed: str,
+    *,
+    rf: int,
+    limit: int | None = None,
+    chunk_workers: int = DEFAULT_CHUNK_WORKERS,
+    target_workers: int = DEFAULT_TARGET_WORKERS,
+    target_inflight: int = DEFAULT_TARGET_INFLIGHT,
+    max_pending_chunks: int = DEFAULT_MAX_PENDING_CHUNKS,
+    rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
+    commit_every: int = DEFAULT_COMMIT_EVERY,
+):
     repo = CASRepository(LOCAL_SHARD_DIR)
     db = MetadataDB(DB_FILE)
-    stubs = StorageStubPool()
 
-    sent = 0
+    protected = 0
     attempted = 0
+    failed = 0
     pending_chunks = []
+    coordinator = None
+    start_time = time.perf_counter()
+    current_epoch = "unknown"
 
     try:
         self_addr = os.getenv("ADVERTISE_ADDR", "")
         cluster = ClusterMembershipClient(seed, self_addr=self_addr).get_cluster_view()
+
         if not cluster.members:
             print(f"No eligible members returned by seed {seed}.")
-            return False
+            return
 
-        placement_epoch = cluster.placement_epoch(
+        current_epoch = cluster.placement_epoch(
             desired_rf=rf,
             cluster_token=CLUSTER_TOKEN,
         )
-        db.mark_stale_protection(desired_rf=rf, current_epoch=placement_epoch)
+        db.mark_stale_protection(desired_rf=rf, current_epoch=current_epoch)
         pending_chunks = db.get_pending_protection_chunks(
             desired_rf=rf,
-            current_epoch=placement_epoch,
+            current_epoch=current_epoch,
             limit=limit,
         )
 
         if not pending_chunks:
             print("No chunks pending for the current protection policy.")
-            return True
+            return
 
-        print(f"Protecting {len(pending_chunks)} chunks")
-        print(f"Replication factor: {min(max(rf, 1), len(cluster.members))}")
-        print(f"Placement epoch: {placement_epoch[:12]}")
+        coordinator = ReplicationCoordinator(
+            repo=repo,
+            cluster=cluster,
+            rf=rf,
+            cluster_token=CLUSTER_TOKEN,
+            rpc_timeout_s=rpc_timeout_s,
+            chunk_workers=chunk_workers,
+            target_workers=target_workers,
+            target_inflight=target_inflight,
+            max_pending_chunks=max_pending_chunks,
+            max_message_bytes=DEFAULT_MAX_MESSAGE_BYTES,
+        )
 
-        for chunk_hash in pending_chunks:
+        print(f"Push: {len(pending_chunks)} chunks pending for protection")
+        print(f"Eligible members: {[f'{m.node_id[:8]}@{m.address}' for m in cluster.members]}")
+        if cluster.self_node_id:
+            print(f"Self: {cluster.self_node_id[:8]}@{self_addr}")
+        print(f"RF targets: {min(max(rf, 1), len(cluster.members))}")
+        print(f"placement_epoch={current_epoch[:12]}")
+        print(
+            f"Pipeline: chunk_workers={chunk_workers} target_workers={target_workers} "
+            f"target_inflight={target_inflight} max_pending_chunks={max_pending_chunks}"
+        )
+
+        dirty = 0
+        for outcome in coordinator.replicate_chunks(pending_chunks):
             attempted += 1
-            targets = cluster.hrw_remote_targets(chunk_hash, rf=rf, salt=CLUSTER_TOKEN)
-
-            if not targets:
+            if outcome.success:
                 db.mark_chunk_placed(
-                    chunk_hash,
+                    outcome.chunk_hash,
                     desired_rf=rf,
-                    protected_remote_copies=0,
-                    placement_epoch=placement_epoch,
+                    protected_remote_copies=outcome.protected_remote_copies,
+                    placement_epoch=current_epoch,
                 )
-                sent += 1
-                continue
-
-            try:
-                compressed_data = repo.get_compressed(chunk_hash)
-            except Exception as exc:
-                db.mark_chunk_failed(
-                    chunk_hash,
-                    desired_rf=rf,
-                    protected_remote_copies=0,
-                    placement_epoch=placement_epoch,
-                    error=f"Could not read local chunk: {exc}",
-                )
-                continue
-
-            ok_count = 0
-            failures = []
-
-            for member in targets:
-                request = p2p_storage_pb2.StoreRequest(
-                    chunk_hash=chunk_hash,
-                    chunk_data=compressed_data,
-                )
-
-                try:
-                    response = stubs.get(member.address).StoreChunk(request, timeout=10)
-                    if response.success:
-                        ok_count += 1
-                    else:
-                        failures.append(f"{member.address}: {response.message}")
-
-                except grpc.RpcError as exc:
-                    failures.append(f"{member.address}: RPC {exc.details()}")
-
-            if ok_count == len(targets):
-                db.mark_chunk_placed(
-                    chunk_hash,
-                    desired_rf=rf,
-                    protected_remote_copies=ok_count,
-                    placement_epoch=placement_epoch,
-                )
-                sent += 1
-                if sent % COMMIT_EVERY == 0:
-                    db.commit()
+                protected += 1
             else:
                 db.mark_chunk_failed(
-                    chunk_hash,
+                    outcome.chunk_hash,
                     desired_rf=rf,
-                    protected_remote_copies=ok_count,
-                    placement_epoch=placement_epoch,
-                    error="; ".join(failures)[:2000],
+                    protected_remote_copies=outcome.protected_remote_copies,
+                    placement_epoch=current_epoch,
+                    error=outcome.error or "replication failed",
                 )
+                failed += 1
+                print(f"   {outcome.chunk_hash[:8]} failed: {outcome.error}")
 
-        return True
+            dirty += 1
+            if dirty >= max(1, commit_every):
+                db.commit()
+                dirty = 0
 
     except KeyboardInterrupt:
-        print("Push interrupted.")
-        return False
+        print("\nPush interrupted by user.")
 
     finally:
+        if coordinator is not None:
+            coordinator.close()
+
         db.commit()
         db.close()
-        stubs.close()
-        print(f"Push finished: {sent}/{len(pending_chunks)} chunks protected (attempted={attempted}).")
 
+        elapsed = time.perf_counter() - start_time
+        speed = protected / elapsed if elapsed > 0 else 0
 
-def _build_parser():
-    parser = argparse.ArgumentParser(description="Replica chunks pendientes en nodos P2P.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    push_parser = subparsers.add_parser("push")
-    push_parser.add_argument("--seed", default=DEFAULT_SEED, help="Nodo seed de membership")
-    push_parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor")
-    push_parser.add_argument("--limit", type=int, default=None, help="Máximo de chunks a procesar")
-
-    return parser
+        print("-" * 40)
+        print(f"Push finished in {elapsed:.2f} seconds.")
+        print(f"Protection policy: RF={rf} (epoch={current_epoch[:12]})")
+        print(f"Chunks protected: {protected}/{len(pending_chunks)} pending")
+        print(f"Attempted/failed: {attempted}/{failed}")
+        if protected > 0:
+            print(f"Average speed: {speed:.2f} chunks/second")
 
 
 if __name__ == "__main__":
-    args = _build_parser().parse_args()
-    if args.command == "push":
-        ok = push(seed=args.seed, rf=args.rf, limit=args.limit)
-        if not ok:
-            raise SystemExit(1)
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    push_parser = sub.add_parser("push")
+    push_parser.add_argument("--seed", default="node1:50051", help="Seed de membership, por ejemplo node1:50051")
+    push_parser.add_argument("--rf", type=int, default=int(os.getenv("RF", os.getenv("REPLICATION_FACTOR", "3"))), help="Factor de réplica usado para calcular targets HRW")
+    push_parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución")
+    push_parser.add_argument("--chunk-workers", type=int, default=DEFAULT_CHUNK_WORKERS, help="Paralelismo a nivel de chunks")
+    push_parser.add_argument("--target-workers", type=int, default=DEFAULT_TARGET_WORKERS, help="Paralelismo por nodo destino")
+    push_parser.add_argument("--target-inflight", type=int, default=DEFAULT_TARGET_INFLIGHT, help="Máximo de chunks en vuelo por nodo destino")
+    push_parser.add_argument("--max-pending-chunks", type=int, default=DEFAULT_MAX_PENDING_CHUNKS, help="Máximo de chunks concurrentes dentro del coordinador")
+    push_parser.add_argument("--rpc-timeout", type=float, default=DEFAULT_RPC_TIMEOUT_S, help="Timeout de cada llamada StoreChunk")
+    push_parser.add_argument("--commit-every", type=int, default=DEFAULT_COMMIT_EVERY, help="Guardar progreso cada N resultados")
+
+    args = parser.parse_args()
+
+    if args.cmd == "push":
+        push_to_network(
+            seed=args.seed,
+            rf=args.rf,
+            limit=args.limit,
+            chunk_workers=args.chunk_workers,
+            target_workers=args.target_workers,
+            target_inflight=args.target_inflight,
+            max_pending_chunks=args.max_pending_chunks,
+            rpc_timeout_s=args.rpc_timeout,
+            commit_every=args.commit_every,
+        )

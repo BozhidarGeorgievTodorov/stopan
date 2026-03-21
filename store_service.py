@@ -26,14 +26,14 @@ INDIRECT_PING_FANOUT = int(os.getenv("SWIM_INDIRECT_FANOUT", "3"))
 MAX_GOSSIP_EVENTS = int(os.getenv("SWIM_MAX_GOSSIP", "20"))
 GOSSIP_TTL_S = float(os.getenv("SWIM_GOSSIP_TTL_S", "60.0"))
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", str(8 * 1024 * 1024)))
-STORAGE_RPC_WORKERS = int(os.getenv("STORAGE_RPC_WORKERS", "64"))
-GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
 CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
 ADVERTISE_ADDR = os.getenv("ADVERTISE_ADDR", "")
 BIND_ADDR = os.getenv("BIND_ADDR", "[::]:50051")
 REPO_STORE_DIR = os.getenv("REPO_STORE_DIR", "node_store")
 SEEDS = [s.strip() for s in os.getenv("SEEDS", "").split(",") if s.strip()]
+STORAGE_RPC_WORKERS = int(os.getenv("STORAGE_RPC_WORKERS", "64"))
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
 STATE_ORDER = {
     membership_pb2.UNKNOWN: 0,
@@ -394,33 +394,72 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
 
     def _get_thread_local_decompressor(self):
         """Devuelve un descompresor Zstandard propio del hilo actual."""
-        decomp = getattr(self._thread_local, "decompressor", None)
-        if decomp is None:
-            decomp = zstd.ZstdDecompressor()
-            self._thread_local.decompressor = decomp
-        return decomp
+        decompressor = getattr(self._thread_local, "decompressor", None)
+        if decompressor is None:
+            decompressor = zstd.ZstdDecompressor()
+            self._thread_local.decompressor = decompressor
+        return decompressor
+
+    def _validate_and_store_one(self, chunk_hash: str, chunk_data: bytes):
+        """Valida un chunk comprimido y lo guarda si todavía no existe."""
+        if self.repo.exists_local(chunk_hash):
+            return True, True, "already present"
+
+        try:
+            raw = self._get_thread_local_decompressor().decompress(
+                chunk_data,
+                max_output_size=MAX_CHUNK_SIZE,
+            )
+        except zstd.ZstdError:
+            return False, False, "rejected: corrupt zstd data"
+        except Exception:
+            return False, False, "rejected: decompressed output too large"
+
+        h = blake3.blake3(raw).hexdigest()
+        if h != chunk_hash:
+            return False, False, "rejected: hash mismatch"
+
+        is_new = self.repo.put_compressed(chunk_hash, chunk_data)
+        if is_new:
+            return True, False, "stored"
+        return True, True, "already present"
 
     def StoreChunk(self, request, context):
         try:
-            if self.repo.exists_local(request.chunk_hash):
-                return p2p_storage_pb2.StoreResponse(success=True, message="already present")
-
-            try:
-                raw = self._get_thread_local_decompressor().decompress(request.chunk_data, max_output_size=MAX_CHUNK_SIZE)
-            except zstd.ZstdError:
-                return p2p_storage_pb2.StoreResponse(success=False, message="rejected: corrupt zstd data")
-            except Exception:
-                return p2p_storage_pb2.StoreResponse(success=False, message="rejected: decompressed output too large")
-
-            h = blake3.blake3(raw).hexdigest()
-            if h != request.chunk_hash:
-                return p2p_storage_pb2.StoreResponse(success=False, message="rejected: hash mismatch")
-
-            is_new = self.repo.put_compressed(request.chunk_hash, request.chunk_data)
-            msg = "stored" if is_new else "already present"
-            return p2p_storage_pb2.StoreResponse(success=True, message=msg)
+            success, already_present, message = self._validate_and_store_one(request.chunk_hash, request.chunk_data)
+            return p2p_storage_pb2.StoreResponse(success=success, message=message)
         except Exception as e:
             return p2p_storage_pb2.StoreResponse(success=False, message=str(e))
+
+    def ProbeMissingChunks(self, request, context):
+        """Devuelve solo los hashes que este nodo no tiene en local."""
+        try:
+            missing = [h for h in request.chunk_hashes if h and (not self.repo.exists_local(h))]
+            return p2p_storage_pb2.MissingChunksResponse(missing_hashes=missing)
+        except Exception as e:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return p2p_storage_pb2.MissingChunksResponse()
+
+    def StoreChunkBatch(self, request, context):
+        """Guarda varios chunks en una sola llamada gRPC."""
+        try:
+            results = []
+            for item in request.items:
+                success, already_present, message = self._validate_and_store_one(item.chunk_hash, item.chunk_data)
+                results.append(
+                    p2p_storage_pb2.BatchStoreResult(
+                        chunk_hash=item.chunk_hash,
+                        success=success,
+                        already_present=already_present,
+                        message=message,
+                    )
+                )
+            return p2p_storage_pb2.StoreChunkBatchResponse(results=results)
+        except Exception as e:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return p2p_storage_pb2.StoreChunkBatchResponse()
 
     def RetrieveChunk(self, request, context):
         """Devuelve el chunk comprimido tal como está almacenado."""

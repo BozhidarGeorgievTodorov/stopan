@@ -424,13 +424,6 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             return True, False, "stored"
         return True, True, "already present"
 
-    def StoreChunk(self, request, context):
-        try:
-            success, already_present, message = self._validate_and_store_one(request.chunk_hash, request.chunk_data)
-            return p2p_storage_pb2.StoreResponse(success=success, message=message)
-        except Exception as e:
-            return p2p_storage_pb2.StoreResponse(success=False, message=str(e))
-
     def ProbeMissingChunks(self, request, context):
         """Devuelve solo los hashes que este nodo no tiene en local."""
         try:
@@ -441,25 +434,24 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             context.set_details(str(e))
             return p2p_storage_pb2.MissingChunksResponse()
 
-    def StoreChunkBatch(self, request, context):
-        """Guarda varios chunks en una sola llamada gRPC."""
+    def ReplicateChunks(self, request_iterator, context):
+        """Guarda chunks recibidos por stream y devuelve una respuesta por item."""
         try:
-            results = []
-            for item in request.items:
-                success, already_present, message = self._validate_and_store_one(item.chunk_hash, item.chunk_data)
-                results.append(
-                    p2p_storage_pb2.BatchStoreResult(
-                        chunk_hash=item.chunk_hash,
-                        success=success,
-                        already_present=already_present,
-                        message=message,
-                    )
+            for item in request_iterator:
+                success, already_present, message = self._validate_and_store_one(
+                    item.chunk_hash,
+                    item.chunk_data,
                 )
-            return p2p_storage_pb2.StoreChunkBatchResponse(results=results)
+                yield p2p_storage_pb2.StreamStoreResult(
+                    chunk_hash=item.chunk_hash,
+                    success=success,
+                    already_present=already_present,
+                    message=message,
+                )
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return p2p_storage_pb2.StoreChunkBatchResponse()
+            return
 
     def RetrieveChunk(self, request, context):
         """Devuelve el chunk comprimido tal como está almacenado."""

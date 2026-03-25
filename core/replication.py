@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,8 +17,7 @@ from protos import p2p_storage_pb2_grpc
 DEFAULT_RPC_TIMEOUT_S = float(os.getenv("REPLICATION_RPC_TIMEOUT_S", "10.0"))
 DEFAULT_TARGET_PARALLELISM = int(os.getenv("REPLICATION_TARGET_PARALLELISM", "4"))
 DEFAULT_PROBE_BATCH_HASHES = int(os.getenv("REPLICATION_PROBE_BATCH_HASHES", "2048"))
-DEFAULT_STORE_BATCH_ITEMS = int(os.getenv("REPLICATION_STORE_BATCH_ITEMS", "32"))
-DEFAULT_STORE_BATCH_BYTES = int(os.getenv("REPLICATION_STORE_BATCH_BYTES", str(4 * 1024 * 1024)))
+DEFAULT_STREAM_INFLIGHT = int(os.getenv("REPLICATION_STREAM_INFLIGHT", "64"))
 DEFAULT_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
 
@@ -104,9 +104,35 @@ class StorageRpcPool:
             self._stubs.clear()
 
 
-class TargetReplicationSession:
+class _QueueIterator:
+    def __init__(self, maxsize: int):
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
+        self._sentinel = object()
+        self._closed = False
+
+    def put(self, item) -> None:
+        if self._closed:
+            return
+        self._queue.put(item)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(self._sentinel)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._queue.get()
+        if item is self._sentinel:
+            raise StopIteration
+        return item
+
+
+class TargetStreamingSession:
     """
-    Sesión persistente hacia un nodo destino.
+    Sesión persistente hacia un target remoto.
     """
 
     def __init__(
@@ -117,110 +143,117 @@ class TargetReplicationSession:
         rpc_pool: StorageRpcPool,
         rpc_timeout_s: float,
         probe_batch_hashes: int,
-        store_batch_items: int,
-        store_batch_bytes: int,
+        stream_inflight: int,
     ):
         self.node_id = node_id
         self.address = address
         self._rpc_pool = rpc_pool
         self._rpc_timeout_s = float(rpc_timeout_s)
         self._probe_batch_hashes = max(1, int(probe_batch_hashes))
-        self._store_batch_items = max(1, int(store_batch_items))
-        self._store_batch_bytes = max(1, int(store_batch_bytes))
+        self._stream_inflight = max(1, int(stream_inflight))
 
     @property
     def _stub(self) -> p2p_storage_pb2_grpc.P2PStorageStub:
         return self._rpc_pool.get_stub(self.address)
 
     def probe_missing_hashes(self, chunk_hashes: Sequence[str]) -> set[str]:
-        """Pregunta al nodo remoto qué hashes no tiene todavía."""
         missing: set[str] = set()
         if not chunk_hashes:
             return missing
 
         for batch in _iter_hash_batches(chunk_hashes, self._probe_batch_hashes):
             request = p2p_storage_pb2.MissingChunksRequest(chunk_hashes=batch)
-            try:
-                response = self._stub.ProbeMissingChunks(request, timeout=self._rpc_timeout_s)
-                missing.update(chunk_hash for chunk_hash in response.missing_hashes if chunk_hash)
-            except grpc.RpcError as exc:
-                if exc.code() == grpc.StatusCode.UNIMPLEMENTED:
-                    # Permite una transición gradual si algún nodo todavía no soporta ProbeMissingChunks.
-                    missing.update(batch)
-                    continue
-                raise
+            response = self._stub.ProbeMissingChunks(request, timeout=self._rpc_timeout_s)
+            missing.update(chunk_hash for chunk_hash in response.missing_hashes if chunk_hash)
 
         return missing
 
-    def store_missing_chunks(self, items: Sequence[tuple[str, bytes]]) -> Dict[str, TargetAck]:
-        """Envía al nodo remoto los chunks que faltan, agrupados en lotes."""
-        results: Dict[str, TargetAck] = {}
-        if not items:
-            return results
+    def replicate_missing_hashes(self, chunk_hashes: Sequence[str], repo) -> Dict[str, TargetAck]:
+        ordered_hashes = list(dict.fromkeys(chunk_hashes))
+        if not ordered_hashes:
+            return {}
+        return self._replicate_with_stream(ordered_hashes, repo)
 
-        for batch in _iter_store_batches(items, self._store_batch_items, self._store_batch_bytes):
+    def _replicate_with_stream(self, chunk_hashes: Sequence[str], repo) -> Dict[str, TargetAck]:
+        request_iter = _QueueIterator(maxsize=self._stream_inflight)
+        acks: Dict[str, TargetAck] = {}
+        local_failures: Dict[str, TargetAck] = {}
+        stop_event = threading.Event()
+
+        def sender() -> None:
             try:
-                response = self._stub.StoreChunkBatch(
-                    p2p_storage_pb2.StoreChunkBatchRequest(
-                        items=[
-                            p2p_storage_pb2.BatchStoreItem(
-                                chunk_hash=chunk_hash,
-                                chunk_data=chunk_data,
-                            )
-                            for chunk_hash, chunk_data in batch
-                        ]
-                    ),
-                    timeout=self._rpc_timeout_s,
-                )
-                results.update(
-                    _normalize_batch_results(
-                        node_id=self.node_id,
-                        address=self.address,
-                        batch=batch,
-                        response=response,
+                for chunk_hash in chunk_hashes:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        chunk_data = repo.get_compressed(chunk_hash)
+                    except Exception as e:
+                        local_failures[chunk_hash] = TargetAck(
+                            chunk_hash=chunk_hash,
+                            node_id=self.node_id,
+                            address=self.address,
+                            success=False,
+                            already_present=False,
+                            message=f"Local read failed: {e}",
+                        )
+                        continue
+
+                    request_iter.put(
+                        p2p_storage_pb2.StreamStoreItem(
+                            chunk_hash=chunk_hash,
+                            chunk_data=chunk_data,
+                        )
                     )
-                )
-            except grpc.RpcError as exc:
-                if exc.code() == grpc.StatusCode.UNIMPLEMENTED:
-                    results.update(self._store_with_unary_fallback(batch))
+            finally:
+                request_iter.close()
+
+        sender_thread = threading.Thread(
+            target=sender,
+            name=f"stream-send-{self.node_id[:8]}",
+            daemon=True,
+        )
+        sender_thread.start()
+
+        try:
+            responses = self._stub.ReplicateChunks(request_iter, timeout=self._rpc_timeout_s)
+            for result in responses:
+                if not result.chunk_hash:
                     continue
-                raise
-
-        return results
-
-    def _store_with_unary_fallback(self, batch: Sequence[tuple[str, bytes]]) -> Dict[str, TargetAck]:
-        """Fallback para nodos que todavía solo implementan StoreChunk unary."""
-        out: Dict[str, TargetAck] = {}
-        for chunk_hash, chunk_data in batch:
-            request = p2p_storage_pb2.StoreRequest(chunk_hash=chunk_hash, chunk_data=chunk_data)
-            try:
-                response = self._stub.StoreChunk(request, timeout=self._rpc_timeout_s)
-                message = response.message or ""
-                out[chunk_hash] = TargetAck(
-                    chunk_hash=chunk_hash,
+                acks[result.chunk_hash] = TargetAck(
+                    chunk_hash=result.chunk_hash,
                     node_id=self.node_id,
                     address=self.address,
-                    success=bool(response.success),
-                    already_present=("already present" in message),
-                    message=message,
+                    success=bool(result.success),
+                    already_present=bool(result.already_present),
+                    message=result.message or "",
                 )
-            except grpc.RpcError as exc:
-                out[chunk_hash] = TargetAck(
+        except grpc.RpcError:
+            stop_event.set()
+            request_iter.close()
+            raise
+        finally:
+            stop_event.set()
+            request_iter.close()
+            sender_thread.join(timeout=2.0)
+
+        acks.update(local_failures)
+
+        for chunk_hash in chunk_hashes:
+            if chunk_hash not in acks:
+                acks[chunk_hash] = TargetAck(
                     chunk_hash=chunk_hash,
                     node_id=self.node_id,
                     address=self.address,
                     success=False,
                     already_present=False,
-                    message=f"RPC {exc.code().name}: {exc.details()}",
+                    message="Stream ended without per-chunk ack",
                 )
 
-        return out
+        return acks
 
 
-class BatchReplicationCoordinator:
-    """
-    Coordina la replicación por RF usando preflight y escritura por lotes.
-    """
+class StreamingReplicationCoordinator:
+    """Coordina la protección RF usando probe por lotes y streaming de chunks."""
 
     def __init__(
         self,
@@ -232,8 +265,7 @@ class BatchReplicationCoordinator:
         rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
         target_parallelism: int = DEFAULT_TARGET_PARALLELISM,
         probe_batch_hashes: int = DEFAULT_PROBE_BATCH_HASHES,
-        store_batch_items: int = DEFAULT_STORE_BATCH_ITEMS,
-        store_batch_bytes: int = DEFAULT_STORE_BATCH_BYTES,
+        stream_inflight: int = DEFAULT_STREAM_INFLIGHT,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     ):
         self.repo = repo
@@ -243,11 +275,9 @@ class BatchReplicationCoordinator:
         self.rpc_timeout_s = float(rpc_timeout_s)
         self.target_parallelism = max(1, int(target_parallelism))
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
-        self.store_batch_items = max(1, int(store_batch_items))
-        self.store_batch_bytes = max(1, int(store_batch_bytes))
-
+        self.stream_inflight = max(1, int(stream_inflight))
         self._rpc_pool = StorageRpcPool(max_message_bytes=max_message_bytes)
-        self._sessions: Dict[str, TargetReplicationSession] = {}
+        self._sessions: Dict[str, TargetStreamingSession] = {}
         self._sessions_lock = threading.Lock()
 
     def close(self) -> None:
@@ -255,20 +285,19 @@ class BatchReplicationCoordinator:
             self._sessions.clear()
         self._rpc_pool.close()
 
-    def _get_session(self, member) -> TargetReplicationSession:
+    def _get_session(self, member) -> TargetStreamingSession:
         with self._sessions_lock:
             session = self._sessions.get(member.address)
             if session is not None:
                 return session
 
-            session = TargetReplicationSession(
+            session = TargetStreamingSession(
                 node_id=member.node_id,
                 address=member.address,
                 rpc_pool=self._rpc_pool,
                 rpc_timeout_s=self.rpc_timeout_s,
                 probe_batch_hashes=self.probe_batch_hashes,
-                store_batch_items=self.store_batch_items,
-                store_batch_bytes=self.store_batch_bytes,
+                stream_inflight=self.stream_inflight,
             )
             self._sessions[member.address] = session
             return session
@@ -306,7 +335,7 @@ class BatchReplicationCoordinator:
             )
 
         acks: Dict[str, TargetAck] = {}
-        items_to_send: List[tuple[str, bytes]] = []
+        to_send = [chunk_hash for chunk_hash in ordered_hashes if chunk_hash in missing_hashes]
 
         for chunk_hash in ordered_hashes:
             if chunk_hash not in missing_hashes:
@@ -318,39 +347,19 @@ class BatchReplicationCoordinator:
                     already_present=True,
                     message="already present on remote target",
                 )
-                continue
 
+        if to_send:
             try:
-                chunk_data = self.repo.get_compressed(chunk_hash)
-            except Exception as exc:
-                acks[chunk_hash] = TargetAck(
-                    chunk_hash=chunk_hash,
-                    node_id=member.node_id,
-                    address=member.address,
-                    success=False,
-                    already_present=False,
-                    message=f"local read failed: {exc}",
-                )
-                continue
-
-            items_to_send.append((chunk_hash, chunk_data))
-
-        if items_to_send:
-            try:
-                acks.update(session.store_missing_chunks(items_to_send))
+                acks.update(session.replicate_missing_hashes(to_send, self.repo))
             except Exception as exc:
                 return TargetExecutionResult(
                     node_id=member.node_id,
                     address=member.address,
                     acks=acks,
-                    transport_error=f"store batch failed: {exc}",
+                    transport_error=f"stream replication failed: {exc}",
                 )
 
-        return TargetExecutionResult(
-            node_id=member.node_id,
-            address=member.address,
-            acks=acks,
-        )
+        return TargetExecutionResult(node_id=member.node_id, address=member.address, acks=acks)
 
     def replicate_chunks(self, chunk_hashes: Iterable[str]) -> Iterator[ChunkReplicationOutcome]:
         ordered_hashes = list(chunk_hashes)
@@ -365,7 +374,7 @@ class BatchReplicationCoordinator:
             chunk_hash for chunk_hash, targets in chunk_targets.items() if not targets
         }
 
-        with ThreadPoolExecutor(max_workers=self.target_parallelism, thread_name_prefix="target-batch") as executor:
+        with ThreadPoolExecutor(max_workers=self.target_parallelism, thread_name_prefix="target-stream") as executor:
             future_map = {
                 executor.submit(self._execute_target_plan, target_member[address], hashes): address
                 for address, hashes in target_chunks.items()
@@ -385,7 +394,6 @@ class BatchReplicationCoordinator:
                     )
 
                 planned_hashes = target_chunks[address]
-
                 if target_result.transport_error:
                     message = f"{target_result.node_id[:8]}@{target_result.address}: {target_result.transport_error}"
                     for chunk_hash in planned_hashes:
@@ -445,71 +453,3 @@ def _iter_hash_batches(chunk_hashes: Sequence[str], batch_size: int) -> Iterator
             current = []
     if current:
         yield current
-
-
-def _iter_store_batches(
-    items: Sequence[tuple[str, bytes]],
-    max_items: int,
-    max_bytes: int,
-) -> Iterator[List[tuple[str, bytes]]]:
-    max_items = max(1, int(max_items))
-    max_bytes = max(1, int(max_bytes))
-
-    batch: List[tuple[str, bytes]] = []
-    batch_bytes = 0
-
-    for chunk_hash, chunk_data in items:
-        chunk_bytes = len(chunk_data)
-
-        if batch and (len(batch) >= max_items or (batch_bytes + chunk_bytes) > max_bytes):
-            yield batch
-            batch = []
-            batch_bytes = 0
-
-        batch.append((chunk_hash, chunk_data))
-        batch_bytes += chunk_bytes
-
-        if chunk_bytes >= max_bytes:
-            yield batch
-            batch = []
-            batch_bytes = 0
-
-    if batch:
-        yield batch
-
-
-def _normalize_batch_results(
-    *,
-    node_id: str,
-    address: str,
-    batch: Sequence[tuple[str, bytes]],
-    response,
-) -> Dict[str, TargetAck]:
-    out: Dict[str, TargetAck] = {}
-    expected = {chunk_hash for chunk_hash, _ in batch}
-
-    for result in response.results:
-        chunk_hash = result.chunk_hash
-        if chunk_hash not in expected:
-            continue
-        out[chunk_hash] = TargetAck(
-            chunk_hash=chunk_hash,
-            node_id=node_id,
-            address=address,
-            success=bool(result.success),
-            already_present=bool(result.already_present),
-            message=result.message or "",
-        )
-
-    for chunk_hash, _ in batch:
-        if chunk_hash not in out:
-            out[chunk_hash] = TargetAck(
-                chunk_hash=chunk_hash,
-                node_id=node_id,
-                address=address,
-                success=False,
-                already_present=False,
-                message="batch response omitted chunk result",
-            )
-
-    return out

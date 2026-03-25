@@ -5,13 +5,12 @@ import time
 from core.cluster_view import ClusterMembershipClient
 from core.database import MetadataDB
 from core.replication import (
-    BatchReplicationCoordinator,
     DEFAULT_MAX_MESSAGE_BYTES,
     DEFAULT_PROBE_BATCH_HASHES,
     DEFAULT_RPC_TIMEOUT_S,
-    DEFAULT_STORE_BATCH_BYTES,
-    DEFAULT_STORE_BATCH_ITEMS,
+    DEFAULT_STREAM_INFLIGHT,
     DEFAULT_TARGET_PARALLELISM,
+    StreamingReplicationCoordinator,
 )
 from core.repository import CASRepository
 
@@ -29,8 +28,7 @@ def push_to_network(
     limit: int | None = None,
     target_parallelism: int = DEFAULT_TARGET_PARALLELISM,
     probe_batch_hashes: int = DEFAULT_PROBE_BATCH_HASHES,
-    store_batch_items: int = DEFAULT_STORE_BATCH_ITEMS,
-    store_batch_bytes: int = DEFAULT_STORE_BATCH_BYTES,
+    stream_inflight: int = DEFAULT_STREAM_INFLIGHT,
     rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     commit_every: int = DEFAULT_COMMIT_EVERY,
@@ -45,9 +43,8 @@ def push_to_network(
     stored_remote = 0
     already_present_remote = 0
     pending_chunks = []
-    coordinator = None
-    start_time = time.perf_counter()
     current_epoch = "unknown"
+    start_time = time.perf_counter()
 
     try:
         self_addr = os.getenv("ADVERTISE_ADDR", "")
@@ -69,7 +66,7 @@ def push_to_network(
             print("No chunks pending for the current protection policy.")
             return
 
-        coordinator = BatchReplicationCoordinator(
+        coordinator = StreamingReplicationCoordinator(
             repo=repo,
             cluster=cluster,
             rf=rf,
@@ -77,12 +74,11 @@ def push_to_network(
             rpc_timeout_s=rpc_timeout_s,
             target_parallelism=target_parallelism,
             probe_batch_hashes=probe_batch_hashes,
-            store_batch_items=store_batch_items,
-            store_batch_bytes=store_batch_bytes,
+            stream_inflight=stream_inflight,
             max_message_bytes=max_message_bytes,
         )
 
-        print(f"Push batch: {len(pending_chunks)} chunks pending for protection")
+        print(f"Push stream: {len(pending_chunks)} chunks pending for protection")
         print(f"Eligible members: {[f'{m.node_id[:8]}@{m.address}' for m in cluster.members]}")
         if cluster.self_node_id:
             print(f"Self: {cluster.self_node_id[:8]}@{self_addr}")
@@ -91,8 +87,7 @@ def push_to_network(
         print(
             f"Pipeline: target_parallelism={target_parallelism} "
             f"probe_batch_hashes={probe_batch_hashes} "
-            f"store_batch_items={store_batch_items} "
-            f"store_batch_bytes={store_batch_bytes}"
+            f"stream_inflight={stream_inflight}"
         )
 
         for outcome in coordinator.replicate_chunks(pending_chunks):
@@ -138,6 +133,7 @@ def push_to_network(
     finally:
         if coordinator is not None:
             coordinator.close()
+
         db.commit()
         db.close()
 
@@ -165,8 +161,7 @@ if __name__ == "__main__":
     push_parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución")
     push_parser.add_argument("--target-parallelism", type=int, default=DEFAULT_TARGET_PARALLELISM, help="Número de nodos destino procesados en paralelo")
     push_parser.add_argument("--probe-batch-hashes", type=int, default=DEFAULT_PROBE_BATCH_HASHES, help="Hashes por lote de inventario remoto")
-    push_parser.add_argument("--store-batch-items", type=int, default=DEFAULT_STORE_BATCH_ITEMS, help="Máximo de chunks por lote de escritura")
-    push_parser.add_argument("--store-batch-bytes", type=int, default=DEFAULT_STORE_BATCH_BYTES, help="Máximo de bytes por lote de escritura")
+    push_parser.add_argument("--stream-inflight", type=int, default=DEFAULT_STREAM_INFLIGHT, help="Ventana máxima de chunks en vuelo por stream")
     push_parser.add_argument("--rpc-timeout", type=float, default=DEFAULT_RPC_TIMEOUT_S, help="Timeout RPC en segundos")
     push_parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MAX_MESSAGE_BYTES, help="Límite de mensaje gRPC")
     push_parser.add_argument("--commit-every", type=int, default=DEFAULT_COMMIT_EVERY, help="Guardar progreso cada N resultados")
@@ -180,8 +175,7 @@ if __name__ == "__main__":
             limit=args.limit,
             target_parallelism=args.target_parallelism,
             probe_batch_hashes=args.probe_batch_hashes,
-            store_batch_items=args.store_batch_items,
-            store_batch_bytes=args.store_batch_bytes,
+            stream_inflight=args.stream_inflight,
             rpc_timeout_s=args.rpc_timeout,
             max_message_bytes=args.max_message_bytes,
             commit_every=args.commit_every,

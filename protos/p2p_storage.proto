@@ -1,20 +1,9 @@
 syntax = "proto3";
 
 service P2PStorage {
-  rpc StoreChunk(StoreRequest) returns (StoreResponse);
   rpc RetrieveChunk(RetrieveRequest) returns (RetrieveResponse);
   rpc ProbeMissingChunks(MissingChunksRequest) returns (MissingChunksResponse);
-  rpc StoreChunkBatch(StoreChunkBatchRequest) returns (StoreChunkBatchResponse);
-}
-
-message StoreRequest {
-  string chunk_hash = 1;
-  bytes chunk_data = 2;
-}
-
-message StoreResponse {
-  bool success = 1;
-  string message = 2;
+  rpc ReplicateChunks(stream StreamStoreItem) returns (stream StreamStoreResult);
 }
 
 message RetrieveRequest {
@@ -35,22 +24,14 @@ message MissingChunksResponse {
   repeated string missing_hashes = 1;
 }
 
-message BatchStoreItem {
+message StreamStoreItem {
   string chunk_hash = 1;
   bytes chunk_data = 2;
 }
 
-message BatchStoreResult {
+message StreamStoreResult {
   string chunk_hash = 1;
   bool success = 2;
   bool already_present = 3;
   string message = 4;
-}
-
-message StoreChunkBatchRequest {
-  repeated BatchStoreItem items = 1;
-}
-
-message StoreChunkBatchResponse {
-  repeated BatchStoreResult results = 1;
 }

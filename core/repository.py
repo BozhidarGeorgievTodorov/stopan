@@ -1,4 +1,5 @@
 import os
+import threading
 import uuid
 
 import blake3
@@ -9,15 +10,51 @@ ZSTD_LEVEL = 3
 
 
 class CASRepository:
-    """
-    Almacena bloques direccionados por hash en disco.
-    """
+    """Repositorio CAS local con sharding, compresión y verificación por hash."""
 
-    def __init__(self, data_folder=DATA_FOLDER):
-        self.data_folder = data_folder
-        self.compressor = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-        self.decompressor = zstd.ZstdDecompressor()
-        os.makedirs(self.data_folder, exist_ok=True)
+    __slots__ = ("root_path", "_tls", "_ensured_dirs", "_dir_lock")
+
+    def __init__(self, root_path=DATA_FOLDER):
+        self.root_path = root_path
+        os.makedirs(root_path, exist_ok=True)
+
+        # Contextos thread-local: el repositorio puede usarse desde varios hilos
+        # durante backup, restore y recepción remota de chunks.
+        self._tls = threading.local()
+
+        # Evita llamar a os.makedirs() para directorios de shard ya creados.
+        self._ensured_dirs = {os.path.abspath(root_path)}
+        self._dir_lock = threading.Lock()
+
+    def _compressor(self):
+        compressor = getattr(self._tls, "compressor", None)
+        if compressor is None:
+            compressor = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+            self._tls.compressor = compressor
+        return compressor
+
+    def _decompressor(self):
+        decompressor = getattr(self._tls, "decompressor", None)
+        if decompressor is None:
+            decompressor = zstd.ZstdDecompressor()
+            self._tls.decompressor = decompressor
+        return decompressor
+
+    def _chunk_path(self, chunk_hash):
+        first_dir = chunk_hash[:2]
+        second_dir = chunk_hash[2:4]
+        return os.path.join(self.root_path, first_dir, second_dir, chunk_hash)
+
+    def _ensure_parent_dir(self, path):
+        parent = os.path.dirname(path)
+        if parent in self._ensured_dirs:
+            return
+
+        with self._dir_lock:
+            if parent in self._ensured_dirs:
+                return
+            os.makedirs(parent, exist_ok=True)
+            self._ensured_dirs.add(parent)
 
     def exists_local(self, chunk_hash):
         """Comprueba si el bloque ya existe en el repositorio local."""
@@ -25,7 +62,7 @@ class CASRepository:
 
     def put(self, chunk_hash, chunk_data):
         """Comprime y guarda un bloque si todavía no existe."""
-        compressed_data = self.compressor.compress(chunk_data)
+        compressed_data = self._compressor().compress(chunk_data)
         return self.put_compressed(chunk_hash, compressed_data)
 
     def put_compressed(self, chunk_hash, compressed_data):
@@ -36,22 +73,22 @@ class CASRepository:
         if os.path.exists(path):
             return False
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._ensure_parent_dir(path)
         temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
         written = False
 
         try:
-            with open(temp_path, 'wb') as f:
+            with open(temp_path, "wb") as f:
                 f.write(compressed_data)
 
-            os.replace(temp_path, path)
-            written = True
-            return True
-
-        except Exception:
-            if os.path.exists(path):
-                return False
-            raise
+            try:
+                os.replace(temp_path, path)
+                written = True
+                return True
+            except OSError:
+                if os.path.exists(path):
+                    return False
+                raise
 
         finally:
             if not written:
@@ -71,7 +108,7 @@ class CASRepository:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Missing block: {chunk_hash}")
 
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             return f.read()
 
     def _validate_compressed_block(self, chunk_hash, compressed_data):
@@ -79,7 +116,7 @@ class CASRepository:
 
     def _decompress_and_validate(self, chunk_hash, compressed_data):
         try:
-            data = self.decompressor.decompress(compressed_data)
+            data = self._decompressor().decompress(compressed_data)
         except zstd.ZstdError as exc:
             raise ValueError(f"Corrupt compressed block: {chunk_hash}") from exc
 
@@ -88,8 +125,3 @@ class CASRepository:
             raise ValueError(f"Corrupt block: {chunk_hash}")
 
         return data
-
-    def _chunk_path(self, chunk_hash):
-        first_dir = chunk_hash[:2]
-        second_dir = chunk_hash[2:4]
-        return os.path.join(self.data_folder, first_dir, second_dir, chunk_hash)

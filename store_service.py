@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import random
+import queue
 import threading
 import grpc
 from concurrent import futures
@@ -384,45 +385,94 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
         return membership_pb2.GetMembersResponse(members=self.mgr.get_members_snapshot(eligible_only=True))
 
 
+
+@dataclass(frozen=True)
+class StorageCommitResult:
+    chunk_hash: str
+    success: bool
+    already_present: bool
+    message: str
+
+
+class StorageCommitEngine:
+    """
+    Motor interno de ingestión de chunks.
+
+    Desacopla la recepción por gRPC del coste de validar, descomprimir y
+    persistir bloques en el CAS. La cola acotada aplica backpressure cuando
+    el disco o la CPU no siguen el ritmo del stream.
+    """
+
+    def __init__(self, repo: CASRepository):
+        self.repo = repo
+        self._tls = threading.local()
+        self._max_chunk_size = MAX_CHUNK_SIZE
+        self._max_pending = int(os.getenv("STORAGE_COMMIT_QUEUE_ITEMS", "256"))
+        self._worker_count = int(os.getenv("STORAGE_COMMIT_WORKERS", str(max(4, os.cpu_count() or 4))))
+        self._executor = futures.ThreadPoolExecutor(
+            max_workers=self._worker_count,
+            thread_name_prefix="storage-commit",
+        )
+        self._slots = threading.Semaphore(max(1, self._max_pending))
+
+    @property
+    def worker_count(self):
+        return self._worker_count
+
+    @property
+    def max_pending(self):
+        return self._max_pending
+
+    def close(self):
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+    def _decompressor(self):
+        decompressor = getattr(self._tls, "decompressor", None)
+        if decompressor is None:
+            decompressor = zstd.ZstdDecompressor()
+            self._tls.decompressor = decompressor
+        return decompressor
+
+    def process_one(self, chunk_hash: str, chunk_data: bytes) -> StorageCommitResult:
+        if self.repo.exists_local(chunk_hash):
+            return StorageCommitResult(chunk_hash, True, True, "already present")
+
+        try:
+            raw = self._decompressor().decompress(
+                chunk_data,
+                max_output_size=self._max_chunk_size,
+            )
+        except zstd.ZstdError:
+            return StorageCommitResult(chunk_hash, False, False, "rejected: corrupt zstd data")
+        except Exception:
+            return StorageCommitResult(chunk_hash, False, False, "rejected: decompressed output too large")
+
+        actual_hash = blake3.blake3(raw).hexdigest()
+        if actual_hash != chunk_hash:
+            return StorageCommitResult(chunk_hash, False, False, "rejected: hash mismatch")
+
+        is_new = self.repo.put_compressed(chunk_hash, chunk_data)
+        if is_new:
+            return StorageCommitResult(chunk_hash, True, False, "stored")
+        return StorageCommitResult(chunk_hash, True, True, "already present")
+
+    def submit(self, chunk_hash: str, chunk_data: bytes):
+        self._slots.acquire()
+        future = self._executor.submit(self.process_one, chunk_hash, chunk_data)
+        future.add_done_callback(lambda _f: self._slots.release())
+        return future
+
 class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
     """Servicio gRPC que recibe y sirve chunks comprimidos."""
 
     def __init__(self, repo_store_dir: str):
         self.repo = CASRepository(repo_store_dir)
-        self._thread_local = threading.local()
+        self._engine = StorageCommitEngine(self.repo)
         print(f"Storage node using repository: {os.path.abspath(repo_store_dir)}")
+        print(f"Commit engine: workers={self._engine.worker_count} queue={self._engine.max_pending}")
 
-    def _get_thread_local_decompressor(self):
-        """Devuelve un descompresor Zstandard propio del hilo actual."""
-        decompressor = getattr(self._thread_local, "decompressor", None)
-        if decompressor is None:
-            decompressor = zstd.ZstdDecompressor()
-            self._thread_local.decompressor = decompressor
-        return decompressor
-
-    def _validate_and_store_one(self, chunk_hash: str, chunk_data: bytes):
-        """Valida un chunk comprimido y lo guarda si todavía no existe."""
-        if self.repo.exists_local(chunk_hash):
-            return True, True, "already present"
-
-        try:
-            raw = self._get_thread_local_decompressor().decompress(
-                chunk_data,
-                max_output_size=MAX_CHUNK_SIZE,
-            )
-        except zstd.ZstdError:
-            return False, False, "rejected: corrupt zstd data"
-        except Exception:
-            return False, False, "rejected: decompressed output too large"
-
-        h = blake3.blake3(raw).hexdigest()
-        if h != chunk_hash:
-            return False, False, "rejected: hash mismatch"
-
-        is_new = self.repo.put_compressed(chunk_hash, chunk_data)
-        if is_new:
-            return True, False, "stored"
-        return True, True, "already present"
+    def close(self):
+        self._engine.close()
 
     def ProbeMissingChunks(self, request, context):
         """Devuelve solo los hashes que este nodo no tiene en local."""
@@ -436,22 +486,88 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
 
     def ReplicateChunks(self, request_iterator, context):
         """Guarda chunks recibidos por stream y devuelve una respuesta por item."""
+        future_queue: queue.Queue = queue.Queue(maxsize=max(1, self._engine.max_pending))
+        sentinel = object()
+        reader_error = []
+
+        def reader():
+            try:
+                for item in request_iterator:
+                    if not context.is_active():
+                        break
+                    if not item.chunk_hash:
+                        continue
+                    future_queue.put(self._engine.submit(item.chunk_hash, item.chunk_data))
+            except Exception as exc:
+                reader_error.append(exc)
+            finally:
+                future_queue.put(sentinel)
+
+        reader_thread = threading.Thread(target=reader, name="storage-stream-reader", daemon=True)
+        reader_thread.start()
+
+        in_flight = set()
+        reader_finished = False
+
         try:
-            for item in request_iterator:
-                success, already_present, message = self._validate_and_store_one(
-                    item.chunk_hash,
-                    item.chunk_data,
+            while True:
+                drained_any = False
+                while True:
+                    try:
+                        item = future_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    drained_any = True
+                    if item is sentinel:
+                        reader_finished = True
+                    else:
+                        in_flight.add(item)
+
+                if not in_flight and reader_finished:
+                    break
+
+                if not in_flight:
+                    item = future_queue.get()
+                    if item is sentinel:
+                        reader_finished = True
+                        if not in_flight:
+                            break
+                    else:
+                        in_flight.add(item)
+                    continue
+
+                done, pending = futures.wait(
+                    in_flight,
+                    timeout=0.05,
+                    return_when=futures.FIRST_COMPLETED,
                 )
-                yield p2p_storage_pb2.StreamStoreResult(
-                    chunk_hash=item.chunk_hash,
-                    success=success,
-                    already_present=already_present,
-                    message=message,
-                )
+                in_flight = set(pending)
+
+                for future in done:
+                    result = future.result()
+                    yield p2p_storage_pb2.StreamStoreResult(
+                        chunk_hash=result.chunk_hash,
+                        success=result.success,
+                        already_present=result.already_present,
+                        message=result.message,
+                    )
+
+                if reader_finished and not in_flight:
+                    break
+
+                if (not drained_any) and (not done) and (not context.is_active()):
+                    break
+
+            if reader_error:
+                raise reader_error[0]
+
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return
+        finally:
+            reader_thread.join(timeout=2.0)
 
     def RetrieveChunk(self, request, context):
         """Devuelve el chunk comprimido tal como está almacenado."""
@@ -460,7 +576,6 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             return p2p_storage_pb2.RetrieveResponse(success=True, chunk_data=data, message="ok")
         except Exception as e:
             return p2p_storage_pb2.RetrieveResponse(success=False, message=str(e))
-
 
 def load_or_create_node_id(path: str) -> str:
     """Carga un identificador persistente del nodo o crea uno nuevo."""
@@ -496,7 +611,8 @@ def serve():
             ("grpc.keepalive_permit_without_calls", 1),
         ],
     )
-    p2p_storage_pb2_grpc.add_P2PStorageServicer_to_server(StorageNodeServicer(repo_store_dir), server)
+    storage_servicer = StorageNodeServicer(repo_store_dir)
+    p2p_storage_pb2_grpc.add_P2PStorageServicer_to_server(storage_servicer, server)
     membership_pb2_grpc.add_MembershipServicer_to_server(MembershipServicer(mgr), server)
 
     server.add_insecure_port(BIND_ADDR)
@@ -512,6 +628,7 @@ def serve():
         pass
     finally:
         mgr.stop()
+        storage_servicer.close()
         server.stop(0)
 
 

@@ -569,13 +569,39 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         finally:
             reader_thread.join(timeout=2.0)
 
-    def RetrieveChunk(self, request, context):
-        """Devuelve el chunk comprimido tal como está almacenado."""
+    def RetrieveChunkBatch(self, request, context):
+        """Devuelve varios chunks comprimidos en una sola llamada gRPC."""
         try:
-            data = self.repo.get_compressed(request.chunk_hash)
-            return p2p_storage_pb2.RetrieveResponse(success=True, chunk_data=data, message="ok")
+            results = []
+            for chunk_hash in request.chunk_hashes:
+                if not chunk_hash:
+                    continue
+
+                try:
+                    data = self.repo.get_compressed(chunk_hash)
+                    results.append(
+                        p2p_storage_pb2.BatchRetrieveResult(
+                            chunk_hash=chunk_hash,
+                            success=True,
+                            chunk_data=data,
+                            message="ok",
+                        )
+                    )
+                except Exception as e:
+                    results.append(
+                        p2p_storage_pb2.BatchRetrieveResult(
+                            chunk_hash=chunk_hash,
+                            success=False,
+                            message=str(e),
+                        )
+                    )
+
+            return p2p_storage_pb2.RetrieveChunkBatchResponse(results=results)
+
         except Exception as e:
-            return p2p_storage_pb2.RetrieveResponse(success=False, message=str(e))
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return p2p_storage_pb2.RetrieveChunkBatchResponse()
 
 def load_or_create_node_id(path: str) -> str:
     """Carga un identificador persistente del nodo o crea uno nuevo."""

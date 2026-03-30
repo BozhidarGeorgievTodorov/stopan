@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from core.database import MetadataDB
 from core.repository import CASRepository
 
+
 LOCAL_SHARD_DIR = os.getenv("LOCAL_SHARD_DIR", "_data_chunks")
 DB_FILE = os.getenv("DB_FILE", "_metadata.db")
 CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
 DEFAULT_RF = int(os.getenv("RF", os.getenv("REPLICATION_FACTOR", "3")))
 DEFAULT_SEED = os.getenv("MEMBERSHIP_SEED", "localhost:50051")
 DEFAULT_RPC_TIMEOUT_S = float(os.getenv("RESTORE_RPC_TIMEOUT_S", "5.0"))
-DEFAULT_PREFETCH_WORKERS = int(os.getenv("RESTORE_PREFETCH_WORKERS", "8"))
+DEFAULT_BATCH_TARGET_PARALLELISM = int(os.getenv("RESTORE_BATCH_TARGET_PARALLELISM", "4"))
 DEFAULT_PREFETCH_WINDOW = int(os.getenv("RESTORE_PREFETCH_WINDOW", "32"))
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
@@ -44,12 +45,20 @@ class RestorePaths:
         return RestorePaths(final_dir=final_dir, incomplete_dir=final_dir + ".incomplete")
 
 
+@dataclass(frozen=True)
+class BatchRetrieveItemResult:
+    chunk_hash: str
+    success: bool
+    chunk_data: bytes
+    message: str
+
+
 class RemoteStorageClientPool:
     """
     Pool de clientes remotos para restore.
 
     La carga de grpc/protobuf se retrasa hasta que realmente falta un chunk
-    local y hay que consultar la red.
+    local y hay que consultar la red. La lectura remota usa RetrieveChunkBatch.
     """
 
     def __init__(self, *, timeout_s=DEFAULT_RPC_TIMEOUT_S):
@@ -89,10 +98,36 @@ class RemoteStorageClientPool:
                 self._stubs[address] = self._p2p_storage_pb2_grpc.P2PStorageStub(channel)
             return self._stubs[address]
 
-    def retrieve_chunk(self, *, address, chunk_hash):
+    def retrieve_chunk_batch(self, *, address, chunk_hashes):
+        self._ensure_runtime()
+        if not chunk_hashes:
+            return {}
+
         stub = self._get_stub(address)
-        request = self._p2p_storage_pb2.RetrieveRequest(chunk_hash=chunk_hash)
-        return stub.RetrieveChunk(request, timeout=self.timeout_s)
+        request = self._p2p_storage_pb2.RetrieveChunkBatchRequest(chunk_hashes=list(chunk_hashes))
+        response = stub.RetrieveChunkBatch(request, timeout=self.timeout_s)
+
+        results = {}
+        for item in response.results:
+            if not item.chunk_hash:
+                continue
+            results[item.chunk_hash] = BatchRetrieveItemResult(
+                chunk_hash=item.chunk_hash,
+                success=bool(item.success),
+                chunk_data=bytes(item.chunk_data),
+                message=item.message or "",
+            )
+
+        for chunk_hash in chunk_hashes:
+            if chunk_hash not in results:
+                results[chunk_hash] = BatchRetrieveItemResult(
+                    chunk_hash=chunk_hash,
+                    success=False,
+                    chunk_data=b"",
+                    message="missing batch result",
+                )
+
+        return results
 
     def is_rpc_error(self, exc):
         self._ensure_runtime()
@@ -155,7 +190,7 @@ class LazyClusterResolver:
 
 class ChunkFetchService:
     """
-    Lee chunks con prioridad local y recuperación remota bajo demanda.
+    Lee chunks con prioridad local y recuperación remota por lotes bajo demanda.
     """
 
     def __init__(self, *, repo, cluster_resolver, remote_pool, rf):
@@ -164,87 +199,155 @@ class ChunkFetchService:
         self.remote_pool = remote_pool
         self.rf = max(int(rf), 1)
 
-    def fetch_raw_chunk(self, chunk_hash):
-        try:
-            return self.repo.get(chunk_hash)
-        except FileNotFoundError:
-            return self._fetch_from_remote(chunk_hash)
+    def fetch_many_raw_chunks(self, chunk_hashes, *, target_parallelism):
+        ordered_hashes = list(chunk_hashes)
+        results = {}
+        missing = []
 
-    def _fetch_from_remote(self, chunk_hash):
+        for chunk_hash in ordered_hashes:
+            try:
+                results[chunk_hash] = self.repo.get(chunk_hash)
+            except FileNotFoundError:
+                missing.append(chunk_hash)
+            except Exception as exc:
+                results[chunk_hash] = exc
+
+        if missing:
+            results.update(
+                self._fetch_missing_many_from_remote(
+                    missing,
+                    target_parallelism=max(int(target_parallelism), 1),
+                )
+            )
+
+        return results
+
+    def _fetch_missing_many_from_remote(self, missing_hashes, *, target_parallelism):
         cluster = self.cluster_resolver.get_cluster()
         self.cluster_resolver.announce_once()
 
-        targets = cluster.hrw_remote_targets(chunk_hash, rf=self.rf, salt=CLUSTER_TOKEN)
-        if not targets:
-            raise FileNotFoundError(f"Missing local chunk and no remote targets available: {chunk_hash}")
+        target_lists = {}
+        result_map = {}
+        error_map = {chunk_hash: [] for chunk_hash in missing_hashes}
 
-        errors = []
-        for member in targets:
-            try:
-                response = self.remote_pool.retrieve_chunk(address=member.address, chunk_hash=chunk_hash)
-                if not response.success:
-                    errors.append(f"{member.address}: {response.message}")
+        for chunk_hash in missing_hashes:
+            targets = cluster.hrw_remote_targets(chunk_hash, rf=self.rf, salt=CLUSTER_TOKEN)
+            target_lists[chunk_hash] = targets
+            if not targets:
+                result_map[chunk_hash] = FileNotFoundError(
+                    f"Chunk {chunk_hash[:8]} is not local and has no usable HRW targets."
+                )
+
+        unresolved = {chunk_hash for chunk_hash in missing_hashes if chunk_hash not in result_map}
+        max_depth = max((len(target_lists[chunk_hash]) for chunk_hash in unresolved), default=0)
+
+        for rank in range(max_depth):
+            if not unresolved:
+                break
+
+            groups = {}
+            for chunk_hash in list(unresolved):
+                targets = target_lists[chunk_hash]
+                if rank >= len(targets):
                     continue
 
-                self.repo.put_compressed(chunk_hash, response.chunk_data)
-                return self.repo.get(chunk_hash)
+                member = targets[rank]
+                if member.address not in groups:
+                    groups[member.address] = (member, [])
+                groups[member.address][1].append(chunk_hash)
 
-            except Exception as exc:
-                if self.remote_pool.is_rpc_error(exc):
-                    details = getattr(exc, "details", lambda: str(exc))()
-                    errors.append(f"{member.address}: RPC {details}")
-                else:
-                    errors.append(f"{member.address}: {exc}")
+            if not groups:
+                break
 
-        raise FileNotFoundError(
-            f"Chunk {chunk_hash[:8]} not returned by any HRW target. " + " | ".join(errors)
-        )
+            max_workers = min(max(int(target_parallelism), 1), len(groups))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self.remote_pool.retrieve_chunk_batch,
+                        address=member.address,
+                        chunk_hashes=group_hashes,
+                    ): (member, group_hashes)
+                    for member, group_hashes in groups.values()
+                }
+
+                for future in concurrent.futures.as_completed(future_map):
+                    member, group_hashes = future_map[future]
+
+                    try:
+                        batch_results = future.result()
+                    except Exception as exc:
+                        if self.remote_pool.is_rpc_error(exc):
+                            details = getattr(exc, "details", lambda: str(exc))()
+                            message = f"{member.address}: RPC {details}"
+                        else:
+                            message = f"{member.address}: {exc}"
+
+                        for chunk_hash in group_hashes:
+                            error_map[chunk_hash].append(message)
+                        continue
+
+                    for chunk_hash in group_hashes:
+                        result = batch_results.get(chunk_hash)
+                        if result is None:
+                            error_map[chunk_hash].append(f"{member.address}: missing batch result")
+                            continue
+
+                        if not result.success:
+                            error_map[chunk_hash].append(f"{member.address}: {result.message}")
+                            continue
+
+                        try:
+                            self.repo.put_compressed(chunk_hash, result.chunk_data)
+                            result_map[chunk_hash] = self.repo.get(chunk_hash)
+                            unresolved.discard(chunk_hash)
+                        except Exception as exc:
+                            result_map[chunk_hash] = exc
+                            unresolved.discard(chunk_hash)
+
+        for chunk_hash in unresolved:
+            result_map[chunk_hash] = FileNotFoundError(
+                f"No HRW target returned chunk {chunk_hash[:8]}. " + " | ".join(error_map[chunk_hash])
+            )
+
+        return result_map
 
 
-class OrderedChunkPrefetcher:
+class OrderedBatchChunkPrefetcher:
     """
-    Prefetch ordenado y acotado de chunks.
+    Lee chunks por ventanas y conserva el orden de escritura del archivo.
 
-    Lanza varias lecturas en paralelo, pero entrega los bytes en el orden de la
-    receta para poder escribir cada archivo secuencialmente.
+    Cada ventana se resuelve local-first. Si faltan chunks, se agrupan por rank
+    HRW y por nodo remoto para reducir llamadas gRPC durante restore.
     """
 
-    def __init__(self, fetch_service, *, workers, window):
+    def __init__(self, fetch_service, *, target_parallelism, window):
         self.fetch_service = fetch_service
-        self.workers = max(int(workers), 1)
+        self.target_parallelism = max(int(target_parallelism), 1)
         self.window = max(int(window), 1)
 
     def iter_raw_chunks(self, chunk_hashes):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-            iterator = iter(chunk_hashes)
-            in_flight = {}
-            next_submit_idx = 0
-            next_yield_idx = 0
+        window = []
 
-            def submit_one(chunk_hash):
-                nonlocal next_submit_idx
-                future = executor.submit(self.fetch_service.fetch_raw_chunk, chunk_hash)
-                in_flight[next_submit_idx] = (chunk_hash, future)
-                next_submit_idx += 1
+        for chunk_hash in chunk_hashes:
+            window.append(chunk_hash)
+            if len(window) >= self.window:
+                yield from self._drain_window(window)
+                window = []
 
-            while len(in_flight) < self.window:
-                try:
-                    submit_one(next(iterator))
-                except StopIteration:
-                    break
+        if window:
+            yield from self._drain_window(window)
 
-            while in_flight:
-                chunk_hash, future = in_flight[next_yield_idx]
-                raw = future.result()
-                yield chunk_hash, raw
-                del in_flight[next_yield_idx]
-                next_yield_idx += 1
+    def _drain_window(self, window_hashes):
+        result_map = self.fetch_service.fetch_many_raw_chunks(
+            window_hashes,
+            target_parallelism=self.target_parallelism,
+        )
 
-                while len(in_flight) < self.window:
-                    try:
-                        submit_one(next(iterator))
-                    except StopIteration:
-                        break
+        for chunk_hash in window_hashes:
+            value = result_map[chunk_hash]
+            if isinstance(value, Exception):
+                raise value
+            yield chunk_hash, value
 
 
 class SnapshotRestorer:
@@ -254,135 +357,164 @@ class SnapshotRestorer:
         db,
         repo,
         fetch_service,
-        output_dir,
-        prefetch_workers,
+        base_output_dir,
+        batch_target_parallelism,
         prefetch_window,
     ):
         self.db = db
         self.repo = repo
         self.fetch_service = fetch_service
-        self.output_dir = output_dir
-        self.prefetch_workers = max(int(prefetch_workers), 1)
+        self.base_output_dir = base_output_dir
+        self.batch_target_parallelism = max(int(batch_target_parallelism), 1)
         self.prefetch_window = max(int(prefetch_window), 1)
 
     def restore(self, snapshot_id):
         status, error = self.db.get_snapshot_status(snapshot_id)
         if status is None:
-            print(f"Snapshot {snapshot_id} not found.")
-            return False
+            print(f"Snapshot ID {snapshot_id} does not exist.")
+            return
 
         if status != "COMPLETE":
-            print(f"Snapshot {snapshot_id} is not restorable: {status}")
+            print(f"Snapshot {snapshot_id} is not restorable (status={status}).")
             if error:
-                print(f"Reason: {error}")
-            return False
+                print(f"Recorded error: {error}")
+            return
 
         snapshot_uuid = self.db.get_snapshot_uuid(snapshot_id)
         if not snapshot_uuid:
-            raise RuntimeError(f"Snapshot {snapshot_id} does not have a UUID.")
+            raise RuntimeError("Snapshot has no UUID.")
 
-        paths = RestorePaths.for_snapshot(self.output_dir, snapshot_uuid)
+        paths = RestorePaths.for_snapshot(self.base_output_dir, snapshot_uuid)
+
         if os.path.exists(paths.final_dir):
-            print(f"Snapshot {snapshot_id} already restored at: {paths.final_dir}")
-            return True
+            print(f"Snapshot {snapshot_id} is already restored at: {paths.final_dir}")
+            return
 
         os.makedirs(paths.incomplete_dir, exist_ok=True)
         print(f"Restoring snapshot {snapshot_id} into {paths.incomplete_dir}")
-        print(f"Prefetch: workers={self.prefetch_workers} window={self.prefetch_window}")
-        start_time = time.perf_counter()
+        print(
+            f"Batch read: target_parallelism={self.batch_target_parallelism} "
+            f"window={self.prefetch_window}"
+        )
+
+        items_gen = self.db.get_snapshot_items(snapshot_id)
+        first_item = next(items_gen, None)
+        if first_item is None:
+            print(f"Snapshot {snapshot_id} is empty.")
+            return
+
+        def iter_items():
+            yield first_item
+            yield from items_gen
 
         directories = []
-        current_temp_path = None
+        current_tmp_path = None
         processed_items = 0
         successful_items = 0
 
         try:
-            for item in self.db.get_snapshot_items(snapshot_id):
+            for item in iter_items():
                 processed_items += 1
 
                 try:
-                    target_path = _safe_restore_path(paths.incomplete_dir, item["path"])
+                    full_path = _safe_restore_path(paths.incomplete_dir, item["path"])
                 except ValueError as exc:
                     print(f"Skipping unsafe path: {exc}")
                     continue
 
-                if item["item_type"] == "dir":
-                    os.makedirs(target_path, exist_ok=True)
-                    directories.append((target_path, item))
+                if item["type"] == "dir":
+                    os.makedirs(full_path, exist_ok=True)
+                    directories.append((full_path, item))
                     successful_items += 1
                     continue
 
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-                if os.path.isdir(target_path):
-                    print(f"Expected file but found directory: {item['path']}")
+                if os.path.isdir(full_path):
+                    print(f"Expected file but found directory at {item['path']}")
                     continue
 
-                if os.path.exists(target_path) and os.path.getsize(target_path) == item["size"]:
-                    _restore_metadata(target_path, item)
-                    successful_items += 1
-                    continue
-
-                current_temp_path = f"{target_path}.tmp"
-                file_ok = True
+                print(f"Restoring item {processed_items}: {item['path']}")
+                current_tmp_path = full_path + ".tmp"
+                success_file = True
 
                 try:
-                    prefetcher = OrderedChunkPrefetcher(
+                    chunk_hashes = list(self.db.get_item_chunks(item["id"]))
+                    prefetcher = OrderedBatchChunkPrefetcher(
                         self.fetch_service,
-                        workers=self.prefetch_workers,
+                        target_parallelism=self.batch_target_parallelism,
                         window=self.prefetch_window,
                     )
-                    with open(current_temp_path, "wb") as restored_file:
-                        for _chunk_hash, raw in prefetcher.iter_raw_chunks(self.db.get_item_chunks(item["id"])):
-                            restored_file.write(raw)
+
+                    with open(current_tmp_path, "wb") as handle:
+                        for chunk_hash, raw in prefetcher.iter_raw_chunks(chunk_hashes):
+                            try:
+                                handle.write(raw)
+                            except Exception as exc:
+                                print(f"Could not write chunk {chunk_hash[:8]} for {item['path']}: {exc}")
+                                success_file = False
+                                break
+
                 except Exception as exc:
                     print(f"Could not restore file {item['path']}: {exc}")
-                    file_ok = False
+                    success_file = False
 
-                if file_ok:
-                    os.replace(current_temp_path, target_path)
-                    current_temp_path = None
-                    _restore_metadata(target_path, item)
+                if success_file:
+                    os.replace(current_tmp_path, full_path)
+                    current_tmp_path = None
+                    self._apply_item_metadata(full_path, item, is_dir=False)
                     successful_items += 1
                 else:
-                    if current_temp_path and os.path.exists(current_temp_path):
-                        os.remove(current_temp_path)
-                    current_temp_path = None
+                    if current_tmp_path and os.path.exists(current_tmp_path):
+                        os.remove(current_tmp_path)
+                    current_tmp_path = None
+                    print(f"File {item['path']} was not restored. It can be retried later.")
 
         except KeyboardInterrupt:
-            print("Restore interrupted. Partial progress is kept in the .incomplete directory.")
-            if current_temp_path and os.path.exists(current_temp_path):
-                os.remove(current_temp_path)
-            return False
+            print("\nRestore interrupted by user.")
+            if current_tmp_path and os.path.exists(current_tmp_path):
+                os.remove(current_tmp_path)
+                print("Temporary file removed.")
+            print(f"Partial restore kept at: {paths.incomplete_dir}")
+            return
 
         finally:
             directories.sort(key=lambda pair: len(pair[0]), reverse=True)
             for directory_path, item in directories:
-                _restore_metadata(directory_path, item)
+                self._apply_item_metadata(directory_path, item, is_dir=True)
 
         if successful_items == processed_items and processed_items > 0:
-            os.replace(paths.incomplete_dir, paths.final_dir)
-            elapsed = time.perf_counter() - start_time
-            print(f"Restore completed: {paths.final_dir}")
-            print(f"Time: {elapsed:.2f} seconds")
-            return True
+            try:
+                os.replace(paths.incomplete_dir, paths.final_dir)
+                print("-" * 40)
+                print(f"Restore completed for snapshot {snapshot_id}.")
+                print(f"Final directory: {paths.final_dir}")
+            except OSError as exc:
+                print(f"Could not rename final directory: {exc}")
+        else:
+            print("-" * 40)
+            print(f"Restore incomplete: {successful_items}/{processed_items} items restored.")
+            print(f"Work directory: {paths.incomplete_dir}")
 
-        print(f"Restore incomplete: {successful_items}/{processed_items} items restored.")
-        print(f"Work directory: {paths.incomplete_dir}")
-        return False
-
-
-def _restore_metadata(path, item):
-    try:
-        if item.get("mtime") is not None:
-            os.utime(path, (item["mtime"], item["mtime"]))
-        if item.get("mode") is not None:
+    @staticmethod
+    def _apply_item_metadata(path, item, *, is_dir):
+        kind = "directory" if is_dir else "file"
+        try:
             os.chmod(path, item["mode"])
-    except OSError:
-        print(f"Could not restore metadata for: {item['path']}")
+            os.utime(path, (item["mtime"], item["mtime"]))
+        except OSError:
+            print(f"Could not restore metadata for {kind}: {item['path']}")
 
 
-def restore(snapshot_id, output_dir, *, seed=DEFAULT_SEED, rf=DEFAULT_RF, prefetch_workers=DEFAULT_PREFETCH_WORKERS, prefetch_window=DEFAULT_PREFETCH_WINDOW):
+def restore_snapshot(
+    snapshot_id,
+    *,
+    seed,
+    base_output_dir,
+    rf,
+    batch_target_parallelism,
+    prefetch_window,
+):
     db = MetadataDB(DB_FILE)
     repo = CASRepository(LOCAL_SHARD_DIR)
     remote_pool = RemoteStorageClientPool(timeout_s=DEFAULT_RPC_TIMEOUT_S)
@@ -397,38 +529,51 @@ def restore(snapshot_id, output_dir, *, seed=DEFAULT_SEED, rf=DEFAULT_RF, prefet
         db=db,
         repo=repo,
         fetch_service=fetch_service,
-        output_dir=output_dir,
-        prefetch_workers=prefetch_workers,
+        base_output_dir=base_output_dir,
+        batch_target_parallelism=batch_target_parallelism,
         prefetch_window=prefetch_window,
     )
 
     try:
-        return restorer.restore(snapshot_id)
+        restorer.restore(snapshot_id)
     finally:
         db.close()
         remote_pool.close()
 
 
-def _build_parser():
-    parser = argparse.ArgumentParser(description="Restaura snapshots desde caché local o nodos P2P.")
-    parser.add_argument("snapshot_id", type=int)
-    parser.add_argument("output_dir")
-    parser.add_argument("--seed", default=DEFAULT_SEED, help="Nodo seed de membership")
-    parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor esperado")
-    parser.add_argument("--prefetch-workers", type=int, default=DEFAULT_PREFETCH_WORKERS, help="Número de workers para prefetch ordenado")
-    parser.add_argument("--prefetch-window", type=int, default=DEFAULT_PREFETCH_WINDOW, help="Ventana máxima de chunks en vuelo por archivo")
-    return parser
-
-
 if __name__ == "__main__":
-    args = _build_parser().parse_args()
-    ok = restore(
+    parser = argparse.ArgumentParser(
+        prog="restore.py",
+        description="Restaura snapshots desde CAS local y red bajo demanda.",
+    )
+    parser.add_argument("snapshot_id", type=int)
+    parser.add_argument("out", nargs="?", default="restore_out", help="Directorio base de salida")
+    parser.add_argument("--seed", default=DEFAULT_SEED, help="Seed de membership para recuperación remota")
+    parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor HRW")
+    parser.add_argument(
+        "--prefetch-window",
+        type=int,
+        default=DEFAULT_PREFETCH_WINDOW,
+        help="Número de chunks a resolver por ventana",
+    )
+    parser.add_argument(
+        "--batch-target-parallelism",
+        type=int,
+        default=DEFAULT_BATCH_TARGET_PARALLELISM,
+        help="Número máximo de targets remotos consultados en paralelo por ronda HRW",
+    )
+
+    args = parser.parse_args()
+    start_time = time.perf_counter()
+
+    restore_snapshot(
         args.snapshot_id,
-        args.output_dir,
         seed=args.seed,
+        base_output_dir=args.out,
         rf=args.rf,
-        prefetch_workers=args.prefetch_workers,
+        batch_target_parallelism=args.batch_target_parallelism,
         prefetch_window=args.prefetch_window,
     )
-    if not ok:
-        raise SystemExit(1)
+
+    elapsed = time.perf_counter() - start_time
+    print(f"Restore command finished in {elapsed:.2f} seconds.")

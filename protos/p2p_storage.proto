@@ -1,19 +1,24 @@
 syntax = "proto3";
 
 service P2PStorage {
-  rpc RetrieveChunk(RetrieveRequest) returns (RetrieveResponse);
+  rpc RetrieveChunkBatch(RetrieveChunkBatchRequest) returns (RetrieveChunkBatchResponse);
   rpc ProbeMissingChunks(MissingChunksRequest) returns (MissingChunksResponse);
   rpc ReplicateChunks(stream StreamStoreItem) returns (stream StreamStoreResult);
 }
 
-message RetrieveRequest {
+message BatchRetrieveResult {
   string chunk_hash = 1;
+  bool success = 2;
+  bytes chunk_data = 3;
+  string message = 4;
 }
 
-message RetrieveResponse {
-  bool success = 1;
-  bytes chunk_data = 2;
-  string message = 3;
+message RetrieveChunkBatchRequest {
+  repeated string chunk_hashes = 1;
+}
+
+message RetrieveChunkBatchResponse {
+  repeated BatchRetrieveResult results = 1;
 }
 
 message MissingChunksRequest {

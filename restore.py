@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import os
@@ -48,9 +50,12 @@ class RestorePaths:
 @dataclass(frozen=True)
 class BatchRetrieveItemResult:
     chunk_hash: str
-    success: bool
+    status: int
     chunk_data: bytes
-    message: str
+    detail: str
+
+    def is_found(self, retrieve_status_found):
+        return self.status == retrieve_status_found
 
 
 class RemoteStorageClientPool:
@@ -58,7 +63,8 @@ class RemoteStorageClientPool:
     Pool de clientes remotos para restore.
 
     La carga de grpc/protobuf se retrasa hasta que realmente falta un chunk
-    local y hay que consultar la red. La lectura remota usa RetrieveChunkBatch.
+    local y hay que consultar la red. La lectura remota usa únicamente
+    RetrieveChunkBatch.
     """
 
     def __init__(self, *, timeout_s=DEFAULT_RPC_TIMEOUT_S):
@@ -81,6 +87,11 @@ class RemoteStorageClientPool:
         self._grpc = grpc
         self._p2p_storage_pb2 = p2p_storage_pb2
         self._p2p_storage_pb2_grpc = p2p_storage_pb2_grpc
+
+    @property
+    def retrieve_status_found(self):
+        self._ensure_runtime()
+        return self._p2p_storage_pb2.RETRIEVE_STATUS_FOUND
 
     def _get_stub(self, address):
         self._ensure_runtime()
@@ -113,18 +124,18 @@ class RemoteStorageClientPool:
                 continue
             results[item.chunk_hash] = BatchRetrieveItemResult(
                 chunk_hash=item.chunk_hash,
-                success=bool(item.success),
+                status=item.status,
                 chunk_data=bytes(item.chunk_data),
-                message=item.message or "",
+                detail=item.detail or "",
             )
 
         for chunk_hash in chunk_hashes:
             if chunk_hash not in results:
                 results[chunk_hash] = BatchRetrieveItemResult(
                     chunk_hash=chunk_hash,
-                    success=False,
+                    status=self._p2p_storage_pb2.RETRIEVE_STATUS_ERROR,
                     chunk_data=b"",
-                    message="missing batch result",
+                    detail="missing batch result",
                 )
 
         return results
@@ -292,8 +303,8 @@ class ChunkFetchService:
                             error_map[chunk_hash].append(f"{member.address}: missing batch result")
                             continue
 
-                        if not result.success:
-                            error_map[chunk_hash].append(f"{member.address}: {result.message}")
+                        if not result.is_found(self.remote_pool.retrieve_status_found):
+                            error_map[chunk_hash].append(f"{member.address}: {result.detail}")
                             continue
 
                         try:
@@ -422,7 +433,7 @@ class SnapshotRestorer:
                     print(f"Skipping unsafe path: {exc}")
                     continue
 
-                if item["type"] == "dir":
+                if item["item_type"] == "dir":
                     os.makedirs(full_path, exist_ok=True)
                     directories.append((full_path, item))
                     successful_items += 1
@@ -541,7 +552,7 @@ def restore_snapshot(
         remote_pool.close()
 
 
-if __name__ == "__main__":
+def parse_args():
     parser = argparse.ArgumentParser(
         prog="restore.py",
         description="Restaura snapshots desde CAS local y red bajo demanda.",
@@ -562,8 +573,11 @@ if __name__ == "__main__":
         default=DEFAULT_BATCH_TARGET_PARALLELISM,
         help="Número máximo de targets remotos consultados en paralelo por ronda HRW",
     )
+    return parser.parse_args()
 
-    args = parser.parse_args()
+
+def main():
+    args = parse_args()
     start_time = time.perf_counter()
 
     restore_snapshot(
@@ -577,3 +591,8 @@ if __name__ == "__main__":
 
     elapsed = time.perf_counter() - start_time
     print(f"Restore command finished in {elapsed:.2f} seconds.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

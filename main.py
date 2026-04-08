@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import argparse
 import concurrent.futures
 import hashlib
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -162,9 +163,9 @@ def _process_file(
     planner = ChunkPlanner(
         repo,
         db,
+        index=shared_index,
         fast_path_enabled=policy.fast_local_enabled,
         safe_mode=safe_mode,
-        index=shared_index,
         allow_remote_protected_skip=policy.fast_remote_enabled,
         desired_rf=policy.desired_rf,
         current_placement_epoch=policy.placement_epoch,
@@ -174,8 +175,8 @@ def _process_file(
     total_size = 0
     stats = WorkerStats()
 
-    with open(full_path, "rb") as f:
-        for order, (chunk_hash, chunk_data) in enumerate(chunker.chunk_stream(f)):
+    with open(full_path, "rb") as handle:
+        for order, (chunk_hash, chunk_data) in enumerate(chunker.chunk_stream(handle)):
             chunk_size = len(chunk_data)
             total_size += chunk_size
             stats.chunks_total += 1
@@ -212,6 +213,9 @@ def backup(
     membership_seed=None,
 ):
     """Crea un snapshot de una carpeta."""
+    if fast_remote_enabled and safe_mode:
+        raise ValueError("'--safe' and '--fast-remote' are incompatible.")
+
     if not os.path.isdir(source_path):
         print(f"Directory not found: {source_path}")
         return False
@@ -387,7 +391,7 @@ def _format_speed(total_size, elapsed):
     return f"{mb_per_second:.2f} MB/s"
 
 
-def _build_parser():
+def parse_args():
     parser = argparse.ArgumentParser(description="Sistema de backup con CAS, SQLite y nodos P2P.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -401,22 +405,31 @@ def _build_parser():
     backup_parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor deseado")
     backup_parser.add_argument("--membership-seed", default=None, help="Nodo seed para obtener la vista de membership")
 
-    return parser
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.command != "backup":
+        raise ValueError(f"Unsupported command: {args.command}")
+
+    if args.fast_remote and args.safe:
+        raise ValueError("'--safe' and '--fast-remote' are incompatible.")
+
+    ok = backup(
+        args.source_dir,
+        args.workers,
+        fast_path_enabled=args.fast,
+        fast_remote_enabled=args.fast_remote,
+        safe_mode=args.safe,
+        deterministic=args.deterministic,
+        desired_rf=args.rf,
+        membership_seed=args.membership_seed,
+    )
+
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    args = _build_parser().parse_args()
-
-    if args.command == "backup":
-        ok = backup(
-            args.source_dir,
-            args.workers,
-            fast_path_enabled=args.fast,
-            fast_remote_enabled=args.fast_remote,
-            safe_mode=args.safe,
-            deterministic=args.deterministic,
-            desired_rf=args.rf,
-            membership_seed=args.membership_seed,
-        )
-        if not ok:
-            sys.exit(1)
+    raise SystemExit(main())

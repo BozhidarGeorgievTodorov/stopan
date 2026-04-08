@@ -1,91 +1,81 @@
+x-node-env: &node-env
+  BIND_ADDR: "[::]:50051"
+  SEEDS: "node1:50051,node2:50051,node3:50051,node4:50051"
+  CLUSTER_TOKEN: "oficina-demo"
+
+  REPO_STORE_DIR: "/app/node_store"
+  LOCAL_SHARD_DIR: "/app/state/_data_chunks"
+  DB_FILE: "/app/state/_metadata.db"
+
+  RF: "3"
+  GRPC_MAX_MESSAGE_BYTES: "8388608"
+  MAX_CHUNK_SIZE: "8388608"
+
+  STORAGE_RPC_WORKERS: "64"
+  STORAGE_COMMIT_WORKERS: "16"
+  STORAGE_COMMIT_QUEUE_ITEMS: "256"
+
+  REPLICATION_TARGET_PARALLELISM: "4"
+  REPLICATION_PROBE_BATCH_HASHES: "2048"
+  REPLICATION_STREAM_INFLIGHT: "64"
+  REPLICATION_PROBE_TIMEOUT_S: "10"
+  REPLICATION_STREAM_TIMEOUT_S: "60"
+  REPLICATION_COMMIT_EVERY: "100"
+
+  RESTORE_BATCH_TARGET_PARALLELISM: "4"
+  RESTORE_PREFETCH_WINDOW: "32"
+
+x-node-common: &node-common
+  build: .
+
 services:
   node1:
-    build: .
+    <<: *node-common
+    container_name: p2p_node_1
     ports:
       - "50051:50051"
+    environment:
+      <<: *node-env
+      ADVERTISE_ADDR: "node1:50051"
     volumes:
       - node1_data:/app/node_store
       - node1_state:/app/state
-    container_name: p2p_node_1
-    environment:
-      - ADVERTISE_ADDR=node1:50051
-      - BIND_ADDR=[::]:50051
-      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
-      - CLUSTER_TOKEN=oficina-demo
-      - REPO_STORE_DIR=/app/node_store
-      - LOCAL_SHARD_DIR=/app/state/_data_chunks
-      - DB_FILE=/app/state/_metadata.db
-      - REPLICATION_RPC_TIMEOUT_S=10
-      - REPLICATION_COMMIT_EVERY=100
-      - STORAGE_RPC_WORKERS=64
-      - GRPC_MAX_MESSAGE_BYTES=8388608
-      - MAX_CHUNK_SIZE=8388608
 
   node2:
-    build: .
+    <<: *node-common
+    container_name: p2p_node_2
     ports:
       - "50052:50051"
+    environment:
+      <<: *node-env
+      ADVERTISE_ADDR: "node2:50051"
     volumes:
       - node2_data:/app/node_store
       - node2_state:/app/state
-    container_name: p2p_node_2
-    environment:
-      - ADVERTISE_ADDR=node2:50051
-      - BIND_ADDR=[::]:50051
-      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
-      - CLUSTER_TOKEN=oficina-demo
-      - REPO_STORE_DIR=/app/node_store
-      - LOCAL_SHARD_DIR=/app/state/_data_chunks
-      - DB_FILE=/app/state/_metadata.db
-      - REPLICATION_RPC_TIMEOUT_S=10
-      - REPLICATION_COMMIT_EVERY=100
-      - STORAGE_RPC_WORKERS=64
-      - GRPC_MAX_MESSAGE_BYTES=8388608
-      - MAX_CHUNK_SIZE=8388608
 
   node3:
-    build: .
+    <<: *node-common
+    container_name: p2p_node_3
     ports:
       - "50053:50051"
+    environment:
+      <<: *node-env
+      ADVERTISE_ADDR: "node3:50051"
     volumes:
       - node3_data:/app/node_store
       - node3_state:/app/state
-    container_name: p2p_node_3
-    environment:
-      - ADVERTISE_ADDR=node3:50051
-      - BIND_ADDR=[::]:50051
-      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
-      - CLUSTER_TOKEN=oficina-demo
-      - REPO_STORE_DIR=/app/node_store
-      - LOCAL_SHARD_DIR=/app/state/_data_chunks
-      - DB_FILE=/app/state/_metadata.db
-      - REPLICATION_RPC_TIMEOUT_S=10
-      - REPLICATION_COMMIT_EVERY=100
-      - STORAGE_RPC_WORKERS=64
-      - GRPC_MAX_MESSAGE_BYTES=8388608
-      - MAX_CHUNK_SIZE=8388608
 
   node4:
-    build: .
+    <<: *node-common
+    container_name: p2p_node_4
     ports:
       - "50054:50051"
+    environment:
+      <<: *node-env
+      ADVERTISE_ADDR: "node4:50051"
     volumes:
       - node4_data:/app/node_store
       - node4_state:/app/state
-    container_name: p2p_node_4
-    environment:
-      - ADVERTISE_ADDR=node4:50051
-      - BIND_ADDR=[::]:50051
-      - SEEDS=node1:50051,node2:50051,node3:50051,node4:50051
-      - CLUSTER_TOKEN=oficina-demo
-      - REPO_STORE_DIR=/app/node_store
-      - LOCAL_SHARD_DIR=/app/state/_data_chunks
-      - DB_FILE=/app/state/_metadata.db
-      - REPLICATION_RPC_TIMEOUT_S=10
-      - REPLICATION_COMMIT_EVERY=100
-      - STORAGE_RPC_WORKERS=64
-      - GRPC_MAX_MESSAGE_BYTES=8388608
-      - MAX_CHUNK_SIZE=8388608
 
 volumes:
   node1_data: {}

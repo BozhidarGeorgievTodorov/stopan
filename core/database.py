@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import sqlite3
 import time
 import uuid
 from collections import defaultdict
+from typing import Iterable
 
-from core.protection import ProtectionRecord, is_record_sufficient
+from core.protection import ProtectionRecord, ProtectionState, is_record_sufficient
 
 DB_FILE = "_metadata.db"
 
@@ -11,6 +14,15 @@ DB_FILE = "_metadata.db"
 class MetadataDB:
     """
     Guarda snapshots, recetas de chunks y estado de protección distribuida.
+
+    Modelo canónico:
+      - snapshots
+      - snapshot_items
+      - recipes / recipe_chunks
+      - chunks
+      - chunk_protection
+
+    La protección remota se decide exclusivamente desde chunk_protection.
     """
 
     def __init__(self, db_file=DB_FILE, *, init_schema=True):
@@ -97,14 +109,8 @@ class MetadataDB:
             CREATE TABLE IF NOT EXISTS chunks (
                 hash TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
-                ref_count INTEGER NOT NULL DEFAULT 0,
-                is_synced INTEGER NOT NULL DEFAULT 0
+                ref_count INTEGER NOT NULL DEFAULT 0
             )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chunks_unsynced
-            ON chunks(is_synced)
-            WHERE is_synced = 0
         """)
 
         cursor.execute("""
@@ -134,9 +140,9 @@ class MetadataDB:
                 chunk_hash, desired_rf, protection_state, protected_remote_copies,
                 placement_epoch, last_push_at, last_verify_at, last_error
             )
-            SELECT hash, 1, 'PENDING', 0, NULL, NULL, NULL, NULL
+            SELECT hash, 1, ?, 0, NULL, NULL, NULL, NULL
             FROM chunks
-        """)
+        """, (ProtectionState.PENDING.value,))
 
         self.conn.commit()
 
@@ -246,6 +252,7 @@ class MetadataDB:
     def get_or_create_recipe(self, recipe_hash, chunks, *, desired_rf=3):
         """Crea o reutiliza una receta deduplicada de chunks."""
         chunks = list(chunks)
+        desired_rf = max(int(desired_rf), 1)
         chunk_count = len(chunks)
         total_size = sum(chunk_size for _, _, chunk_size in chunks)
 
@@ -262,7 +269,10 @@ class MetadataDB:
                 WHERE recipe_hash = ?
                 LIMIT 1
             """, (recipe_hash,))
-            recipe_id = cursor.fetchone()["id"]
+            row = cursor.fetchone()
+            if row is None:
+                raise RuntimeError(f"Could not resolve recipe_id for {recipe_hash}")
+            recipe_id = row["id"]
 
             cursor.execute("""
                 SELECT 1
@@ -303,15 +313,20 @@ class MetadataDB:
             ref_counts[chunk_hash][1] += 1
 
         self.conn.executemany("""
-            INSERT INTO chunks (hash, size, ref_count, is_synced)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO chunks (hash, size, ref_count)
+            VALUES (?, ?, ?)
             ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + excluded.ref_count
         """, (
             (chunk_hash, chunk_size, ref_count)
             for chunk_hash, (chunk_size, ref_count) in ref_counts.items()
         ))
 
-    def _ensure_chunk_protection_rows(self, chunks, *, desired_rf):
+    def _ensure_chunk_protection_rows(
+        self,
+        chunks: Iterable[tuple[int, str, int]],
+        *,
+        desired_rf,
+    ):
         desired_rf = max(int(desired_rf), 1)
         rows = [(chunk_hash, desired_rf) for _, chunk_hash, _ in chunks]
         if not rows:
@@ -322,14 +337,17 @@ class MetadataDB:
                 chunk_hash, desired_rf, protection_state, protected_remote_copies,
                 placement_epoch, last_push_at, last_verify_at, last_error
             )
-            VALUES (?, ?, 'PENDING', 0, NULL, NULL, NULL, NULL)
-        """, rows)
+            VALUES (?, ?, ?, 0, NULL, NULL, NULL, NULL)
+        """, (
+            (chunk_hash, desired_rf, ProtectionState.PENDING.value)
+            for chunk_hash, desired_rf in rows
+        ))
 
         self.conn.executemany("""
             UPDATE chunk_protection
             SET desired_rf = CASE WHEN desired_rf < ? THEN ? ELSE desired_rf END
             WHERE chunk_hash = ?
-        """, ((desired_rf, desired_rf, chunk_hash) for _, chunk_hash, _ in chunks))
+        """, ((desired_rf, desired_rf, chunk_hash) for chunk_hash, _ in rows))
 
     def get_snapshot_items(self, snapshot_id):
         """Genera los elementos de un snapshot en orden de ruta."""
@@ -353,8 +371,10 @@ class MetadataDB:
             WHERE id = ?
         """, (item_id,))
         row = cursor.fetchone()
-        if row is None or row["recipe_id"] is None:
-            raise ValueError(f"Item {item_id} does not have an associated recipe.")
+        if row is None:
+            raise ValueError(f"Snapshot item does not exist: {item_id}")
+        if row["recipe_id"] is None:
+            raise ValueError(f"Snapshot item has no associated recipe: {item_id}")
 
         cursor.execute("""
             SELECT chunk_hash
@@ -381,9 +401,9 @@ class MetadataDB:
 
         return ProtectionRecord(
             chunk_hash=row["chunk_hash"],
-            desired_rf=row["desired_rf"],
-            protection_state=row["protection_state"],
-            protected_remote_copies=row["protected_remote_copies"],
+            desired_rf=int(row["desired_rf"]),
+            protection_state=ProtectionState(row["protection_state"]),
+            protected_remote_copies=int(row["protected_remote_copies"]),
             placement_epoch=row["placement_epoch"],
             last_push_at=row["last_push_at"],
             last_verify_at=row["last_verify_at"],
@@ -396,22 +416,31 @@ class MetadataDB:
 
     def get_pending_protection_chunks(self, *, desired_rf, current_epoch=None, limit=None):
         desired_rf = max(int(desired_rf), 1)
-        params = [desired_rf]
+        params = [
+            ProtectionState.PENDING.value,
+            ProtectionState.DEGRADED.value,
+            ProtectionState.FAILED.value,
+            desired_rf,
+        ]
         query = """
             SELECT chunk_hash
             FROM chunk_protection
-            WHERE protection_state IN ('PENDING', 'DEGRADED', 'FAILED')
+            WHERE protection_state IN (?, ?, ?)
                OR desired_rf < ?
         """
 
         if current_epoch is not None:
             query += """
                OR (
-                    protection_state IN ('PLACED', 'VERIFIED')
+                    protection_state IN (?, ?)
                     AND (placement_epoch IS NULL OR placement_epoch <> ?)
                )
             """
-            params.append(current_epoch)
+            params.extend([
+                ProtectionState.PLACED.value,
+                ProtectionState.VERIFIED.value,
+                current_epoch,
+            ])
 
         query += " ORDER BY chunk_hash ASC"
 
@@ -428,110 +457,110 @@ class MetadataDB:
         with self.conn:
             self.conn.execute("""
                 UPDATE chunk_protection
-                SET protection_state = 'DEGRADED',
-                    last_error = 'desired_rf increased'
+                SET protection_state = ?,
+                    last_error = CASE
+                        WHEN desired_rf < ? THEN 'desired_rf increased'
+                        ELSE last_error
+                    END
                 WHERE desired_rf < ?
-                  AND protection_state IN ('PLACED', 'VERIFIED')
-            """, (desired_rf,))
+                  AND protection_state IN (?, ?)
+            """, (
+                ProtectionState.DEGRADED.value,
+                desired_rf,
+                desired_rf,
+                ProtectionState.PLACED.value,
+                ProtectionState.VERIFIED.value,
+            ))
 
             if current_epoch is not None:
                 self.conn.execute("""
                     UPDATE chunk_protection
-                    SET protection_state = 'DEGRADED',
+                    SET protection_state = ?,
                         last_error = 'placement_epoch changed'
-                    WHERE protection_state IN ('PLACED', 'VERIFIED')
+                    WHERE protection_state IN (?, ?)
                       AND (placement_epoch IS NULL OR placement_epoch <> ?)
-                """, (current_epoch,))
-
-            self.conn.execute("""
-                UPDATE chunks
-                SET is_synced = 0
-                WHERE hash IN (
-                    SELECT chunk_hash
-                    FROM chunk_protection
-                    WHERE protection_state IN ('PENDING', 'DEGRADED', 'FAILED')
-                )
-            """)
+                """, (
+                    ProtectionState.DEGRADED.value,
+                    ProtectionState.PLACED.value,
+                    ProtectionState.VERIFIED.value,
+                    current_epoch,
+                ))
 
     def mark_chunk_placed(self, chunk_hash, *, desired_rf, protected_remote_copies, placement_epoch):
-        self._mark_chunk_protection(
-            chunk_hash,
-            state="PLACED",
-            desired_rf=desired_rf,
-            protected_remote_copies=protected_remote_copies,
-            placement_epoch=placement_epoch,
-            error=None,
-            verified=False,
-        )
+        with self.conn:
+            self._upsert_chunk_protection_state(
+                chunk_hash=chunk_hash,
+                desired_rf=desired_rf,
+                protection_state=ProtectionState.PLACED,
+                protected_remote_copies=protected_remote_copies,
+                placement_epoch=placement_epoch,
+                last_push_at=time.time(),
+                last_verify_at=None,
+                last_error=None,
+            )
 
     def mark_chunk_failed(self, chunk_hash, *, desired_rf, protected_remote_copies, placement_epoch, error):
-        self._mark_chunk_protection(
-            chunk_hash,
-            state="FAILED",
-            desired_rf=desired_rf,
-            protected_remote_copies=protected_remote_copies,
-            placement_epoch=placement_epoch,
-            error=error,
-            verified=False,
-        )
+        with self.conn:
+            self._upsert_chunk_protection_state(
+                chunk_hash=chunk_hash,
+                desired_rf=desired_rf,
+                protection_state=ProtectionState.FAILED,
+                protected_remote_copies=protected_remote_copies,
+                placement_epoch=placement_epoch,
+                last_push_at=time.time(),
+                last_verify_at=None,
+                last_error=error,
+            )
 
     def mark_chunk_verified(self, chunk_hash, *, desired_rf, protected_remote_copies, placement_epoch):
-        self._mark_chunk_protection(
-            chunk_hash,
-            state="VERIFIED",
-            desired_rf=desired_rf,
-            protected_remote_copies=protected_remote_copies,
-            placement_epoch=placement_epoch,
-            error=None,
-            verified=True,
-        )
+        with self.conn:
+            self._upsert_chunk_protection_state(
+                chunk_hash=chunk_hash,
+                desired_rf=desired_rf,
+                protection_state=ProtectionState.VERIFIED,
+                protected_remote_copies=protected_remote_copies,
+                placement_epoch=placement_epoch,
+                last_push_at=None,
+                last_verify_at=time.time(),
+                last_error=None,
+            )
 
-    def _mark_chunk_protection(
+    def _upsert_chunk_protection_state(
         self,
-        chunk_hash,
         *,
-        state,
+        chunk_hash,
         desired_rf,
+        protection_state,
         protected_remote_copies,
         placement_epoch,
-        error,
-        verified,
+        last_push_at,
+        last_verify_at,
+        last_error,
     ):
-        desired_rf = max(int(desired_rf), 1)
-        protected_remote_copies = max(int(protected_remote_copies), 0)
-        now = time.time()
-
-        with self.conn:
-            self.conn.execute("""
-                INSERT INTO chunk_protection (
-                    chunk_hash, desired_rf, protection_state, protected_remote_copies,
-                    placement_epoch, last_push_at, last_verify_at, last_error
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chunk_hash) DO UPDATE SET
-                    desired_rf = excluded.desired_rf,
-                    protection_state = excluded.protection_state,
-                    protected_remote_copies = excluded.protected_remote_copies,
-                    placement_epoch = excluded.placement_epoch,
-                    last_push_at = excluded.last_push_at,
-                    last_verify_at = excluded.last_verify_at,
-                    last_error = excluded.last_error
-            """, (
-                chunk_hash,
-                desired_rf,
-                state,
-                protected_remote_copies,
-                placement_epoch,
-                None if verified else now,
-                now if verified else None,
-                error,
-            ))
-
-            self.conn.execute("""
-                UPDATE chunks
-                SET is_synced = ?
-                WHERE hash = ?
-            """, (1 if state in ("PLACED", "VERIFIED") else 0, chunk_hash))
+        self.conn.execute("""
+            INSERT INTO chunk_protection (
+                chunk_hash, desired_rf, protection_state, protected_remote_copies,
+                placement_epoch, last_push_at, last_verify_at, last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_hash) DO UPDATE SET
+                desired_rf = excluded.desired_rf,
+                protection_state = excluded.protection_state,
+                protected_remote_copies = excluded.protected_remote_copies,
+                placement_epoch = excluded.placement_epoch,
+                last_push_at = excluded.last_push_at,
+                last_verify_at = excluded.last_verify_at,
+                last_error = excluded.last_error
+        """, (
+            chunk_hash,
+            max(int(desired_rf), 1),
+            protection_state.value,
+            max(int(protected_remote_copies), 0),
+            placement_epoch,
+            last_push_at,
+            last_verify_at,
+            last_error,
+        ))
 
     def has_chunk(self, chunk_hash):
         cursor = self.conn.cursor()

@@ -1,42 +1,57 @@
 syntax = "proto3";
 
 service P2PStorage {
+  rpc ProbeMissingChunks(ProbeMissingChunksRequest) returns (ProbeMissingChunksResponse);
+  rpc ReplicateChunks(stream ReplicateChunkRequest) returns (stream ReplicateChunkResult);
   rpc RetrieveChunkBatch(RetrieveChunkBatchRequest) returns (RetrieveChunkBatchResponse);
-  rpc ProbeMissingChunks(MissingChunksRequest) returns (MissingChunksResponse);
-  rpc ReplicateChunks(stream StreamStoreItem) returns (stream StreamStoreResult);
 }
 
-message BatchRetrieveResult {
+message ProbeMissingChunksRequest {
+  repeated string chunk_hashes = 1;
+}
+
+message ProbeMissingChunksResponse {
+  repeated string missing_hashes = 1;
+}
+
+enum StoreStatus {
+  STORE_STATUS_UNSPECIFIED = 0;
+  STORE_STATUS_STORED = 1;
+  STORE_STATUS_ALREADY_PRESENT = 2;
+  STORE_STATUS_REJECTED_CORRUPT = 3;
+  STORE_STATUS_REJECTED_HASH_MISMATCH = 4;
+  STORE_STATUS_ERROR = 5;
+}
+
+message ReplicateChunkRequest {
   string chunk_hash = 1;
-  bool success = 2;
-  bytes chunk_data = 3;
-  string message = 4;
+  bytes chunk_data = 2;
+}
+
+message ReplicateChunkResult {
+  string chunk_hash = 1;
+  StoreStatus status = 2;
+  string detail = 3;
+}
+
+enum RetrieveStatus {
+  RETRIEVE_STATUS_UNSPECIFIED = 0;
+  RETRIEVE_STATUS_FOUND = 1;
+  RETRIEVE_STATUS_NOT_FOUND = 2;
+  RETRIEVE_STATUS_ERROR = 3;
 }
 
 message RetrieveChunkBatchRequest {
   repeated string chunk_hashes = 1;
 }
 
+message RetrievedChunk {
+  string chunk_hash = 1;
+  RetrieveStatus status = 2;
+  bytes chunk_data = 3;
+  string detail = 4;
+}
+
 message RetrieveChunkBatchResponse {
-  repeated BatchRetrieveResult results = 1;
-}
-
-message MissingChunksRequest {
-  repeated string chunk_hashes = 1;
-}
-
-message MissingChunksResponse {
-  repeated string missing_hashes = 1;
-}
-
-message StreamStoreItem {
-  string chunk_hash = 1;
-  bytes chunk_data = 2;
-}
-
-message StreamStoreResult {
-  string chunk_hash = 1;
-  bool success = 2;
-  bool already_present = 3;
-  string message = 4;
+  repeated RetrievedChunk results = 1;
 }

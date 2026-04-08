@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Iterable
 
 import blake3
 
@@ -13,33 +13,78 @@ class Member:
     address: str
 
 
-def _score_hrw_int(chunk_hash: str, node_id: str, *, salt: str) -> int:
-    material = f"{salt}|{node_id}|{chunk_hash}".encode("utf-8")
-    digest = blake3.blake3(material).digest()
+def _hrw_score(chunk_hash: str, node_id: str, *, salt: str) -> int:
+    """
+    Devuelve el score HRW determinista para (chunk_hash, node_id, salt).
+
+    Convención estable del mensaje:
+        "{salt}|{node_id}|{chunk_hash}"
+
+    Importante:
+      - no cambiar este formato una vez congelado, porque define el placement;
+      - score mayor = mejor candidato.
+    """
+    message = f"{salt}|{node_id}|{chunk_hash}".encode("utf-8")
+    digest = blake3.blake3(message).digest()
     return int.from_bytes(digest, "big")
 
 
-def hrw_rank_node_ids(chunk_hash: str, node_ids: Iterable[str], *, salt: str = "") -> List[str]:
-    scored = [(_score_hrw_int(chunk_hash, node_id, salt=salt), node_id) for node_id in node_ids]
+def hrw_rank_node_ids(
+    chunk_hash: str,
+    node_ids: Iterable[str],
+    *,
+    salt: str = "",
+) -> list[str]:
+    """
+    Devuelve todos los node_id ordenados por preferencia HRW.
+    """
+    normalized_node_ids = [str(node_id) for node_id in node_ids if node_id]
+    scored = [
+        (_hrw_score(chunk_hash, node_id, salt=salt), node_id)
+        for node_id in normalized_node_ids
+    ]
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [node_id for _, node_id in scored]
 
 
-def hrw_top_k_node_ids(chunk_hash: str, node_ids: Iterable[str], k: int, *, salt: str = "") -> List[str]:
+def hrw_top_k_node_ids(
+    chunk_hash: str,
+    node_ids: Iterable[str],
+    k: int,
+    *,
+    salt: str = "",
+) -> list[str]:
+    """
+    Devuelve los k mejores node_id según HRW.
+    """
     if k <= 0:
         return []
 
-    heap: List[Tuple[int, str]] = []
-    for node_id in node_ids:
-        key = (_score_hrw_int(chunk_hash, node_id, salt=salt), node_id)
+    heap: list[tuple[int, str]] = []
+
+    for raw_node_id in node_ids:
+        node_id = str(raw_node_id)
+        if not node_id:
+            continue
+
+        item = (_hrw_score(chunk_hash, node_id, salt=salt), node_id)
+
         if len(heap) < k:
-            heapq.heappush(heap, key)
-        elif key > heap[0]:
-            heapq.heapreplace(heap, key)
+            heapq.heappush(heap, item)
+        elif item > heap[0]:
+            heapq.heapreplace(heap, item)
 
     heap.sort(reverse=True)
     return [node_id for _, node_id in heap]
 
 
-def members_to_maps(members: Iterable[Member]) -> Dict[str, str]:
-    return {member.node_id: member.address for member in members if member.node_id and member.address}
+def member_address_map(members: Iterable[Member]) -> dict[str, str]:
+    """
+    Convierte una colección de Member en un mapa node_id -> address,
+    filtrando entradas incompletas.
+    """
+    return {
+        member.node_id: member.address
+        for member in members
+        if member.node_id and member.address
+    }

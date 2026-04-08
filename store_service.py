@@ -389,9 +389,15 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
 @dataclass(frozen=True)
 class StorageCommitResult:
     chunk_hash: str
-    success: bool
-    already_present: bool
-    message: str
+    status: int
+    detail: str
+
+    @property
+    def is_success(self) -> bool:
+        return self.status in (
+            p2p_storage_pb2.STORE_STATUS_STORED,
+            p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
+        )
 
 
 class StorageCommitEngine:
@@ -435,7 +441,11 @@ class StorageCommitEngine:
 
     def process_one(self, chunk_hash: str, chunk_data: bytes) -> StorageCommitResult:
         if self.repo.exists_local(chunk_hash):
-            return StorageCommitResult(chunk_hash, True, True, "already present")
+            return StorageCommitResult(
+                chunk_hash=chunk_hash,
+                status=p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
+                detail="already present",
+            )
 
         try:
             raw = self._decompressor().decompress(
@@ -443,24 +453,54 @@ class StorageCommitEngine:
                 max_output_size=self._max_chunk_size,
             )
         except zstd.ZstdError:
-            return StorageCommitResult(chunk_hash, False, False, "rejected: corrupt zstd data")
+            return StorageCommitResult(
+                chunk_hash=chunk_hash,
+                status=p2p_storage_pb2.STORE_STATUS_REJECTED_CORRUPT,
+                detail="rejected: corrupt zstd data",
+            )
         except Exception:
-            return StorageCommitResult(chunk_hash, False, False, "rejected: decompressed output too large")
+            return StorageCommitResult(
+                chunk_hash=chunk_hash,
+                status=p2p_storage_pb2.STORE_STATUS_REJECTED_CORRUPT,
+                detail="rejected: decompressed output too large",
+            )
 
         actual_hash = blake3.blake3(raw).hexdigest()
         if actual_hash != chunk_hash:
-            return StorageCommitResult(chunk_hash, False, False, "rejected: hash mismatch")
+            return StorageCommitResult(
+                chunk_hash=chunk_hash,
+                status=p2p_storage_pb2.STORE_STATUS_REJECTED_HASH_MISMATCH,
+                detail="rejected: hash mismatch",
+            )
 
-        is_new = self.repo.put_compressed(chunk_hash, chunk_data)
+        try:
+            is_new = self.repo.put_compressed(chunk_hash, chunk_data)
+        except Exception as exc:
+            return StorageCommitResult(
+                chunk_hash=chunk_hash,
+                status=p2p_storage_pb2.STORE_STATUS_ERROR,
+                detail=str(exc),
+            )
+
         if is_new:
-            return StorageCommitResult(chunk_hash, True, False, "stored")
-        return StorageCommitResult(chunk_hash, True, True, "already present")
+            return StorageCommitResult(
+                chunk_hash=chunk_hash,
+                status=p2p_storage_pb2.STORE_STATUS_STORED,
+                detail="stored",
+            )
+
+        return StorageCommitResult(
+            chunk_hash=chunk_hash,
+            status=p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
+            detail="already present",
+        )
 
     def submit(self, chunk_hash: str, chunk_data: bytes):
         self._slots.acquire()
         future = self._executor.submit(self.process_one, chunk_hash, chunk_data)
         future.add_done_callback(lambda _f: self._slots.release())
         return future
+
 
 class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
     """Servicio gRPC que recibe y sirve chunks comprimidos."""
@@ -478,11 +518,11 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         """Devuelve solo los hashes que este nodo no tiene en local."""
         try:
             missing = [h for h in request.chunk_hashes if h and (not self.repo.exists_local(h))]
-            return p2p_storage_pb2.MissingChunksResponse(missing_hashes=missing)
+            return p2p_storage_pb2.ProbeMissingChunksResponse(missing_hashes=missing)
         except Exception as e:
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return p2p_storage_pb2.MissingChunksResponse()
+            return p2p_storage_pb2.ProbeMissingChunksResponse()
 
     def ReplicateChunks(self, request_iterator, context):
         """Guarda chunks recibidos por stream y devuelve una respuesta por item."""
@@ -546,11 +586,10 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
 
                 for future in done:
                     result = future.result()
-                    yield p2p_storage_pb2.StreamStoreResult(
+                    yield p2p_storage_pb2.ReplicateChunkResult(
                         chunk_hash=result.chunk_hash,
-                        success=result.success,
-                        already_present=result.already_present,
-                        message=result.message,
+                        status=result.status,
+                        detail=result.detail,
                     )
 
                 if reader_finished and not in_flight:
@@ -580,19 +619,27 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
                 try:
                     data = self.repo.get_compressed(chunk_hash)
                     results.append(
-                        p2p_storage_pb2.BatchRetrieveResult(
+                        p2p_storage_pb2.RetrievedChunk(
                             chunk_hash=chunk_hash,
-                            success=True,
+                            status=p2p_storage_pb2.RETRIEVE_STATUS_FOUND,
                             chunk_data=data,
-                            message="ok",
+                            detail="ok",
+                        )
+                    )
+                except FileNotFoundError:
+                    results.append(
+                        p2p_storage_pb2.RetrievedChunk(
+                            chunk_hash=chunk_hash,
+                            status=p2p_storage_pb2.RETRIEVE_STATUS_NOT_FOUND,
+                            detail="missing chunk",
                         )
                     )
                 except Exception as e:
                     results.append(
-                        p2p_storage_pb2.BatchRetrieveResult(
+                        p2p_storage_pb2.RetrievedChunk(
                             chunk_hash=chunk_hash,
-                            success=False,
-                            message=str(e),
+                            status=p2p_storage_pb2.RETRIEVE_STATUS_ERROR,
+                            detail=str(e),
                         )
                     )
 

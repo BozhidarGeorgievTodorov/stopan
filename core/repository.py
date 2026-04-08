@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import threading
 import uuid
@@ -9,21 +11,33 @@ DATA_FOLDER = "_data_chunks"
 ZSTD_LEVEL = 3
 
 
+class CASRepositoryError(Exception):
+    """Error base del repositorio CAS."""
+
+
+class CASCorruptionError(CASRepositoryError):
+    """El bloque existe pero está corrupto o no coincide con su hash."""
+
+
 class CASRepository:
-    """Repositorio CAS local con sharding, compresión y verificación por hash."""
+    """
+    Almacena bloques direccionados por hash en disco.
 
-    __slots__ = ("root_path", "_tls", "_ensured_dirs", "_dir_lock")
+    Semántica:
+      - put(chunk_hash, chunk_data) comprime y persiste atómicamente.
+      - put_compressed(chunk_hash, compressed_data) valida y persiste un bloque ya comprimido.
+      - get(chunk_hash) lee, descomprime y verifica integridad.
+      - get_compressed(chunk_hash) devuelve el bloque comprimido tal como está almacenado.
+    """
 
-    def __init__(self, root_path=DATA_FOLDER):
-        self.root_path = root_path
-        os.makedirs(root_path, exist_ok=True)
+    __slots__ = ("data_folder", "_tls", "_ensured_dirs", "_dir_lock")
 
-        # Contextos thread-local: el repositorio puede usarse desde varios hilos
-        # durante backup, restore y recepción remota de chunks.
+    def __init__(self, data_folder=DATA_FOLDER):
+        self.data_folder = os.path.abspath(data_folder)
+        os.makedirs(self.data_folder, exist_ok=True)
+
         self._tls = threading.local()
-
-        # Evita llamar a os.makedirs() para directorios de shard ya creados.
-        self._ensured_dirs = {os.path.abspath(root_path)}
+        self._ensured_dirs = {self.data_folder}
         self._dir_lock = threading.Lock()
 
     def _compressor(self):
@@ -40,22 +54,6 @@ class CASRepository:
             self._tls.decompressor = decompressor
         return decompressor
 
-    def _chunk_path(self, chunk_hash):
-        first_dir = chunk_hash[:2]
-        second_dir = chunk_hash[2:4]
-        return os.path.join(self.root_path, first_dir, second_dir, chunk_hash)
-
-    def _ensure_parent_dir(self, path):
-        parent = os.path.dirname(path)
-        if parent in self._ensured_dirs:
-            return
-
-        with self._dir_lock:
-            if parent in self._ensured_dirs:
-                return
-            os.makedirs(parent, exist_ok=True)
-            self._ensured_dirs.add(parent)
-
     def exists_local(self, chunk_hash):
         """Comprueba si el bloque ya existe en el repositorio local."""
         return os.path.exists(self._chunk_path(chunk_hash))
@@ -63,39 +61,12 @@ class CASRepository:
     def put(self, chunk_hash, chunk_data):
         """Comprime y guarda un bloque si todavía no existe."""
         compressed_data = self._compressor().compress(chunk_data)
-        return self.put_compressed(chunk_hash, compressed_data)
+        return self._write_once(self._chunk_path(chunk_hash), compressed_data)
 
     def put_compressed(self, chunk_hash, compressed_data):
         """Guarda un bloque ya comprimido, validando antes su hash."""
         self._validate_compressed_block(chunk_hash, compressed_data)
-        path = self._chunk_path(chunk_hash)
-
-        if os.path.exists(path):
-            return False
-
-        self._ensure_parent_dir(path)
-        temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
-        written = False
-
-        try:
-            with open(temp_path, "wb") as f:
-                f.write(compressed_data)
-
-            try:
-                os.replace(temp_path, path)
-                written = True
-                return True
-            except OSError:
-                if os.path.exists(path):
-                    return False
-                raise
-
-        finally:
-            if not written:
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
+        return self._write_once(self._chunk_path(chunk_hash), compressed_data)
 
     def get(self, chunk_hash):
         """Recupera, descomprime y verifica un bloque guardado por hash."""
@@ -111,6 +82,47 @@ class CASRepository:
         with open(path, "rb") as f:
             return f.read()
 
+    def _write_once(self, path, data):
+        if os.path.exists(path):
+            return False
+
+        self._ensure_parent_dir(path)
+        temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+        written = False
+
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(data)
+
+            try:
+                os.replace(temp_path, path)
+                written = True
+            except OSError:
+                if os.path.exists(path):
+                    written = False
+                else:
+                    raise
+
+            return written
+
+        finally:
+            if not written:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    def _ensure_parent_dir(self, path):
+        parent = os.path.dirname(path)
+        if parent in self._ensured_dirs:
+            return
+
+        with self._dir_lock:
+            if parent in self._ensured_dirs:
+                return
+            os.makedirs(parent, exist_ok=True)
+            self._ensured_dirs.add(parent)
+
     def _validate_compressed_block(self, chunk_hash, compressed_data):
         self._decompress_and_validate(chunk_hash, compressed_data)
 
@@ -118,10 +130,18 @@ class CASRepository:
         try:
             data = self._decompressor().decompress(compressed_data)
         except zstd.ZstdError as exc:
-            raise ValueError(f"Corrupt compressed block: {chunk_hash}") from exc
+            raise CASCorruptionError(f"Corrupt compressed block: {chunk_hash}") from exc
 
         calculated_hash = blake3.blake3(data).hexdigest()
         if calculated_hash != chunk_hash:
-            raise ValueError(f"Corrupt block: {chunk_hash}")
+            raise CASCorruptionError(
+                f"Corrupt block: expected {chunk_hash}, got {calculated_hash}"
+            )
 
         return data
+
+    def _chunk_dir(self, chunk_hash):
+        return os.path.join(self.data_folder, chunk_hash[:2], chunk_hash[2:4])
+
+    def _chunk_path(self, chunk_hash):
+        return os.path.join(self._chunk_dir(chunk_hash), chunk_hash)

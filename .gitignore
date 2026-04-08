@@ -9,3 +9,5 @@ build/
 restored/protos/*_pb2.py
 protos/*_pb2_grpc.py
 *.sh
+protos/membership_pb2.py
+protos/p2p_storage_pb2.py

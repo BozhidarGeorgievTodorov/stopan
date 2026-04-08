@@ -12,10 +12,34 @@ class FileChunker:
     La búsqueda de puntos de corte se delega en la extensión nativa fast_rabin.
     """
 
+    __slots__ = (
+        "avg_chunk_size",
+        "min_chunk_size",
+        "max_chunk_size",
+        "relaxed_mask",
+        "strong_mask",
+    )
+
     def __init__(self, avg_chunk_size=4096, min_chunk_size=None, max_chunk_size=None):
+        avg_chunk_size = int(avg_chunk_size)
+        if avg_chunk_size <= 0:
+            raise ValueError("avg_chunk_size must be > 0")
+        if avg_chunk_size & (avg_chunk_size - 1) != 0:
+            raise ValueError("avg_chunk_size must be a power of 2")
+
         self.avg_chunk_size = avg_chunk_size
-        self.min_chunk_size = min_chunk_size or avg_chunk_size // 4
-        self.max_chunk_size = max_chunk_size or avg_chunk_size * 4
+        self.min_chunk_size = (
+            int(min_chunk_size) if min_chunk_size is not None else avg_chunk_size // 4
+        )
+        self.max_chunk_size = (
+            int(max_chunk_size) if max_chunk_size is not None else avg_chunk_size * 4
+        )
+
+        if self.min_chunk_size <= 0:
+            raise ValueError("min_chunk_size must be > 0")
+        if self.max_chunk_size < self.min_chunk_size:
+            raise ValueError("max_chunk_size must be >= min_chunk_size")
+
         self.relaxed_mask = avg_chunk_size - 1
         self.strong_mask = (avg_chunk_size * 2) - 1
 

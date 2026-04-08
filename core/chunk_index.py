@@ -1,35 +1,52 @@
 import threading
 
 
-class FastDictCache:
-    """Caché sencilla para consultas repetidas durante una ejecución."""
+class FastBoolCache:
+    """
+    Caché booleana en memoria para una ejecución.
 
-    __slots__ = ("max_items", "_data", "_lock", "_ops")
+    Estrategia:
+      - lecturas lock-free sobre dict
+      - escritura ligera
+      - clear-on-full con muestreo periódico para evitar comprobar el tamaño
+        en cada inserción
+    """
+
+    __slots__ = ("max_items", "_data", "_clear_lock", "_write_ops")
 
     def __init__(self, max_items=200_000):
-        self.max_items = max_items
+        self.max_items = max(int(max_items), 1)
         self._data = {}
-        self._lock = threading.Lock()
-        self._ops = 0
+        self._clear_lock = threading.Lock()
+        self._write_ops = 0
 
     def get(self, key):
         return self._data.get(key)
 
     def set(self, key, value):
-        self._data[key] = value
-        self._ops += 1
+        self._data[key] = bool(value)
+        self._write_ops += 1
 
-        if (self._ops & 1023) == 0 and len(self._data) > self.max_items:
-            with self._lock:
+        if (self._write_ops & 1023) == 0 and len(self._data) > self.max_items:
+            with self._clear_lock:
                 if len(self._data) > self.max_items:
                     self._data.clear()
 
 
 class ChunkIndex:
-    """Índice en memoria para decisiones de fast-path durante un backup."""
+    """
+    Índice efímero por ejecución.
 
-    __slots__ = ("local_exists", "synced")
+    local_exists:
+      - cachea existencia local en el CAS
+
+    remotely_protected:
+      - cachea si el chunk tiene evidencia suficiente de protección remota
+        para el contexto actual del planner
+    """
+
+    __slots__ = ("local_exists", "remotely_protected")
 
     def __init__(self, max_items=200_000):
-        self.local_exists = FastDictCache(max_items=max_items)
-        self.synced = FastDictCache(max_items=max_items)
+        self.local_exists = FastBoolCache(max_items=max_items)
+        self.remotely_protected = FastBoolCache(max_items=max_items)

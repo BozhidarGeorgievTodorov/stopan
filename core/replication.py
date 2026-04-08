@@ -14,7 +14,8 @@ from protos import p2p_storage_pb2
 from protos import p2p_storage_pb2_grpc
 
 
-DEFAULT_RPC_TIMEOUT_S = float(os.getenv("REPLICATION_RPC_TIMEOUT_S", "10.0"))
+DEFAULT_PROBE_TIMEOUT_S = float(os.getenv("REPLICATION_PROBE_TIMEOUT_S", "10.0"))
+DEFAULT_STREAM_TIMEOUT_S = float(os.getenv("REPLICATION_STREAM_TIMEOUT_S", "60.0"))
 DEFAULT_TARGET_PARALLELISM = int(os.getenv("REPLICATION_TARGET_PARALLELISM", "4"))
 DEFAULT_PROBE_BATCH_HASHES = int(os.getenv("REPLICATION_PROBE_BATCH_HASHES", "2048"))
 DEFAULT_STREAM_INFLIGHT = int(os.getenv("REPLICATION_STREAM_INFLIGHT", "64"))
@@ -26,9 +27,23 @@ class TargetAck:
     chunk_hash: str
     node_id: str
     address: str
-    success: bool
-    already_present: bool
-    message: str
+    status: int
+    detail: str
+
+    @property
+    def is_success(self) -> bool:
+        return self.status in (
+            p2p_storage_pb2.STORE_STATUS_STORED,
+            p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
+        )
+
+    @property
+    def is_already_present(self) -> bool:
+        return self.status == p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT
+
+    @property
+    def is_stored(self) -> bool:
+        return self.status == p2p_storage_pb2.STORE_STATUS_STORED
 
 
 @dataclass(frozen=True)
@@ -133,6 +148,10 @@ class _QueueIterator:
 class TargetStreamingSession:
     """
     Sesión persistente hacia un target remoto.
+
+    Estrategia:
+      - ProbeMissingChunks para descubrir hashes ausentes.
+      - ReplicateChunks streaming para enviar solo los blobs faltantes.
     """
 
     def __init__(
@@ -141,14 +160,16 @@ class TargetStreamingSession:
         node_id: str,
         address: str,
         rpc_pool: StorageRpcPool,
-        rpc_timeout_s: float,
+        probe_timeout_s: float,
+        stream_timeout_s: float,
         probe_batch_hashes: int,
         stream_inflight: int,
     ):
         self.node_id = node_id
         self.address = address
         self._rpc_pool = rpc_pool
-        self._rpc_timeout_s = float(rpc_timeout_s)
+        self._probe_timeout_s = float(probe_timeout_s)
+        self._stream_timeout_s = float(stream_timeout_s)
         self._probe_batch_hashes = max(1, int(probe_batch_hashes))
         self._stream_inflight = max(1, int(stream_inflight))
 
@@ -162,8 +183,11 @@ class TargetStreamingSession:
             return missing
 
         for batch in _iter_hash_batches(chunk_hashes, self._probe_batch_hashes):
-            request = p2p_storage_pb2.MissingChunksRequest(chunk_hashes=batch)
-            response = self._stub.ProbeMissingChunks(request, timeout=self._rpc_timeout_s)
+            request = p2p_storage_pb2.ProbeMissingChunksRequest(chunk_hashes=batch)
+            response = self._stub.ProbeMissingChunks(
+                request,
+                timeout=self._probe_timeout_s,
+            )
             missing.update(chunk_hash for chunk_hash in response.missing_hashes if chunk_hash)
 
         return missing
@@ -192,14 +216,13 @@ class TargetStreamingSession:
                             chunk_hash=chunk_hash,
                             node_id=self.node_id,
                             address=self.address,
-                            success=False,
-                            already_present=False,
-                            message=f"Local read failed: {e}",
+                            status=p2p_storage_pb2.STORE_STATUS_ERROR,
+                            detail=f"Local read failed: {e}",
                         )
                         continue
 
                     request_iter.put(
-                        p2p_storage_pb2.StreamStoreItem(
+                        p2p_storage_pb2.ReplicateChunkRequest(
                             chunk_hash=chunk_hash,
                             chunk_data=chunk_data,
                         )
@@ -215,7 +238,10 @@ class TargetStreamingSession:
         sender_thread.start()
 
         try:
-            responses = self._stub.ReplicateChunks(request_iter, timeout=self._rpc_timeout_s)
+            responses = self._stub.ReplicateChunks(
+                request_iter,
+                timeout=self._stream_timeout_s,
+            )
             for result in responses:
                 if not result.chunk_hash:
                     continue
@@ -223,9 +249,8 @@ class TargetStreamingSession:
                     chunk_hash=result.chunk_hash,
                     node_id=self.node_id,
                     address=self.address,
-                    success=bool(result.success),
-                    already_present=bool(result.already_present),
-                    message=result.message or "",
+                    status=result.status,
+                    detail=result.detail or "",
                 )
         except grpc.RpcError:
             stop_event.set()
@@ -244,9 +269,8 @@ class TargetStreamingSession:
                     chunk_hash=chunk_hash,
                     node_id=self.node_id,
                     address=self.address,
-                    success=False,
-                    already_present=False,
-                    message="Stream ended without per-chunk ack",
+                    status=p2p_storage_pb2.STORE_STATUS_ERROR,
+                    detail="Stream ended without per-chunk ack",
                 )
 
         return acks
@@ -262,7 +286,8 @@ class StreamingReplicationCoordinator:
         cluster,
         rf: int,
         cluster_token: str,
-        rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
+        probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
+        stream_timeout_s: float = DEFAULT_STREAM_TIMEOUT_S,
         target_parallelism: int = DEFAULT_TARGET_PARALLELISM,
         probe_batch_hashes: int = DEFAULT_PROBE_BATCH_HASHES,
         stream_inflight: int = DEFAULT_STREAM_INFLIGHT,
@@ -272,7 +297,8 @@ class StreamingReplicationCoordinator:
         self.cluster = cluster
         self.rf = max(1, int(rf))
         self.cluster_token = cluster_token
-        self.rpc_timeout_s = float(rpc_timeout_s)
+        self.probe_timeout_s = float(probe_timeout_s)
+        self.stream_timeout_s = float(stream_timeout_s)
         self.target_parallelism = max(1, int(target_parallelism))
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
         self.stream_inflight = max(1, int(stream_inflight))
@@ -295,7 +321,8 @@ class StreamingReplicationCoordinator:
                 node_id=member.node_id,
                 address=member.address,
                 rpc_pool=self._rpc_pool,
-                rpc_timeout_s=self.rpc_timeout_s,
+                probe_timeout_s=self.probe_timeout_s,
+                stream_timeout_s=self.stream_timeout_s,
                 probe_batch_hashes=self.probe_batch_hashes,
                 stream_inflight=self.stream_inflight,
             )
@@ -343,9 +370,8 @@ class StreamingReplicationCoordinator:
                     chunk_hash=chunk_hash,
                     node_id=member.node_id,
                     address=member.address,
-                    success=True,
-                    already_present=True,
-                    message="already present on remote target",
+                    status=p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
+                    detail="already present on remote target",
                 )
 
         if to_send:
@@ -408,14 +434,14 @@ class StreamingReplicationCoordinator:
                         )
                         continue
 
-                    if ack.success:
-                        if ack.already_present:
+                    if ack.is_success:
+                        if ack.is_already_present:
                             accumulators[chunk_hash].already_present_remote_copies += 1
-                        else:
+                        elif ack.is_stored:
                             accumulators[chunk_hash].stored_remote_copies += 1
                     else:
                         accumulators[chunk_hash].errors.append(
-                            f"{ack.node_id[:8]}@{ack.address}: {ack.message}"
+                            f"{ack.node_id[:8]}@{ack.address}: {ack.detail}"
                         )
 
         for chunk_hash in ordered_hashes:

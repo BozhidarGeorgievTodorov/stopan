@@ -86,31 +86,52 @@ class CASRepository:
         if os.path.exists(path):
             return False
 
-        self._ensure_parent_dir(path)
-        temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
-        written = False
+        last_error = None
 
-        try:
-            with open(temp_path, "wb") as f:
-                f.write(data)
+        for attempt in range(2):
+            self._ensure_parent_dir(path)
+            temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+            written = False
 
             try:
-                os.replace(temp_path, path)
-                written = True
-            except OSError:
-                if os.path.exists(path):
-                    written = False
-                else:
+                with open(temp_path, "wb") as f:
+                    f.write(data)
+
+                try:
+                    os.replace(temp_path, path)
+                    written = True
+                    return True
+
+                except FileNotFoundError as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        self._forget_parent_dir(path)
+                        continue
                     raise
 
-            return written
-
-        finally:
-            if not written:
-                try:
-                    os.remove(temp_path)
                 except OSError:
-                    pass
+                    if os.path.exists(path):
+                        return False
+                    raise
+
+            except FileNotFoundError as exc:
+                last_error = exc
+                if attempt == 0:
+                    self._forget_parent_dir(path)
+                    continue
+                raise
+
+            finally:
+                if not written:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+        if last_error is not None:
+            raise last_error
+
+        return False
 
     def _ensure_parent_dir(self, path):
         parent = os.path.dirname(path)
@@ -122,6 +143,11 @@ class CASRepository:
                 return
             os.makedirs(parent, exist_ok=True)
             self._ensured_dirs.add(parent)
+
+    def _forget_parent_dir(self, path):
+        parent = os.path.dirname(path)
+        with self._dir_lock:
+            self._ensured_dirs.discard(parent)
 
     def _validate_compressed_block(self, chunk_hash, compressed_data):
         self._decompress_and_validate(chunk_hash, compressed_data)

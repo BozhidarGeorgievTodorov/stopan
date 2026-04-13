@@ -1,10 +1,11 @@
 ## Flujo general
 
-El sistema tiene tres operaciones principales:
+El sistema tiene cuatro operaciones principales:
 
 1. crear snapshots locales de una carpeta;
 2. proteger los chunks pendientes en una red P2P;
-3. restaurar un snapshot usando la caché local o la red.
+3. verificar que la protección remota registrada sigue siendo cierta;
+4. restaurar un snapshot usando la caché local o la red.
 
 ### Backup local
 
@@ -14,15 +15,23 @@ Por cada archivo encontrado, `FileChunker` lo divide en chunks de tamaño variab
 
 Antes de escribir un chunk, `ChunkPlanner` decide si hace falta procesarlo o si se puede reutilizar. Para eso consulta el repositorio local, la metadata guardada en SQLite y una caché en memoria llamada `ChunkIndex`.
 
-La metadata del snapshot se guarda en SQLite. Cada snapshot contiene los archivos y carpetas recorridos, sus metadatos básicos, el estado del snapshot y una referencia a la receta de chunks necesaria para reconstruir cada archivo.
+La metadata del snapshot se guarda en SQLite. Cada snapshot contiene los archivos y carpetas recorridos, sus metadatos básicos, el estado del snapshot, el `origin_node_id` que lo creó y una referencia a la receta de chunks necesaria para reconstruir cada archivo.
 
 Si existe un snapshot anterior completo de la misma raíz, los archivos que no han cambiado pueden reutilizar directamente su receta anterior. Esto evita volver a leer y trocear archivos idénticos.
+
+### Identidad del nodo origen
+
+Cada snapshot se crea asociado a un `origin_node_id`.
+
+Cuando el proceso puede resolver su identidad mediante membership, usa el `node_id` del miembro que coincide con `ADVERTISE_ADDR`. Si se ejecuta en modo local/offline, `main.py` usa una identidad local persistida en `node_store/node_id.txt`.
+
+El `origin_node_id` es importante porque la protección remota no debe contar el nodo que originó el snapshot como copia remota. Por eso replicación, verificación y restauración calculan el placement excluyendo ese nodo.
 
 ### Protección P2P
 
 Después de crear un snapshot, los chunks quedan registrados en SQLite con estado de protección.
 
-`replicator.py` lee los chunks pendientes, obtiene una vista de nodos mediante membership y calcula los nodos destino usando HRW / rendezvous hashing. El replication factor indica cuántos nodos deben proteger cada chunk.
+`replicator.py` lee los chunks pendientes, obtiene una vista de nodos mediante membership y calcula los nodos destino usando HRW / rendezvous hashing. El replication factor indica cuántos nodos remotos deben proteger cada chunk.
 
 Antes de enviar datos, el replicador pregunta a cada nodo qué hashes le faltan mediante `ProbeMissingChunks`. Después envía solamente los chunks ausentes usando `ReplicateChunks`.
 
@@ -33,11 +42,25 @@ El protocolo de almacenamiento usa estados estructurados:
 
 `store_service.py` mantiene un repositorio CAS propio, recibe chunks comprimidos por gRPC, valida su BLAKE3 antes de guardarlos y los devuelve cuando otro proceso los necesita.
 
+### Verificación de protección remota
+
+`verifier.py` audita la protección remota registrada en SQLite.
+
+No descarga blobs completos. Solo recalcula el placement HRW vigente para cada chunk, excluye el `origin_node_id` y usa `ProbeMissingChunks` para comprobar si los nodos esperados siguen teniendo el chunk.
+
+Si encuentra suficientes copias remotas, marca el chunk como `VERIFIED`. Si faltan copias, lo marca como `DEGRADED` y actualiza el error asociado.
+
+Esto permite distinguir entre:
+
+- chunks que fueron colocados por `replicator.py`;
+- chunks cuya presencia remota ha sido comprobada posteriormente;
+- chunks cuya protección se ha degradado por pérdida de nodos, borrado de datos o cambios de cluster.
+
 ### Restauración
 
 `restore.py` reconstruye un snapshot a partir de la metadata guardada en SQLite.
 
-Primero consulta los archivos y recetas del snapshot. Para cada chunk intenta leerlo desde el repositorio local. Si no está disponible, obtiene la vista de nodos y lo solicita a los nodos que deberían tenerlo según el mismo algoritmo de placement.
+Primero consulta los archivos y recetas del snapshot. Para cada chunk intenta leerlo desde el repositorio local. Si no está disponible, puede consultar también el CAS local del nodo P2P y, si sigue faltando, obtiene la vista de nodos y lo solicita a los nodos que deberían tenerlo según HRW excluyendo el `origin_node_id` del snapshot.
 
 La restauración remota usa `RetrieveChunkBatch`, por lo que puede pedir varios chunks a un mismo nodo en una sola llamada gRPC. Los chunks se resuelven por ventanas, pero se escriben siempre en el orden original del archivo.
 
@@ -52,6 +75,7 @@ Cuando todos los archivos se han restaurado correctamente, la carpeta incompleta
 ├── main.py                 # crea snapshots locales de una carpeta
 ├── restore.py              # restaura snapshots desde caché local o nodos P2P
 ├── replicator.py           # protege chunks pendientes en la red P2P
+├── verifier.py             # audita la protección remota registrada en SQLite
 ├── store_service.py        # servidor gRPC de almacenamiento y membership
 ├── setup.py                # compila core.fast_rabin y regenera protos
 ├── Dockerfile
@@ -163,7 +187,7 @@ Para pararlos y borrar los volúmenes de prueba:
 docker compose down -v
 ```
 
-El `docker-compose.yml` define cuatro nodos con membership SWIM, repositorio CAS propio y variables de rendimiento para replicación, restore y commit de almacenamiento.
+El `docker-compose.yml` define cuatro nodos con membership SWIM, repositorio CAS propio, identidad persistente por nodo y variables de rendimiento para replicación, verificación, restore y commit de almacenamiento.
 
 ## Sincronizar chunks a la red
 
@@ -192,7 +216,42 @@ python replicator.py push \
   --stream-timeout-s 60
 ```
 
-El estado de protección se guarda en SQLite, así que si el proceso se corta, se puede reanudar volviendo a ejecutar el comando.
+Por defecto, `replicator.py` aplica RF estricto: si no hay suficientes candidatos remotos para cumplir el RF deseado, no modifica `chunk_protection`.
+
+Para permitir protección best-effort:
+
+```bash
+python replicator.py push --seed localhost:50051 --rf 3 --no-strict-rf
+```
+
+## Verificar protección remota
+
+Después de hacer `push`, se puede auditar la protección remota:
+
+```bash
+python verifier.py --seed localhost:50051
+```
+
+Opciones útiles:
+
+```bash
+python verifier.py \
+  --seed localhost:50051 \
+  --target-parallelism 4 \
+  --probe-batch-hashes 2048 \
+  --probe-timeout-s 10
+```
+
+Para volver a comprobar también chunks ya marcados como `VERIFIED`:
+
+```bash
+python verifier.py --seed localhost:50051 --reverify-verified
+```
+
+El verifier actualiza `chunk_protection`:
+
+- `VERIFIED` si el chunk tiene suficientes copias remotas comprobadas;
+- `DEGRADED` si faltan copias o hay errores al comprobar targets.
 
 ## Restaurar usando caché local o red
 

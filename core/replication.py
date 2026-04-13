@@ -81,6 +81,16 @@ class ChunkAccumulator:
         return self.protected_remote_copies >= self.required_remote_copies
 
 
+class StreamingReplicationError(RuntimeError):
+    """
+    Error de stream que conserva ACKs recibidos antes del fallo.
+    """
+
+    def __init__(self, message: str, *, acks: Dict[str, TargetAck]):
+        super().__init__(message)
+        self.acks = dict(acks)
+
+
 class StorageRpcPool:
     """
     Pool reutilizable de canales y stubs gRPC para replicación de chunks.
@@ -120,20 +130,52 @@ class StorageRpcPool:
 
 
 class _QueueIterator:
+    """
+    Iterador productor/consumidor para requests streaming.
+    """
+
     def __init__(self, maxsize: int):
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
         self._sentinel = object()
-        self._closed = False
+        self._closed = threading.Event()
 
-    def put(self, item) -> None:
-        if self._closed:
-            return
-        self._queue.put(item)
+    def put(self, item) -> bool:
+        while not self._closed.is_set():
+            try:
+                self._queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
 
-    def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._queue.put(self._sentinel)
+    def finish(self) -> None:
+        if not self._closed.is_set():
+            self._closed.set()
+            self._put_sentinel()
+
+    def cancel(self) -> None:
+        self._closed.set()
+        self._drain()
+        self._put_sentinel()
+
+    def _put_sentinel(self) -> None:
+        while True:
+            try:
+                self._queue.put_nowait(self._sentinel)
+                return
+            except queue.Full:
+                self._drain_one()
+
+    def _drain(self) -> None:
+        while self._drain_one():
+            pass
+
+    def _drain_one(self) -> bool:
+        try:
+            self._queue.get_nowait()
+            return True
+        except queue.Empty:
+            return False
 
     def __iter__(self):
         return self
@@ -182,7 +224,7 @@ class TargetStreamingSession:
         if not chunk_hashes:
             return missing
 
-        for batch in _iter_hash_batches(chunk_hashes, self._probe_batch_hashes):
+        for batch in iter_hash_batches(chunk_hashes, self._probe_batch_hashes):
             request = p2p_storage_pb2.ProbeMissingChunksRequest(chunk_hashes=batch)
             response = self._stub.ProbeMissingChunks(
                 request,
@@ -204,31 +246,39 @@ class TargetStreamingSession:
         local_failures: Dict[str, TargetAck] = {}
         stop_event = threading.Event()
 
+        def merged_acks() -> Dict[str, TargetAck]:
+            merged = dict(acks)
+            merged.update(local_failures)
+            return merged
+
         def sender() -> None:
             try:
                 for chunk_hash in chunk_hashes:
                     if stop_event.is_set():
                         break
+
                     try:
                         chunk_data = repo.get_compressed(chunk_hash)
-                    except Exception as e:
+                    except Exception as exc:
                         local_failures[chunk_hash] = TargetAck(
                             chunk_hash=chunk_hash,
                             node_id=self.node_id,
                             address=self.address,
                             status=p2p_storage_pb2.STORE_STATUS_ERROR,
-                            detail=f"Local read failed: {e}",
+                            detail=f"Local read failed: {exc}",
                         )
                         continue
 
-                    request_iter.put(
+                    accepted = request_iter.put(
                         p2p_storage_pb2.ReplicateChunkRequest(
                             chunk_hash=chunk_hash,
                             chunk_data=chunk_data,
                         )
                     )
+                    if not accepted:
+                        break
             finally:
-                request_iter.close()
+                request_iter.finish()
 
         sender_thread = threading.Thread(
             target=sender,
@@ -252,13 +302,25 @@ class TargetStreamingSession:
                     status=result.status,
                     detail=result.detail or "",
                 )
-        except grpc.RpcError:
+
+        except grpc.RpcError as exc:
             stop_event.set()
-            request_iter.close()
-            raise
+            request_iter.cancel()
+            raise StreamingReplicationError(
+                f"stream replication failed: {format_rpc_error(exc)}",
+                acks=merged_acks(),
+            ) from exc
+
+        except Exception as exc:
+            stop_event.set()
+            request_iter.cancel()
+            raise StreamingReplicationError(
+                f"stream replication failed: {exc}",
+                acks=merged_acks(),
+            ) from exc
+
         finally:
             stop_event.set()
-            request_iter.close()
             sender_thread.join(timeout=2.0)
 
         acks.update(local_failures)
@@ -286,6 +348,7 @@ class StreamingReplicationCoordinator:
         cluster,
         rf: int,
         cluster_token: str,
+        origin_node_id: str,
         probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
         stream_timeout_s: float = DEFAULT_STREAM_TIMEOUT_S,
         target_parallelism: int = DEFAULT_TARGET_PARALLELISM,
@@ -293,10 +356,15 @@ class StreamingReplicationCoordinator:
         stream_inflight: int = DEFAULT_STREAM_INFLIGHT,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     ):
+        origin_node_id = str(origin_node_id).strip()
+        if not origin_node_id:
+            raise ValueError("StreamingReplicationCoordinator requires a non-empty origin_node_id.")
+
         self.repo = repo
         self.cluster = cluster
         self.rf = max(1, int(rf))
         self.cluster_token = cluster_token
+        self.origin_node_id = origin_node_id
         self.probe_timeout_s = float(probe_timeout_s)
         self.stream_timeout_s = float(stream_timeout_s)
         self.target_parallelism = max(1, int(target_parallelism))
@@ -334,11 +402,14 @@ class StreamingReplicationCoordinator:
         target_chunks: Dict[str, List[str]] = defaultdict(list)
         target_member: Dict[str, object] = {}
 
+        excluded_node_ids = {self.origin_node_id}
+
         for chunk_hash in chunk_hashes:
-            remote_targets = self.cluster.hrw_remote_targets(
+            remote_targets = self.cluster.hrw_targets_excluding(
                 chunk_hash,
                 rf=self.rf,
                 salt=self.cluster_token,
+                excluded_node_ids=excluded_node_ids,
             )
             chunk_targets[chunk_hash] = remote_targets
             for member in remote_targets:
@@ -377,6 +448,15 @@ class StreamingReplicationCoordinator:
         if to_send:
             try:
                 acks.update(session.replicate_missing_hashes(to_send, self.repo))
+            except StreamingReplicationError as exc:
+                partial_acks = dict(acks)
+                partial_acks.update(exc.acks)
+                return TargetExecutionResult(
+                    node_id=member.node_id,
+                    address=member.address,
+                    acks=partial_acks,
+                    transport_error=str(exc),
+                )
             except Exception as exc:
                 return TargetExecutionResult(
                     node_id=member.node_id,
@@ -420,18 +500,19 @@ class StreamingReplicationCoordinator:
                     )
 
                 planned_hashes = target_chunks[address]
-                if target_result.transport_error:
-                    message = f"{target_result.node_id[:8]}@{target_result.address}: {target_result.transport_error}"
-                    for chunk_hash in planned_hashes:
-                        accumulators[chunk_hash].errors.append(message)
-                    continue
 
                 for chunk_hash in planned_hashes:
                     ack = target_result.acks.get(chunk_hash)
                     if ack is None:
-                        accumulators[chunk_hash].errors.append(
-                            f"{target_result.node_id[:8]}@{target_result.address}: missing ack"
-                        )
+                        if target_result.transport_error:
+                            accumulators[chunk_hash].errors.append(
+                                f"{target_result.node_id[:8]}@{target_result.address}: "
+                                f"{target_result.transport_error}"
+                            )
+                        else:
+                            accumulators[chunk_hash].errors.append(
+                                f"{target_result.node_id[:8]}@{target_result.address}: missing ack"
+                            )
                         continue
 
                     if ack.is_success:
@@ -469,7 +550,7 @@ class StreamingReplicationCoordinator:
             )
 
 
-def _iter_hash_batches(chunk_hashes: Sequence[str], batch_size: int) -> Iterator[List[str]]:
+def iter_hash_batches(chunk_hashes: Sequence[str], batch_size: int) -> Iterator[List[str]]:
     batch_size = max(1, int(batch_size))
     current: List[str] = []
     for chunk_hash in chunk_hashes:
@@ -479,3 +560,20 @@ def _iter_hash_batches(chunk_hashes: Sequence[str], batch_size: int) -> Iterator
             current = []
     if current:
         yield current
+
+
+def format_rpc_error(exc: grpc.RpcError) -> str:
+    code = "UNKNOWN"
+    details = str(exc)
+
+    try:
+        code = exc.code().name
+    except Exception:
+        pass
+
+    try:
+        details = exc.details() or details
+    except Exception:
+        pass
+
+    return f"{code}: {details}"

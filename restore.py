@@ -7,12 +7,16 @@ import threading
 import time
 from dataclasses import dataclass
 
+import blake3
+import zstandard as zstd
+
 from core.database import MetadataDB
 from core.repository import CASRepository
 
 
 LOCAL_SHARD_DIR = os.getenv("LOCAL_SHARD_DIR", "_data_chunks")
 DB_FILE = os.getenv("DB_FILE", "_metadata.db")
+REPO_STORE_DIR = os.getenv("REPO_STORE_DIR", "node_store")
 CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
 DEFAULT_RF = int(os.getenv("RF", os.getenv("REPLICATION_FACTOR", "3")))
 DEFAULT_SEED = os.getenv("MEMBERSHIP_SEED", "localhost:50051")
@@ -34,6 +38,21 @@ def _safe_restore_path(base_dir, rel_path):
         raise ValueError(f"Path escapes restore directory: {rel_path}")
 
     return full_path
+
+
+def _decompress_and_validate_remote_chunk(chunk_hash, compressed_data):
+    try:
+        raw = zstd.ZstdDecompressor().decompress(compressed_data)
+    except zstd.ZstdError as exc:
+        raise ValueError(f"Remote chunk has corrupt zstd data: {chunk_hash}") from exc
+
+    calculated_hash = blake3.blake3(raw).hexdigest()
+    if calculated_hash != chunk_hash:
+        raise ValueError(
+            f"Remote chunk hash mismatch: expected {chunk_hash}, got {calculated_hash}"
+        )
+
+    return raw
 
 
 @dataclass(frozen=True)
@@ -63,8 +82,7 @@ class RemoteStorageClientPool:
     Pool de clientes remotos para restore.
 
     La carga de grpc/protobuf se retrasa hasta que realmente falta un chunk
-    local y hay que consultar la red. La lectura remota usa únicamente
-    RetrieveChunkBatch.
+    local y hay que consultar la red. La lectura remota usa RetrieveChunkBatch.
     """
 
     def __init__(self, *, timeout_s=DEFAULT_RPC_TIMEOUT_S):
@@ -93,6 +111,11 @@ class RemoteStorageClientPool:
         self._ensure_runtime()
         return self._p2p_storage_pb2.RETRIEVE_STATUS_FOUND
 
+    @property
+    def retrieve_status_error(self):
+        self._ensure_runtime()
+        return self._p2p_storage_pb2.RETRIEVE_STATUS_ERROR
+
     def _get_stub(self, address):
         self._ensure_runtime()
 
@@ -111,9 +134,31 @@ class RemoteStorageClientPool:
 
     def retrieve_chunk_batch(self, *, address, chunk_hashes):
         self._ensure_runtime()
-        if not chunk_hashes:
+        ordered_hashes = list(dict.fromkeys(chunk_hashes))
+        if not ordered_hashes:
             return {}
 
+        try:
+            return self._retrieve_chunk_batch_once(
+                address=address,
+                chunk_hashes=ordered_hashes,
+            )
+        except Exception as exc:
+            if len(ordered_hashes) > 1 and self.is_message_too_large_error(exc):
+                midpoint = len(ordered_hashes) // 2
+                left = self.retrieve_chunk_batch(
+                    address=address,
+                    chunk_hashes=ordered_hashes[:midpoint],
+                )
+                right = self.retrieve_chunk_batch(
+                    address=address,
+                    chunk_hashes=ordered_hashes[midpoint:],
+                )
+                left.update(right)
+                return left
+            raise
+
+    def _retrieve_chunk_batch_once(self, *, address, chunk_hashes):
         stub = self._get_stub(address)
         request = self._p2p_storage_pb2.RetrieveChunkBatchRequest(chunk_hashes=list(chunk_hashes))
         response = stub.RetrieveChunkBatch(request, timeout=self.timeout_s)
@@ -144,6 +189,29 @@ class RemoteStorageClientPool:
         self._ensure_runtime()
         return isinstance(exc, self._grpc.RpcError)
 
+    def is_message_too_large_error(self, exc):
+        self._ensure_runtime()
+        if not isinstance(exc, self._grpc.RpcError):
+            return False
+
+        try:
+            if exc.code() == self._grpc.StatusCode.RESOURCE_EXHAUSTED:
+                return True
+        except Exception:
+            pass
+
+        try:
+            details = exc.details() or ""
+        except Exception:
+            details = str(exc)
+
+        lowered = details.lower()
+        return (
+            "resource exhausted" in lowered
+            or "received message larger than max" in lowered
+            or "message larger than max" in lowered
+        )
+
     def close(self):
         with self._lock:
             for channel in self._channels.values():
@@ -156,13 +224,18 @@ class LazyClusterResolver:
     """
     Resuelve membership solo cuando aparece un miss local.
 
-    Evita abrir canales de red en restores que pueden resolverse íntegramente
-    desde la caché local.
+    El restore usa origin_node_id del snapshot para consultar los mismos
+    targets HRW que fueron usados por replicator/verifier.
     """
 
-    def __init__(self, *, seed, rf):
+    def __init__(self, *, seed, rf, origin_node_id):
+        origin_node_id = str(origin_node_id).strip()
+        if not origin_node_id:
+            raise ValueError("LazyClusterResolver requires a non-empty origin_node_id.")
+
         self.seed = seed
         self.rf = max(int(rf), 1)
+        self.origin_node_id = origin_node_id
         self._cluster = None
         self._announced = False
         self._lock = threading.Lock()
@@ -193,10 +266,14 @@ class LazyClusterResolver:
             self._announced = True
 
         self_addr = os.getenv("ADVERTISE_ADDR", "")
+        remote_candidates = len(cluster.candidate_node_ids_excluding({self.origin_node_id}))
+
         print(f"Remote restore enabled. Eligible members: {[f'{m.node_id[:8]}@{m.address}' for m in cluster.members]}")
         if cluster.self_node_id:
             print(f"Self: {cluster.self_node_id[:8]}@{self_addr}")
-        print(f"RF targets: {min(max(self.rf, 1), len(cluster.members))}")
+        print(f"Origin node: {self.origin_node_id[:8]}")
+        print(f"Remote candidates: {remote_candidates}")
+        print(f"Desired RF: {self.rf}")
 
 
 class ChunkFetchService:
@@ -204,8 +281,9 @@ class ChunkFetchService:
     Lee chunks con prioridad local y recuperación remota por lotes bajo demanda.
     """
 
-    def __init__(self, *, repo, cluster_resolver, remote_pool, rf):
+    def __init__(self, *, repo, p2p_local_repo, cluster_resolver, remote_pool, rf):
         self.repo = repo
+        self.p2p_local_repo = p2p_local_repo
         self.cluster_resolver = cluster_resolver
         self.remote_pool = remote_pool
         self.rf = max(int(rf), 1)
@@ -218,10 +296,24 @@ class ChunkFetchService:
         for chunk_hash in ordered_hashes:
             try:
                 results[chunk_hash] = self.repo.get(chunk_hash)
+                continue
             except FileNotFoundError:
-                missing.append(chunk_hash)
+                pass
             except Exception as exc:
                 results[chunk_hash] = exc
+                continue
+
+            if self.p2p_local_repo is not None:
+                try:
+                    results[chunk_hash] = self.p2p_local_repo.get(chunk_hash)
+                    continue
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    results[chunk_hash] = exc
+                    continue
+
+            missing.append(chunk_hash)
 
         if missing:
             results.update(
@@ -240,9 +332,15 @@ class ChunkFetchService:
         target_lists = {}
         result_map = {}
         error_map = {chunk_hash: [] for chunk_hash in missing_hashes}
+        origin_node_id = self.cluster_resolver.origin_node_id
 
         for chunk_hash in missing_hashes:
-            targets = cluster.hrw_remote_targets(chunk_hash, rf=self.rf, salt=CLUSTER_TOKEN)
+            targets = cluster.hrw_targets_excluding(
+                chunk_hash,
+                rf=self.rf,
+                salt=CLUSTER_TOKEN,
+                excluded_node_ids={origin_node_id},
+            )
             target_lists[chunk_hash] = targets
             if not targets:
                 result_map[chunk_hash] = FileNotFoundError(
@@ -308,12 +406,21 @@ class ChunkFetchService:
                             continue
 
                         try:
-                            self.repo.put_compressed(chunk_hash, result.chunk_data)
-                            result_map[chunk_hash] = self.repo.get(chunk_hash)
-                            unresolved.discard(chunk_hash)
+                            raw_data = _decompress_and_validate_remote_chunk(
+                                chunk_hash,
+                                result.chunk_data,
+                            )
                         except Exception as exc:
-                            result_map[chunk_hash] = exc
-                            unresolved.discard(chunk_hash)
+                            error_map[chunk_hash].append(f"{member.address}: {exc}")
+                            continue
+
+                        try:
+                            self.repo.put_compressed(chunk_hash, result.chunk_data)
+                        except Exception as exc:
+                            print(f"Could not cache remote chunk {chunk_hash[:8]} locally: {exc}")
+
+                        result_map[chunk_hash] = raw_data
+                        unresolved.discard(chunk_hash)
 
         for chunk_hash in unresolved:
             result_map[chunk_hash] = FileNotFoundError(
@@ -528,53 +635,65 @@ def restore_snapshot(
 ):
     db = MetadataDB(DB_FILE)
     repo = CASRepository(LOCAL_SHARD_DIR)
-    remote_pool = RemoteStorageClientPool(timeout_s=DEFAULT_RPC_TIMEOUT_S)
-    cluster_resolver = LazyClusterResolver(seed=seed, rf=rf)
-    fetch_service = ChunkFetchService(
-        repo=repo,
-        cluster_resolver=cluster_resolver,
-        remote_pool=remote_pool,
-        rf=rf,
-    )
-    restorer = SnapshotRestorer(
-        db=db,
-        repo=repo,
-        fetch_service=fetch_service,
-        base_output_dir=base_output_dir,
-        batch_target_parallelism=batch_target_parallelism,
-        prefetch_window=prefetch_window,
-    )
+    p2p_local_repo = CASRepository(REPO_STORE_DIR)
+    remote_pool = None
 
     try:
+        origin_node_id = db.get_snapshot_origin_node_id(snapshot_id)
+        if not origin_node_id:
+            raise RuntimeError(f"Snapshot {snapshot_id} has no origin_node_id.")
+
+        remote_pool = RemoteStorageClientPool(timeout_s=DEFAULT_RPC_TIMEOUT_S)
+        cluster_resolver = LazyClusterResolver(
+            seed=seed,
+            rf=rf,
+            origin_node_id=origin_node_id,
+        )
+        fetch_service = ChunkFetchService(
+            repo=repo,
+            p2p_local_repo=p2p_local_repo,
+            cluster_resolver=cluster_resolver,
+            remote_pool=remote_pool,
+            rf=rf,
+        )
+        restorer = SnapshotRestorer(
+            db=db,
+            repo=repo,
+            fetch_service=fetch_service,
+            base_output_dir=base_output_dir,
+            batch_target_parallelism=batch_target_parallelism,
+            prefetch_window=prefetch_window,
+        )
         restorer.restore(snapshot_id)
+
     finally:
         db.close()
-        remote_pool.close()
+        if remote_pool is not None:
+            remote_pool.close()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="restore.py",
-        description="Restaura snapshots desde CAS local y red bajo demanda.",
+        description="Restaura snapshots desde el CAS local y la red P2P bajo demanda.",
     )
-    parser.add_argument("snapshot_id", type=int)
+    parser.add_argument("snapshot_id", type=int, help="ID del snapshot a restaurar")
     parser.add_argument("out", nargs="?", default="restore_out", help="Directorio base de salida")
     parser.add_argument("--seed", default=DEFAULT_SEED, help="Seed de membership para recuperación remota")
-    parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor HRW")
+    parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor usado para calcular targets HRW")
     parser.add_argument(
         "--prefetch-window",
         type=int,
         default=DEFAULT_PREFETCH_WINDOW,
-        help="Número de chunks a resolver por ventana",
+        help="Número de chunks resueltos por ventana",
     )
     parser.add_argument(
         "--batch-target-parallelism",
         type=int,
         default=DEFAULT_BATCH_TARGET_PARALLELISM,
-        help="Número máximo de targets remotos consultados en paralelo por ronda HRW",
+        help="Máximo de targets remotos consultados en paralelo por ronda HRW",
     )
     return parser.parse_args()
-
 
 def main():
     args = parse_args()

@@ -4,11 +4,19 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Iterable
 
 from core.protection import ProtectionRecord, ProtectionState, is_record_sufficient
 
 DB_FILE = "_metadata.db"
+
+
+@dataclass(frozen=True)
+class VerificationCandidate:
+    chunk_hash: str
+    desired_rf: int
+    protection_state: ProtectionState
 
 
 class MetadataDB:
@@ -47,6 +55,7 @@ class MetadataDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
                 root_path TEXT NOT NULL,
+                origin_node_id TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'CREATING',
                 error TEXT,
                 total_size INTEGER NOT NULL DEFAULT 0,
@@ -54,9 +63,14 @@ class MetadataDB:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_snapshots_root_status_id
             ON snapshots(root_path, status, id DESC)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_snapshots_origin_node_id
+            ON snapshots(origin_node_id)
         """)
 
         cursor.execute("""
@@ -146,14 +160,18 @@ class MetadataDB:
 
         self.conn.commit()
 
-    def create_snapshot(self, root_path):
+    def create_snapshot(self, root_path, *, origin_node_id):
         """Crea un snapshot nuevo en estado CREATING."""
+        origin_node_id = str(origin_node_id).strip()
+        if not origin_node_id:
+            raise ValueError("create_snapshot requires a non-empty origin_node_id.")
+
         snapshot_uuid = str(uuid.uuid4())
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO snapshots (uuid, root_path, status)
-            VALUES (?, ?, 'CREATING')
-        """, (snapshot_uuid, root_path))
+            INSERT INTO snapshots (uuid, root_path, origin_node_id, status)
+            VALUES (?, ?, ?, 'CREATING')
+        """, (snapshot_uuid, root_path, origin_node_id))
         return cursor.lastrowid
 
     def finish_snapshot(self, snapshot_id, total_size, total_files):
@@ -193,6 +211,16 @@ class MetadataDB:
         """, (snapshot_id,))
         row = cursor.fetchone()
         return row["uuid"] if row else None
+
+    def get_snapshot_origin_node_id(self, snapshot_id):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT origin_node_id
+            FROM snapshots
+            WHERE id = ?
+        """, (snapshot_id,))
+        row = cursor.fetchone()
+        return row["origin_node_id"] if row else None
 
     def add_item(self, snapshot_id, rel_path, stat_info, item_type):
         """Registra un archivo o directorio dentro de un snapshot."""
@@ -452,6 +480,38 @@ class MetadataDB:
         cursor.execute(query, tuple(params))
         return [row["chunk_hash"] for row in cursor.fetchall()]
 
+    def get_verification_candidates(self, *, include_verified=False, limit=None):
+        states = [
+            ProtectionState.PLACED.value,
+            ProtectionState.DEGRADED.value,
+        ]
+        if include_verified:
+            states.append(ProtectionState.VERIFIED.value)
+
+        placeholders = ", ".join("?" for _ in states)
+        query = f"""
+            SELECT chunk_hash, desired_rf, protection_state
+            FROM chunk_protection
+            WHERE protection_state IN ({placeholders})
+            ORDER BY chunk_hash ASC
+        """
+        params: list[object] = list(states)
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
+        cursor = self.conn.cursor()
+        cursor.execute(query, tuple(params))
+        return [
+            VerificationCandidate(
+                chunk_hash=row["chunk_hash"],
+                desired_rf=int(row["desired_rf"]),
+                protection_state=ProtectionState(row["protection_state"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
     def mark_stale_protection(self, *, desired_rf, current_epoch=None):
         desired_rf = max(int(desired_rf), 1)
         with self.conn:
@@ -514,15 +574,26 @@ class MetadataDB:
 
     def mark_chunk_verified(self, chunk_hash, *, desired_rf, protected_remote_copies, placement_epoch):
         with self.conn:
-            self._upsert_chunk_protection_state(
+            self._upsert_chunk_verification_state(
                 chunk_hash=chunk_hash,
                 desired_rf=desired_rf,
                 protection_state=ProtectionState.VERIFIED,
                 protected_remote_copies=protected_remote_copies,
                 placement_epoch=placement_epoch,
-                last_push_at=None,
                 last_verify_at=time.time(),
                 last_error=None,
+            )
+
+    def mark_chunk_degraded(self, chunk_hash, *, desired_rf, protected_remote_copies, placement_epoch, error):
+        with self.conn:
+            self._upsert_chunk_verification_state(
+                chunk_hash=chunk_hash,
+                desired_rf=desired_rf,
+                protection_state=ProtectionState.DEGRADED,
+                protected_remote_copies=protected_remote_copies,
+                placement_epoch=placement_epoch,
+                last_verify_at=time.time(),
+                last_error=error,
             )
 
     def _upsert_chunk_protection_state(
@@ -558,6 +629,40 @@ class MetadataDB:
             max(int(protected_remote_copies), 0),
             placement_epoch,
             last_push_at,
+            last_verify_at,
+            last_error,
+        ))
+
+    def _upsert_chunk_verification_state(
+        self,
+        *,
+        chunk_hash,
+        desired_rf,
+        protection_state,
+        protected_remote_copies,
+        placement_epoch,
+        last_verify_at,
+        last_error,
+    ):
+        self.conn.execute("""
+            INSERT INTO chunk_protection (
+                chunk_hash, desired_rf, protection_state, protected_remote_copies,
+                placement_epoch, last_push_at, last_verify_at, last_error
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+            ON CONFLICT(chunk_hash) DO UPDATE SET
+                desired_rf = excluded.desired_rf,
+                protection_state = excluded.protection_state,
+                protected_remote_copies = excluded.protected_remote_copies,
+                placement_epoch = excluded.placement_epoch,
+                last_verify_at = excluded.last_verify_at,
+                last_error = excluded.last_error
+        """, (
+            chunk_hash,
+            max(int(desired_rf), 1),
+            protection_state.value,
+            max(int(protected_remote_copies), 0),
+            placement_epoch,
             last_verify_at,
             last_error,
         ))

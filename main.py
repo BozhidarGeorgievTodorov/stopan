@@ -6,6 +6,7 @@ import hashlib
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 from core.chunk_index import ChunkIndex
@@ -22,6 +23,8 @@ MAX_CHUNK_SIZE = 8 * 1024 * 1024
 DEFAULT_WORKERS = 4
 MAX_INDEX_ITEMS = 200_000
 
+REPO_STORE_DIR = os.getenv("REPO_STORE_DIR", "node_store")
+NODE_ID_FILE = os.getenv("NODE_ID_FILE", os.path.join(REPO_STORE_DIR, "node_id.txt"))
 LOCAL_SHARD_DIR = os.getenv("LOCAL_SHARD_DIR", "_data_chunks")
 DB_FILE = os.getenv("DB_FILE", "_metadata.db")
 DEFAULT_RF = int(os.getenv("RF", os.getenv("REPLICATION_FACTOR", "3")))
@@ -83,7 +86,42 @@ def _resolve_membership_seed(explicit_seed=None):
     return advertise_addr or None
 
 
-def _placement_epoch_for(seed, desired_rf):
+def load_or_create_local_node_id() -> str:
+    node_id_file = os.path.abspath(NODE_ID_FILE)
+    parent_dir = os.path.dirname(node_id_file)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    if os.path.exists(node_id_file):
+        with open(node_id_file, "r", encoding="utf-8") as handle:
+            node_id = handle.read().strip()
+            if node_id:
+                return node_id
+
+    node_id = uuid.uuid4().hex
+    with open(node_id_file, "w", encoding="utf-8") as handle:
+        handle.write(node_id)
+    return node_id
+
+
+def resolve_origin_node_id(*, membership_seed=None) -> str:
+    seed = _resolve_membership_seed(membership_seed)
+
+    if seed:
+        try:
+            from core.cluster_view import ClusterMembershipClient
+
+            self_addr = os.getenv("ADVERTISE_ADDR", "")
+            cluster = ClusterMembershipClient(seed, self_addr=self_addr).get_cluster_view()
+            if cluster.self_node_id:
+                return cluster.self_node_id
+        except Exception as exc:
+            print(f"Could not resolve origin node from membership. Using local node identity: {exc}")
+
+    return load_or_create_local_node_id()
+
+
+def _placement_epoch_for(seed, desired_rf, *, origin_node_id):
     if not seed:
         return None
 
@@ -94,13 +132,22 @@ def _placement_epoch_for(seed, desired_rf):
     if not cluster.members:
         return None
 
-    return cluster.placement_epoch(
+    return cluster.placement_epoch_excluding(
         desired_rf=max(int(desired_rf), 1),
         cluster_token=CLUSTER_TOKEN,
+        excluded_node_ids={origin_node_id},
     )
 
 
-def _build_policy(*, desired_rf, fast_enabled, fast_remote_enabled, safe_mode, membership_seed):
+def _build_policy(
+    *,
+    desired_rf,
+    fast_enabled,
+    fast_remote_enabled,
+    safe_mode,
+    membership_seed,
+    origin_node_id,
+):
     desired_rf = max(int(desired_rf), 1)
 
     if safe_mode:
@@ -139,7 +186,11 @@ def _build_policy(*, desired_rf, fast_enabled, fast_remote_enabled, safe_mode, m
         )
 
     try:
-        placement_epoch = _placement_epoch_for(seed, desired_rf)
+        placement_epoch = _placement_epoch_for(
+            seed,
+            desired_rf,
+            origin_node_id=origin_node_id,
+        )
     except Exception as exc:
         print(f"Could not read membership view. Using local fast-path only: {exc}")
         placement_epoch = None
@@ -221,18 +272,21 @@ def backup(
         return False
 
     max_workers = _normalize_worker_count(workers)
+    origin_node_id = resolve_origin_node_id(membership_seed=membership_seed)
     policy = _build_policy(
         desired_rf=desired_rf,
         fast_enabled=fast_path_enabled,
         fast_remote_enabled=fast_remote_enabled,
         safe_mode=safe_mode,
         membership_seed=membership_seed,
+        origin_node_id=origin_node_id,
     )
 
     db = MetadataDB(DB_FILE)
     shared_index = ChunkIndex(max_items=MAX_INDEX_ITEMS)
 
     print(f"Starting backup for: {source_path}")
+    print(f"Origin node: {origin_node_id[:8]}")
     print(f"Workers: {max_workers}")
     print(f"Replication factor: {policy.desired_rf}")
     if policy.fast_remote_enabled:
@@ -247,7 +301,7 @@ def backup(
 
     try:
         root_path = os.path.abspath(source_path)
-        snapshot_id = db.create_snapshot(root_path)
+        snapshot_id = db.create_snapshot(root_path, origin_node_id=origin_node_id)
         previous_snapshot_id = db.get_prev_snapshot_id(root_path, snapshot_id)
         walker = TreeWalker(root_path, deterministic=deterministic)
 
@@ -396,17 +450,16 @@ def parse_args():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     backup_parser = subparsers.add_parser("backup", help="Crea un snapshot de una carpeta")
-    backup_parser.add_argument("source_dir")
-    backup_parser.add_argument("workers", nargs="?", type=int, default=DEFAULT_WORKERS)
+    backup_parser.add_argument("source_dir", help="Carpeta origen a respaldar")
+    backup_parser.add_argument("workers", nargs="?", type=int, default=DEFAULT_WORKERS, help="Número de hilos de trabajo")
     backup_parser.add_argument("--fast", action="store_true", help="Salta chunks ya presentes localmente")
-    backup_parser.add_argument("--fast-remote", action="store_true", help="Permite saltar chunks con RF ya cubierto")
+    backup_parser.add_argument("--fast-remote", action="store_true", help="Permite saltar chunks con protección remota suficiente")
     backup_parser.add_argument("--safe", action="store_true", help="Procesa todos los chunks sin fast-path")
-    backup_parser.add_argument("--deterministic", action="store_true", help="Ordena el recorrido del árbol")
+    backup_parser.add_argument("--deterministic", action="store_true", help="Usa recorrido determinista del árbol")
     backup_parser.add_argument("--rf", type=int, default=DEFAULT_RF, help="Replication factor deseado")
-    backup_parser.add_argument("--membership-seed", default=None, help="Nodo seed para obtener la vista de membership")
+    backup_parser.add_argument("--membership-seed", default=None, help="Seed de membership para fast-path remoto y resolución del nodo origen")
 
     return parser.parse_args()
-
 
 def main():
     args = parse_args()

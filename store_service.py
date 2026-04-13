@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 import uuid
@@ -34,6 +36,8 @@ BIND_ADDR = os.getenv("BIND_ADDR", "[::]:50051")
 REPO_STORE_DIR = os.getenv("REPO_STORE_DIR", "node_store")
 SEEDS = [s.strip() for s in os.getenv("SEEDS", "").split(",") if s.strip()]
 STORAGE_RPC_WORKERS = int(os.getenv("STORAGE_RPC_WORKERS", "64"))
+STORAGE_COMMIT_WORKERS = int(os.getenv("STORAGE_COMMIT_WORKERS", str(max(4, os.cpu_count() or 4))))
+STORAGE_COMMIT_QUEUE_ITEMS = int(os.getenv("STORAGE_COMMIT_QUEUE_ITEMS", "256"))
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
 
 STATE_ORDER = {
@@ -49,6 +53,84 @@ ELIGIBLE_STATES = {membership_pb2.ALIVE}
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+@dataclass(frozen=True)
+class NodeIdentity:
+    node_id: str
+    incarnation: int
+
+
+class NodeIdentityStore:
+    _FILENAME = "node_id.txt"
+
+    def __init__(self, root_path: str):
+        self.root_path = os.path.abspath(root_path)
+        self.file_path = os.path.join(self.root_path, self._FILENAME)
+        self._lock = threading.Lock()
+
+    def load_for_startup(self) -> NodeIdentity:
+        with self._lock:
+            if not os.path.exists(self.file_path):
+                node_id = uuid.uuid4().hex
+                incarnation = 1
+                self._write_unlocked(node_id=node_id, incarnation=incarnation)
+                return NodeIdentity(node_id=node_id, incarnation=incarnation)
+
+            node_id, incarnation = self._read_unlocked()
+            next_incarnation = incarnation + 1
+            self._write_unlocked(node_id=node_id, incarnation=next_incarnation)
+            return NodeIdentity(node_id=node_id, incarnation=next_incarnation)
+
+    def bump_above(self, *, node_id: str, observed_incarnation: int) -> int:
+        node_id = str(node_id).strip()
+        if not node_id:
+            raise ValueError("NodeIdentityStore.bump_above requires a non-empty node_id.")
+
+        with self._lock:
+            stored_node_id, stored_incarnation = self._read_unlocked()
+            if stored_node_id != node_id:
+                raise RuntimeError(
+                    "Persisted node_id is inconsistent: "
+                    f"store={stored_node_id} runtime={node_id}"
+                )
+
+            next_incarnation = max(stored_incarnation, int(observed_incarnation)) + 1
+            self._write_unlocked(node_id=node_id, incarnation=next_incarnation)
+            return next_incarnation
+
+    def _read_unlocked(self) -> tuple[str, int]:
+        with open(self.file_path, "r", encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle.readlines()]
+
+        if len(lines) != 2 or not lines[0]:
+            raise RuntimeError(
+                "Invalid node identity file. Expected canonical v20 format: "
+                "<node_id> followed by <incarnation>."
+            )
+
+        try:
+            incarnation = int(lines[1])
+        except ValueError as exc:
+            raise RuntimeError("Invalid node identity file: incarnation must be an integer.") from exc
+
+        if incarnation < 1:
+            raise RuntimeError("Invalid node identity file: incarnation must be >= 1.")
+
+        return lines[0], incarnation
+
+    def _write_unlocked(self, *, node_id: str, incarnation: int) -> None:
+        node_id = str(node_id).strip()
+        if not node_id:
+            raise ValueError("NodeIdentityStore requires a non-empty node_id.")
+        if int(incarnation) < 1:
+            raise ValueError("NodeIdentityStore requires incarnation >= 1.")
+
+        os.makedirs(self.root_path, exist_ok=True)
+        temp_path = f"{self.file_path}.{uuid.uuid4().hex}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(f"{node_id}\n{int(incarnation)}\n")
+        os.replace(temp_path, self.file_path)
 
 
 @dataclass
@@ -102,14 +184,22 @@ class GossipBuffer:
 
 
 class MembershipManager:
-    def __init__(self, node_id: str, address: str):
+    def __init__(
+        self,
+        *,
+        identity_store: NodeIdentityStore,
+        node_id: str,
+        address: str,
+        incarnation: int,
+    ):
+        self.identity_store = identity_store
         self.node_id = node_id
         self.address = address
+        self.incarnation = max(int(incarnation), 1)
         self._lock = threading.Lock()
         self._members: Dict[str, MemberRecord] = {}
         self.gossip = GossipBuffer()
         self.channels = ChannelCache()
-        self.incarnation = 1
 
         self._members[self.node_id] = MemberRecord(
             node_id=self.node_id,
@@ -166,7 +256,10 @@ class MembershipManager:
     def apply_event(self, ev: membership_pb2.MemberEvent, source: str = ""):
         if ev.node_id == self.node_id and ev.state in (membership_pb2.SUSPECT, membership_pb2.DEAD):
             if ev.incarnation >= self.incarnation:
-                self.incarnation = ev.incarnation + 1
+                self.incarnation = self.identity_store.bump_above(
+                    node_id=self.node_id,
+                    observed_incarnation=ev.incarnation,
+                )
                 self._announce_alive()
             return
 
@@ -413,8 +506,8 @@ class StorageCommitEngine:
         self.repo = repo
         self._tls = threading.local()
         self._max_chunk_size = MAX_CHUNK_SIZE
-        self._max_pending = int(os.getenv("STORAGE_COMMIT_QUEUE_ITEMS", "256"))
-        self._worker_count = int(os.getenv("STORAGE_COMMIT_WORKERS", str(max(4, os.cpu_count() or 4))))
+        self._max_pending = max(1, STORAGE_COMMIT_QUEUE_ITEMS)
+        self._worker_count = max(1, STORAGE_COMMIT_WORKERS)
         self._executor = futures.ThreadPoolExecutor(
             max_workers=self._worker_count,
             thread_name_prefix="storage-commit",
@@ -650,28 +743,19 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             context.set_details(str(e))
             return p2p_storage_pb2.RetrieveChunkBatchResponse()
 
-def load_or_create_node_id(path: str) -> str:
-    """Carga un identificador persistente del nodo o crea uno nuevo."""
-    os.makedirs(path, exist_ok=True)
-    f = os.path.join(path, "node_id.txt")
-    if os.path.exists(f):
-        with open(f, "r", encoding="utf-8") as r:
-            v = r.read().strip()
-            if v:
-                return v
-    v = uuid.uuid4().hex
-    with open(f, "w", encoding="utf-8") as w:
-        w.write(v)
-    return v
-
-
 def serve():
-    repo_store_dir = REPO_STORE_DIR
     if not ADVERTISE_ADDR:
         raise RuntimeError("Missing ADVERTISE_ADDR (for example node1:50051).")
 
-    node_id = load_or_create_node_id(repo_store_dir)
-    mgr = MembershipManager(node_id=node_id, address=ADVERTISE_ADDR)
+    identity_store = NodeIdentityStore(REPO_STORE_DIR)
+    identity = identity_store.load_for_startup()
+
+    mgr = MembershipManager(
+        identity_store=identity_store,
+        node_id=identity.node_id,
+        address=ADVERTISE_ADDR,
+        incarnation=identity.incarnation,
+    )
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=STORAGE_RPC_WORKERS),
@@ -684,13 +768,16 @@ def serve():
             ("grpc.keepalive_permit_without_calls", 1),
         ],
     )
-    storage_servicer = StorageNodeServicer(repo_store_dir)
+    storage_servicer = StorageNodeServicer(REPO_STORE_DIR)
     p2p_storage_pb2_grpc.add_P2PStorageServicer_to_server(storage_servicer, server)
     membership_pb2_grpc.add_MembershipServicer_to_server(MembershipServicer(mgr), server)
 
     server.add_insecure_port(BIND_ADDR)
     server.start()
-    print(f"Node {node_id[:8]} listening on {BIND_ADDR} (advertise={ADVERTISE_ADDR})")
+    print(
+        f"Node {identity.node_id[:8]} inc={identity.incarnation} "
+        f"listening on {BIND_ADDR} (advertise={ADVERTISE_ADDR})"
+    )
 
     mgr.bootstrap_join(SEEDS)
     mgr.start()

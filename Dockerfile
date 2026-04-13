@@ -23,6 +23,7 @@ COPY main.py /app/
 COPY restore.py /app/
 COPY replicator.py /app/
 COPY store_service.py /app/
+COPY verifier.py /app/
 
 RUN python setup.py build_protos
 RUN python setup.py build_ext --inplace && rm -rf build/

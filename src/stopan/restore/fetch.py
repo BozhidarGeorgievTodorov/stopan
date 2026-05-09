@@ -1,3 +1,15 @@
+"""
+Servicio de lectura de chunks para restore.
+
+La lectura sigue una cadena conservadora:
+  1. CAS local;
+  2. CAS P2P local;
+  3. red remota mediante RetrieveChunkBatch.
+
+Todo chunk recuperado fuera del CAS local principal se valida con Zstandard y
+BLAKE3 antes de aceptarse.
+"""
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -8,13 +20,22 @@ import zstandard as zstd
 
 from stopan.cas.repository import CASRepository
 from stopan.restore.cluster import LazyClusterResolver
-from stopan.restore.config import CLUSTER_TOKEN
 from stopan.restore.remote_client import RemoteStorageClientPool
+from stopan.protection.policy import normalize_remote_rf
+from stopan.rpc.errors import format_rpc_error, is_rpc_error
 
 
 class ChunkFetchService:
     """
-    Lee chunks con prioridad local y recuperación remota por lotes bajo demanda.
+    Política de lectura de chunks durante restore.
+
+    Prioridad:
+      1. CAS local principal;
+      2. CAS P2P local del nodo, si existe;
+      3. red bajo demanda con RetrieveChunkBatch.
+
+    rf=0 desactiva la búsqueda remota. Los blobs recuperados desde P2P local o
+    red se descomprimen y se validan contra el BLAKE3 esperado antes de usarse.
     """
 
     def __init__(
@@ -25,12 +46,16 @@ class ChunkFetchService:
         cluster_resolver: LazyClusterResolver,
         remote_pool: RemoteStorageClientPool,
         rf: int,
+        cluster_token: str,
+        max_chunk_size: int,
     ):
         self.repo = repo
         self.p2p_local_repo = p2p_local_repo
         self.cluster_resolver = cluster_resolver
         self.remote_pool = remote_pool
-        self.rf = max(int(rf), 1)
+        self.rf = normalize_remote_rf(rf)
+        self.cluster_token = str(cluster_token or "").strip()
+        self.max_chunk_size = max(int(max_chunk_size), 1)
 
     def fetch_many_raw_chunks(
         self,
@@ -38,9 +63,17 @@ class ChunkFetchService:
         *,
         target_parallelism: int,
     ) -> dict[str, bytes | Exception]:
+        """
+        Recupera varios chunks en formato raw.
+
+        Devuelve bytes para los chunks recuperados y Exception para los que no se
+        pudieron resolver. No lanza por fallo individual de chunk.
+        """
+        
         ordered_hashes = list(chunk_hashes)
         results: dict[str, bytes | Exception] = {}
         missing_hashes: list[str] = []
+        local_errors: dict[str, list[str]] = {}
 
         for chunk_hash in ordered_hashes:
             try:
@@ -49,42 +82,64 @@ class ChunkFetchService:
             except FileNotFoundError:
                 pass
             except Exception as exc:
-                results[chunk_hash] = exc
-                continue
+                local_errors.setdefault(chunk_hash, []).append(f"CAS local: {exc}")
 
             if self.p2p_local_repo is not None:
                 try:
-                    results[chunk_hash] = self.p2p_local_repo.get(chunk_hash)
+                    compressed_data = self.p2p_local_repo.get_compressed(chunk_hash)
+                    raw_data = self._validate_compressed_chunk(
+                        chunk_hash,
+                        compressed_data,
+                        source_label="chunk local P2P",
+                    )
+                    try:
+                        self.repo.put_compressed(chunk_hash, compressed_data)
+                    except Exception as exc:
+                        local_errors.setdefault(chunk_hash, []).append(
+                            f"CAS local cache desde P2P: {exc}"
+                        )
+                    results[chunk_hash] = raw_data
                     continue
                 except FileNotFoundError:
                     pass
                 except Exception as exc:
-                    results[chunk_hash] = exc
-                    continue
+                    local_errors.setdefault(chunk_hash, []).append(f"CAS P2P local: {exc}")
 
             missing_hashes.append(chunk_hash)
 
         if missing_hashes:
-            results.update(
-                self._fetch_missing_many_from_remote(
-                    missing_hashes,
-                    target_parallelism=max(int(target_parallelism), 1),
-                )
+            remote_results = self._fetch_missing_many_from_remote(
+                missing_hashes,
+                target_parallelism=max(int(target_parallelism), 1),
+                initial_errors=local_errors,
             )
+            results.update(remote_results)
 
         return results
 
-    @staticmethod
-    def _validate_remote_compressed_chunk(chunk_hash: str, compressed_data: bytes) -> bytes:
+    def _validate_compressed_chunk(
+        self,
+        chunk_hash: str,
+        compressed_data: bytes,
+        *,
+        source_label: str,
+    ) -> bytes:
         try:
-            raw_data = zstd.ZstdDecompressor().decompress(compressed_data)
+            raw_data = zstd.ZstdDecompressor().decompress(
+                compressed_data,
+                max_output_size=self.max_chunk_size,
+            )
         except zstd.ZstdError as exc:
-            raise ValueError(f"Remote chunk has corrupt zstd data: {chunk_hash}") from exc
+            raise ValueError(f"{source_label} corrupto al descomprimir: {chunk_hash[:8]}: {exc}") from exc
+        except Exception as exc:
+            raise ValueError(
+                f"{source_label} inválido o demasiado grande al descomprimir: {chunk_hash[:8]}: {exc}"
+            ) from exc
 
         calculated_hash = blake3.blake3(raw_data).hexdigest()
         if calculated_hash != chunk_hash:
             raise ValueError(
-                f"Remote chunk hash mismatch: expected {chunk_hash}, got {calculated_hash}"
+                f"hash inválido en {source_label} {chunk_hash[:8]}: calculado {calculated_hash}"
             )
 
         return raw_data
@@ -94,54 +149,52 @@ class ChunkFetchService:
         missing_hashes: list[str],
         *,
         target_parallelism: int,
+        initial_errors: dict[str, list[str]] | None = None,
     ) -> dict[str, bytes | Exception]:
+        """
+        Recupera chunks ausentes desde targets HRW remotos.
+
+        Consulta targets por rondas de rank HRW. En cuanto un chunk se recupera y
+        valida correctamente, deja de consultarse en targets posteriores.
+        """
+        
+        result_map: dict[str, bytes | Exception] = {}
+        error_map: dict[str, list[str]] = {
+            chunk_hash: list((initial_errors or {}).get(chunk_hash, []))
+            for chunk_hash in missing_hashes
+        }
+
+        if self.rf == 0:
+            for chunk_hash in missing_hashes:
+                result_map[chunk_hash] = FileNotFoundError(
+                    f"Chunk {chunk_hash[:8]} no encontrado localmente; "
+                    "rf=0 desactiva la búsqueda remota"
+                )
+            return result_map
+
         cluster = self.cluster_resolver.get_cluster()
         self.cluster_resolver.announce_once()
 
-        result_map: dict[str, bytes | Exception] = {}
-        error_map: dict[str, list[str]] = {chunk_hash: [] for chunk_hash in missing_hashes}
         target_lists: dict[str, list] = {}
+
         excluded_node_ids = {self.cluster_resolver.origin_node_id}
 
         for chunk_hash in missing_hashes:
             remote_targets = cluster.hrw_targets_excluding(
                 chunk_hash,
                 rf=self.rf,
-                salt=CLUSTER_TOKEN,
+                salt=self.cluster_token,
                 excluded_node_ids=excluded_node_ids,
             )
             target_lists[chunk_hash] = remote_targets
 
             if not remote_targets:
                 result_map[chunk_hash] = FileNotFoundError(
-                    f"Chunk {chunk_hash[:8]} is not local and has no usable HRW targets."
+                    f"El chunk {chunk_hash[:8]} no está localmente y no hay targets remotos HRW utilizables. "
+                    + " | ".join(error_map[chunk_hash])
                 )
 
         unresolved = {chunk_hash for chunk_hash in missing_hashes if chunk_hash not in result_map}
-
-        if cluster.self_node_id and self.p2p_local_repo is not None:
-            for chunk_hash in list(unresolved):
-                has_self_target = any(
-                    member.node_id == cluster.self_node_id
-                    for member in target_lists[chunk_hash]
-                )
-                if not has_self_target:
-                    continue
-
-                try:
-                    compressed_data = self.p2p_local_repo.get_compressed(chunk_hash)
-                    raw_data = self._validate_remote_compressed_chunk(chunk_hash, compressed_data)
-                    try:
-                        self.repo.put_compressed(chunk_hash, compressed_data)
-                    except Exception as exc:
-                        error_map[chunk_hash].append(f"local P2P store cache: {exc}")
-                    result_map[chunk_hash] = raw_data
-                    unresolved.discard(chunk_hash)
-                except FileNotFoundError:
-                    error_map[chunk_hash].append("local P2P store: missing chunk")
-                except Exception as exc:
-                    error_map[chunk_hash].append(f"local P2P store: {exc}")
-
         max_depth = max((len(target_lists[chunk_hash]) for chunk_hash in unresolved), default=0)
 
         for rank in range(max_depth):
@@ -169,7 +222,7 @@ class ChunkFetchService:
                 future_map = {
                     executor.submit(
                         self.remote_pool.retrieve_chunk_batch,
-                        address=member.address,
+                        addr=member.address,
                         chunk_hashes=group_hashes,
                     ): (member, group_hashes)
                     for member, group_hashes in groups.values()
@@ -181,9 +234,8 @@ class ChunkFetchService:
                     try:
                         batch_results = future.result()
                     except Exception as exc:
-                        if self.remote_pool.is_rpc_error(exc):
-                            details = getattr(exc, "details", lambda: str(exc))()
-                            message = f"{member.address}: RPC {details}"
+                        if is_rpc_error(exc):
+                            message = f"{member.address}: RPC {format_rpc_error(exc)}"
                         else:
                             message = f"{member.address}: {exc}"
 
@@ -192,9 +244,12 @@ class ChunkFetchService:
                         continue
 
                     for chunk_hash in group_hashes:
+                        if chunk_hash not in unresolved:
+                            continue
+
                         item = batch_results.get(chunk_hash)
                         if item is None:
-                            error_map[chunk_hash].append(f"{member.address}: missing batch result")
+                            error_map[chunk_hash].append(f"{member.address}: sin resultado")
                             continue
 
                         if not item.is_found(self.remote_pool.retrieve_status_found):
@@ -202,29 +257,36 @@ class ChunkFetchService:
                             continue
 
                         try:
-                            raw_data = self._validate_remote_compressed_chunk(
+                            raw_data = self._validate_compressed_chunk(
                                 chunk_hash,
                                 item.chunk_data,
+                                source_label="chunk remoto",
                             )
                         except Exception as exc:
-                            error_map[chunk_hash].append(f"{member.address}: corrupt chunk: {exc}")
                             print(
-                                f"Corrupt replica ignored: "
-                                f"{member.address} chunk={chunk_hash[:8]} error={exc}"
+                                f"   Réplica corrupta ignorada: "
+                                f"{member.address} chunk={chunk_hash[:8]} -> {exc}"
+                            )
+                            error_map[chunk_hash].append(
+                                f"{member.address}: chunk corrupto: {exc}"
                             )
                             continue
 
                         try:
                             self.repo.put_compressed(chunk_hash, item.chunk_data)
                         except Exception as exc:
-                            error_map[chunk_hash].append(f"{member.address}: local cache failed: {exc}")
+                            # El chunk ya fue validado en memoria. Si el cache local falla,
+                            # aún podemos devolver raw_data y completar el restore.
+                            error_map[chunk_hash].append(
+                                f"{member.address}: no pude cachear localmente: {exc}"
+                            )
 
                         result_map[chunk_hash] = raw_data
                         unresolved.discard(chunk_hash)
 
         for chunk_hash in list(unresolved):
             result_map[chunk_hash] = FileNotFoundError(
-                f"No HRW target returned chunk {chunk_hash[:8]}. "
+                f"Ningún target HRW devolvió el bloque {chunk_hash[:8]}. "
                 + " | ".join(error_map[chunk_hash])
             )
 

@@ -1,3 +1,10 @@
+"""
+Pool thread-safe de stubs P2PStorage.
+
+Reutiliza canales gRPC por address para evitar crear un canal nuevo en cada
+probe, stream o restore remoto.
+"""
+
 from __future__ import annotations
 
 import threading
@@ -5,27 +12,20 @@ import threading
 import grpc
 
 from stopan.protos import p2p_storage_pb2_grpc
+from stopan.rpc.options import grpc_channel_options
 
 
-class StorageRpcPool:
-    """
-    Pool reutilizable de canales y stubs gRPC para replicación de chunks.
-    """
+class P2PStorageStubPool:
+    """Pool thread-safe de stubs P2PStorage indexado por address."""
 
     def __init__(self, *, max_message_bytes: int):
         self._lock = threading.Lock()
         self._channels: dict[str, grpc.Channel] = {}
         self._stubs: dict[str, p2p_storage_pb2_grpc.P2PStorageStub] = {}
-        self._options = [
-            ("grpc.max_send_message_length", int(max_message_bytes)),
-            ("grpc.max_receive_message_length", int(max_message_bytes)),
-            ("grpc.keepalive_time_ms", 30_000),
-            ("grpc.keepalive_timeout_ms", 10_000),
-            ("grpc.http2.max_pings_without_data", 0),
-            ("grpc.keepalive_permit_without_calls", 1),
-        ]
+        self._options = grpc_channel_options(max_message_bytes)
 
     def get_stub(self, address: str) -> p2p_storage_pb2_grpc.P2PStorageStub:
+        """Devuelve un stub reutilizable para address, creándolo si no existe."""
         with self._lock:
             stub = self._stubs.get(address)
             if stub is not None:
@@ -38,6 +38,7 @@ class StorageRpcPool:
             return stub
 
     def close(self) -> None:
+        """Cierra todos los canales abiertos y vacía el pool."""
         with self._lock:
             for channel in self._channels.values():
                 channel.close()

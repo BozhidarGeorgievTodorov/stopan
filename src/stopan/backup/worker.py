@@ -1,34 +1,46 @@
+"""
+Worker de procesamiento de archivos durante backup.
+
+Cada worker mantiene herramientas thread-local para evitar recrear chunker,
+repositorio CAS y conexión SQLite de solo lectura en cada archivo procesado.
+"""
+
 from __future__ import annotations
 
-import hashlib
+import os
 import threading
 
-from stopan.backup.config import DB_FILE, LOCAL_SHARD_DIR
-from stopan.backup.models import WorkerStats
+from .models import WorkerStats
 from stopan.cas.repository import CASRepository
 from stopan.chunking.chunker import FileChunker
 from stopan.chunking.planner import ChunkPlanner
+from stopan.chunking.recipes import compute_recipe_hash
 from stopan.metadata.database import MetadataDB
 
 
 _thread_local = threading.local()
 
 
-def compute_recipe_hash(chunks: list[tuple[int, str, int]]) -> str:
-    """Calcula un hash estable para una receta ordenada de chunks."""
-    digest = hashlib.sha256()
-    for order, chunk_hash, size in chunks:
-        digest.update(order.to_bytes(4, "big", signed=False))
-        digest.update(bytes.fromhex(chunk_hash))
-        digest.update(size.to_bytes(8, "big", signed=False))
-    return digest.hexdigest()
+def get_thread_local_tools(*, local_shard_dir: str, db_file: str):
+    """
+    Devuelve herramientas reutilizables por hilo.
 
+    Si cambia el CAS o la base de metadata, se cierra la conexión anterior y se
+    inicializa un nuevo conjunto de herramientas para ese hilo.
+    """
+    key = (os.path.abspath(local_shard_dir), os.path.abspath(db_file))
+    if getattr(_thread_local, "tools_key", None) != key:
+        old_db = getattr(_thread_local, "db_ro", None)
+        if old_db is not None:
+            try:
+                old_db.close()
+            except Exception:
+                pass
 
-def get_thread_local_tools():
-    if not hasattr(_thread_local, "chunker"):
+        _thread_local.tools_key = key
         _thread_local.chunker = FileChunker()
-        _thread_local.repo = CASRepository(LOCAL_SHARD_DIR)
-        _thread_local.db_ro = MetadataDB(DB_FILE, init_schema=False)
+        _thread_local.repo = CASRepository(local_shard_dir)
+        _thread_local.db_ro = MetadataDB(db_file, init_schema=False)
 
     return _thread_local.chunker, _thread_local.repo, _thread_local.db_ro
 
@@ -36,14 +48,26 @@ def get_thread_local_tools():
 def process_file_worker(
     full_path: str,
     *,
+    local_shard_dir: str,
+    db_file: str,
     fast_local_enabled: bool,
     fast_remote_enabled: bool,
     safe_mode: bool,
     shared_index,
     desired_rf: int,
-    current_placement_epoch: str | None,
+    placement_epoch: str | None,
 ):
-    chunker, repo, db_ro = get_thread_local_tools()
+    """
+    Procesa un archivo y devuelve su recipe junto con estadísticas de chunks.
+
+    El worker no escribe metadata del snapshot. Solo materializa chunks cuando
+    la política lo requiere y devuelve la información necesaria para que el hilo
+    coordinador actualice SQLite.
+    """
+    chunker, repo, db_ro = get_thread_local_tools(
+        local_shard_dir=local_shard_dir,
+        db_file=db_file,
+    )
 
     planner = ChunkPlanner(
         repo,
@@ -53,7 +77,7 @@ def process_file_worker(
         safe_mode=safe_mode,
         allow_remote_protected_skip=fast_remote_enabled,
         desired_rf=desired_rf,
-        current_placement_epoch=current_placement_epoch,
+        placement_epoch=placement_epoch,
     )
 
     chunks: list[tuple[int, str, int]] = []
@@ -89,22 +113,22 @@ def process_file_worker(
                     skipped_remote += 1
 
                 else:
-                    raise RuntimeError(f"Unknown planner decision: {decision}")
+                    raise RuntimeError(f"Decisión desconocida del planner: {decision}")
 
                 chunks.append((order, chunk_hash, chunk_size))
 
         return (
             True,
             chunks,
-            file_size,  
+            file_size,
             compute_recipe_hash(chunks),
             WorkerStats(
                 chunks_total=chunks_total,
-                chunks_processed=processed,
-                chunks_skipped=skipped,
-                chunks_skipped_local=skipped_local,
-                chunks_skipped_remote=skipped_remote,
-                chunks_written=written,
+                processed=processed,
+                skipped=skipped,
+                skipped_local=skipped_local,
+                skipped_remote=skipped_remote,
+                written=written,
             ),
         )
 

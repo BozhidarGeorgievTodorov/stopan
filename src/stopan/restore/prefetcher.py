@@ -1,3 +1,10 @@
+"""
+Prefetch ordenado de chunks para restore.
+
+El prefetcher agrupa hashes en ventanas para aprovechar lecturas por lote, pero
+entrega los chunks en el mismo orden en el que deben escribirse al archivo.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
@@ -7,10 +14,11 @@ from stopan.restore.fetch import ChunkFetchService
 
 class OrderedBatchChunkPrefetcher:
     """
-    Lee chunks por ventanas y conserva el orden de escritura del archivo.
+    Resuelve chunks por ventanas y los entrega en orden de escritura.
 
-    Cada ventana se resuelve local-first. Si faltan chunks, se agrupan por rank
-    HRW y por nodo remoto para reducir llamadas gRPC durante restore.
+    La resolución puede usar CAS local, CAS P2P local o red remota, según la
+    política de ChunkFetchService. Este objeto solo controla el tamaño de
+    ventana y preserva el orden.
     """
 
     def __init__(self, fetch_service: ChunkFetchService, *, target_parallelism: int, window: int):
@@ -19,25 +27,40 @@ class OrderedBatchChunkPrefetcher:
         self.window = max(int(window), 1)
 
     def iter_raw_chunks(self, chunk_hashes: Iterable[str]) -> Iterator[tuple[str, bytes]]:
-        pending_window: list[str] = []
+        """
+        Itera chunks raw en el mismo orden que chunk_hashes.
+
+        Cada ventana se resuelve en lote, pero los resultados se emiten según el
+        orden original para que el restorer pueda escribir secuencialmente.
+        """
+                
+        window_hashes: list[str] = []
 
         for chunk_hash in chunk_hashes:
-            pending_window.append(chunk_hash)
-            if len(pending_window) >= self.window:
-                yield from self._drain_window(pending_window)
-                pending_window = []
+            window_hashes.append(chunk_hash)
+            if len(window_hashes) >= self.window:
+                yield from self._flush_window(window_hashes)
+                window_hashes = []
 
-        if pending_window:
-            yield from self._drain_window(pending_window)
+        if window_hashes:
+            yield from self._flush_window(window_hashes)
 
-    def _drain_window(self, window_hashes: list[str]) -> Iterator[tuple[str, bytes]]:
-        result_map = self.fetch_service.fetch_many_raw_chunks(
+    def _flush_window(self, window_hashes: list[str]) -> Iterator[tuple[str, bytes]]:
+        """
+        Resuelve una ventana y produce sus chunks en el orden solicitado.
+
+        Si algún chunk no se resuelve, propaga el error asociado para abortar el
+        restore de forma explícita.
+        """
+        
+        results = self.fetch_service.fetch_many_raw_chunks(
             window_hashes,
             target_parallelism=self.target_parallelism,
         )
-
         for chunk_hash in window_hashes:
-            value = result_map[chunk_hash]
+            value = results.get(chunk_hash)
+            if value is None:
+                raise FileNotFoundError(f"Chunk {chunk_hash[:8]} no resuelto en ventana de restore")
             if isinstance(value, Exception):
                 raise value
             yield chunk_hash, value

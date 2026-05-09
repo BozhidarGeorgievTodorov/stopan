@@ -1,93 +1,48 @@
+"""
+Gestor local del protocolo de membership.
+
+Mantiene la vista local de miembros del cluster, ejecuta un bucle tipo SWIM con
+ping directo e indirecto, y propaga eventos recientes mediante gossip.
+"""
+
 from __future__ import annotations
 
-import os
 import random
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Iterable
 
 import grpc
 
-from stopan.node.identity import NodeIdentityStore
 from stopan.protos import membership_pb2
-from stopan.protos import membership_pb2_grpc
+from stopan.node.identity import NodeIdentityStore
+
+from .channels import ChannelCache
+from .gossip import GossipBuffer
+from .models import ELIGIBLE_STATES, STATE_ORDER, MemberRecord, MembershipSettings
+from .validation import (
+    is_valid_address,
+    is_valid_member_event,
+    is_valid_node_id,
+    is_valid_nodeinfo,
+    limited_gossip,
+    now_ms,
+)
 
 
-PROTOCOL_PERIOD_S = float(os.getenv("SWIM_PERIOD_S", "1.0"))
-PING_TIMEOUT_S = float(os.getenv("SWIM_PING_TIMEOUT_S", "0.25"))
-SUSPECT_TIMEOUT_S = float(os.getenv("SWIM_SUSPECT_TIMEOUT_S", "6.0"))
-INDIRECT_PING_FANOUT = int(os.getenv("SWIM_INDIRECT_FANOUT", "3"))
-
-MAX_GOSSIP_EVENTS = int(os.getenv("SWIM_MAX_GOSSIP", "20"))
-GOSSIP_TTL_S = float(os.getenv("SWIM_GOSSIP_TTL_S", "60.0"))
-
-CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
-
-STATE_ORDER = {
-    membership_pb2.UNKNOWN: 0,
-    membership_pb2.ALIVE: 1,
-    membership_pb2.SUSPECT: 2,
-    membership_pb2.DEAD: 3,
-    membership_pb2.LEFT: 4,
-}
-ELIGIBLE_STATES = {membership_pb2.ALIVE}
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-@dataclass
-class MemberRecord:
-    node_id: str
-    address: str
-    incarnation: int
-    state: int
-    last_seen: float
-    suspect_since: float | None = None
-
-
-class ChannelCache:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._map: dict[str, tuple[grpc.Channel, membership_pb2_grpc.MembershipStub]] = {}
-
-    def get(self, address: str) -> membership_pb2_grpc.MembershipStub:
-        with self._lock:
-            if address not in self._map:
-                channel = grpc.insecure_channel(address)
-                stub = membership_pb2_grpc.MembershipStub(channel)
-                self._map[address] = (channel, stub)
-            return self._map[address][1]
-
-    def close_all(self) -> None:
-        with self._lock:
-            for channel, _ in self._map.values():
-                channel.close()
-            self._map.clear()
-
-
-class GossipBuffer:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._events: list[tuple[float, membership_pb2.MemberEvent]] = []
-
-    def add(self, event: membership_pb2.MemberEvent) -> None:
-        with self._lock:
-            self._events.append((time.time(), event))
-            self._gc_locked()
-
-    def sample(self, limit: int) -> list[membership_pb2.MemberEvent]:
-        with self._lock:
-            self._gc_locked()
-            return [event for _, event in self._events[-limit:]]
-
-    def _gc_locked(self) -> None:
-        cutoff = time.time() - GOSSIP_TTL_S
-        self._events = [(ts, event) for ts, event in self._events if ts >= cutoff]
+_STOP_JOIN_MIN_TIMEOUT_S = 2.0
+_STOP_JOIN_EXTRA_TIMEOUT_S = 0.5
 
 
 class MembershipManager:
+    """
+    Gestiona membership, gossip e incarnation del nodo local.
+
+    Solo los miembros ALIVE se exponen como elegibles para placement. Los estados
+    SUSPECT y DEAD se mantienen para convergencia del protocolo, no para elegir
+    targets remotos.
+    """
+
     def __init__(
         self,
         *,
@@ -95,11 +50,22 @@ class MembershipManager:
         node_id: str,
         address: str,
         incarnation: int,
+        settings: MembershipSettings | None = None,
     ):
+        node_id = str(node_id).strip()
+        address = str(address).strip()
+
+        if not is_valid_node_id(node_id):
+            raise ValueError(f"node_id inválido: {node_id!r}")
+        if not is_valid_address(address):
+            raise ValueError(f"advertise_addr inválido para membership: {address!r}")
+
+        self.settings = settings or MembershipSettings()
         self.identity_store = identity_store
         self.node_id = node_id
         self.address = address
         self.incarnation = max(int(incarnation), 1)
+        self._lifecycle_lock = threading.Lock()
 
         self._lock = threading.Lock()
         self._members: dict[str, MemberRecord] = {
@@ -112,25 +78,74 @@ class MembershipManager:
             )
         }
 
-        self.gossip = GossipBuffer()
-        self.channels = ChannelCache()
+        self.gossip = GossipBuffer(ttl_s=self.settings.gossip_ttl_s)
+        self.channels = ChannelCache(
+            max_message_bytes=self.settings.grpc_max_message_bytes,
+            keepalive_time_ms=self.settings.grpc_keepalive_time_ms,
+            keepalive_timeout_ms=self.settings.grpc_keepalive_timeout_ms,
+            keepalive_permit_without_calls=self.settings.grpc_keepalive_permit_without_calls,
+        )
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._seq = 0
 
+    @property
+    def cluster_token(self) -> str:
+        """Token compartido usado para autorizar RPCs de membership."""
+        return self.settings.cluster_token
+
+    @property
+    def max_gossip_events(self) -> int:
+        """Número máximo de eventos gossip por mensaje."""
+        return int(self.settings.max_gossip_events)
+
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._swim_loop, name="swim-loop", daemon=True)
-        self._thread.start()
+        """Arranca el bucle de membership si aún no está activo."""
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._swim_loop,
+                name="swim-loop",
+                daemon=True,
+            )
+            self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2.0)
+        """Solicita parada, espera al bucle y cierra canales remotos."""
+        with self._lifecycle_lock:
+            self._stop.set()
+            thread = self._thread
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(
+                timeout=max(
+                    _STOP_JOIN_MIN_TIMEOUT_S,
+                    float(self.settings.protocol_period_s) + _STOP_JOIN_EXTRA_TIMEOUT_S,
+                )
+            )
+
+        with self._lifecycle_lock:
+            if self._thread is thread:
+                self._thread = None
+
         self.channels.close_all()
 
-    def bootstrap_join(self, seeds: list[str]) -> None:
-        if not seeds:
+    def bootstrap_join(self, seeds: Iterable[str]) -> None:
+        """Intenta unirse al cluster usando seeds iniciales de membership."""
+        normalized_seeds = []
+        seen = set()
+        for raw_seed in seeds:
+            seed = str(raw_seed).strip()
+            if not seed or seed == self.address or seed in seen:
+                continue
+            seen.add(seed)
+            normalized_seeds.append(seed)
+
+        if not normalized_seeds:
             return
 
         me = membership_pb2.NodeInfo(
@@ -139,23 +154,29 @@ class MembershipManager:
             incarnation=self.incarnation,
         )
 
-        for seed in seeds:
-            if seed == self.address:
+        for seed in normalized_seeds:
+            if not is_valid_address(seed):
+                print(f"AVISO: seed de membership inválido ignorado: {seed!r}")
                 continue
+
             try:
                 stub = self.channels.get(seed)
                 response = stub.Join(
-                    membership_pb2.JoinRequest(self=me, cluster_token=CLUSTER_TOKEN),
-                    timeout=2.0,
+                    membership_pb2.JoinRequest(self=me, cluster_token=self.cluster_token),
+                    timeout=float(self.settings.rpc_timeout_s),
                 )
                 for node in response.members:
                     self._apply_nodeinfo(node, state=membership_pb2.ALIVE, source="join")
-                for event in response.gossip:
+                for event in limited_gossip(response.gossip, self.max_gossip_events):
                     self.apply_event(event, source="join-gossip")
-            except grpc.RpcError:
-                continue
+            except grpc.RpcError as exc:
+                details = getattr(exc, "details", lambda: str(exc))()
+                print(f"AVISO: join contra seed {seed} falló: {details}")
+            except ValueError as exc:
+                print(f"AVISO: join contra seed {seed} omitido: {exc}")
 
     def get_alive_peers(self) -> list[MemberRecord]:
+        """Devuelve peers ALIVE excluyendo el nodo local."""
         with self._lock:
             return [
                 member
@@ -164,6 +185,7 @@ class MembershipManager:
             ]
 
     def get_members_snapshot(self, *, eligible_only: bool = False) -> list[membership_pb2.NodeInfo]:
+        """Devuelve una vista NodeInfo de los miembros conocidos."""
         with self._lock:
             members = []
             for member in self._members.values():
@@ -179,13 +201,12 @@ class MembershipManager:
             return members
 
     def apply_event(self, event: membership_pb2.MemberEvent, *, source: str = "") -> None:
-        if event.node_id == self.node_id and event.state in (membership_pb2.SUSPECT, membership_pb2.DEAD):
-            if event.incarnation >= self.incarnation:
-                self.incarnation = self.identity_store.bump_above(
-                    node_id=self.node_id,
-                    observed_incarnation=event.incarnation,
-                )
-                self._announce_alive()
+        """Aplica un evento de membership si mejora la vista local."""
+        if not is_valid_member_event(event):
+            return
+
+        if event.node_id == self.node_id:
+            self._handle_self_event(event, source=source)
             return
 
         with self._lock:
@@ -206,8 +227,7 @@ class MembershipManager:
             if event.incarnation > current.incarnation:
                 current.incarnation = event.incarnation
                 current.state = event.state
-                if event.address:
-                    current.address = event.address
+                current.address = event.address
                 if event.state == membership_pb2.ALIVE:
                     current.last_seen = time.time()
                     current.suspect_since = None
@@ -228,7 +248,33 @@ class MembershipManager:
                     current.suspect_since = time.time()
                 self.gossip.add(event)
 
+    def _handle_self_event(self, event: membership_pb2.MemberEvent, *, source: str) -> None:
+        """Procesa eventos sobre el propio node_id."""
+        if event.address and event.address != self.address:
+            print(
+                "AVISO: evento de membership ignorado; posible node_id duplicado "
+                f"node_id={self.node_id[:8]} self={self.address} "
+                f"event_address={event.address} source={source}"
+            )
+            return
+
+        if event.state in (membership_pb2.SUSPECT, membership_pb2.DEAD):
+            if event.incarnation >= self.incarnation:
+                self.incarnation = self.identity_store.bump_above(
+                    node_id=self.node_id,
+                    observed_incarnation=event.incarnation,
+                )
+                self._announce_alive()
+
     def _apply_nodeinfo(self, node: membership_pb2.NodeInfo, *, state: int, source: str) -> None:
+        """Convierte un NodeInfo entrante en MemberEvent local."""
+        if not is_valid_nodeinfo(node):
+            print(
+                f"AVISO: NodeInfo inválido ignorado desde {source}: "
+                f"node_id={node.node_id!r} address={node.address!r}"
+            )
+            return
+
         event = membership_pb2.MemberEvent(
             node_id=node.node_id,
             address=node.address,
@@ -239,6 +285,7 @@ class MembershipManager:
         self.apply_event(event, source=source)
 
     def _announce_alive(self) -> None:
+        """Publica ALIVE del nodo local con la incarnation actual."""
         event = membership_pb2.MemberEvent(
             node_id=self.node_id,
             address=self.address,
@@ -250,11 +297,13 @@ class MembershipManager:
             me = self._members[self.node_id]
             me.incarnation = self.incarnation
             me.state = membership_pb2.ALIVE
+            me.address = self.address
             me.last_seen = time.time()
             me.suspect_since = None
         self.gossip.add(event)
 
     def _mark_suspect(self, node_id: str, address: str, incarnation: int) -> None:
+        """Marca localmente un nodo como SUSPECT."""
         event = membership_pb2.MemberEvent(
             node_id=node_id,
             address=address,
@@ -265,6 +314,7 @@ class MembershipManager:
         self.apply_event(event, source="local-suspect")
 
     def _mark_dead(self, node_id: str, address: str, incarnation: int) -> None:
+        """Marca localmente un nodo como DEAD."""
         event = membership_pb2.MemberEvent(
             node_id=node_id,
             address=address,
@@ -275,8 +325,8 @@ class MembershipManager:
         self.apply_event(event, source="local-dead")
 
     def _swim_loop(self) -> None:
-        while not self._stop.is_set():
-            time.sleep(PROTOCOL_PERIOD_S)
+        """Ejecuta rondas periódicas de ping directo e indirecto."""
+        while not self._stop.wait(float(self.settings.protocol_period_s)):
             peers = self.get_alive_peers()
             if not peers:
                 continue
@@ -291,7 +341,7 @@ class MembershipManager:
 
             helpers = [peer for peer in peers if peer.node_id != target.node_id]
             random.shuffle(helpers)
-            helpers = helpers[:INDIRECT_PING_FANOUT]
+            helpers = helpers[: int(self.settings.indirect_ping_fanout)]
 
             indirect_ok = False
             for helper in helpers:
@@ -307,33 +357,40 @@ class MembershipManager:
             self._expire_suspects()
 
     def _expire_suspects(self) -> None:
+        """Promueve SUSPECT a DEAD al superar suspect_timeout_s."""
         now = time.time()
         expired = []
 
         with self._lock:
             for member in self._members.values():
                 if member.state == membership_pb2.SUSPECT and member.suspect_since is not None:
-                    if (now - member.suspect_since) >= SUSPECT_TIMEOUT_S:
+                    if (now - member.suspect_since) >= float(self.settings.suspect_timeout_s):
                         expired.append((member.node_id, member.address, member.incarnation))
 
         for node_id, address, incarnation in expired:
             self._mark_dead(node_id, address, incarnation)
 
     def _ping(self, target: MemberRecord, seq: int) -> bool:
+        """Ejecuta un Ping directo contra target."""
         me = membership_pb2.NodeInfo(
             node_id=self.node_id,
             address=self.address,
             incarnation=self.incarnation,
         )
-        gossip = self.gossip.sample(MAX_GOSSIP_EVENTS)
+        gossip = self.gossip.sample(self.max_gossip_events)
 
         try:
             stub = self.channels.get(target.address)
             response = stub.Ping(
-                membership_pb2.PingRequest(from_node=me, seq=seq, gossip=gossip),
-                timeout=PING_TIMEOUT_S,
+                membership_pb2.PingRequest(
+                    from_node=me,
+                    seq=seq,
+                    gossip=gossip,
+                    cluster_token=self.cluster_token,
+                ),
+                timeout=float(self.settings.ping_timeout_s),
             )
-            for event in response.gossip:
+            for event in limited_gossip(response.gossip, self.max_gossip_events):
                 self.apply_event(event, source="ping-ack")
 
             with self._lock:
@@ -342,16 +399,17 @@ class MembershipManager:
                     current.last_seen = time.time()
 
             return response.ok
-        except grpc.RpcError:
+        except (grpc.RpcError, ValueError):
             return False
 
     def _ping_req(self, *, helper: MemberRecord, target: MemberRecord, seq: int) -> bool:
+        """Solicita a helper que haga Ping indirecto contra target."""
         requester = membership_pb2.NodeInfo(
             node_id=self.node_id,
             address=self.address,
             incarnation=self.incarnation,
         )
-        gossip = self.gossip.sample(MAX_GOSSIP_EVENTS)
+        gossip = self.gossip.sample(self.max_gossip_events)
 
         try:
             stub = self.channels.get(helper.address)
@@ -365,74 +423,12 @@ class MembershipManager:
                     ),
                     seq=seq,
                     gossip=gossip,
+                    cluster_token=self.cluster_token,
                 ),
-                timeout=PING_TIMEOUT_S,
+                timeout=float(self.settings.ping_timeout_s),
             )
-            for event in response.gossip:
+            for event in limited_gossip(response.gossip, self.max_gossip_events):
                 self.apply_event(event, source="pingreq-ack")
             return response.ok
-        except grpc.RpcError:
+        except (grpc.RpcError, ValueError):
             return False
-
-
-class MembershipServicer(membership_pb2_grpc.MembershipServicer):
-    def __init__(self, manager: MembershipManager):
-        self.manager = manager
-
-    def Join(self, request, context):
-        if CLUSTER_TOKEN and request.cluster_token != CLUSTER_TOKEN:
-            return membership_pb2.JoinResponse(members=[], gossip=[])
-
-        self.manager._apply_nodeinfo(request.self, state=membership_pb2.ALIVE, source="join")
-        return membership_pb2.JoinResponse(
-            members=self.manager.get_members_snapshot(eligible_only=True),
-            gossip=self.manager.gossip.sample(MAX_GOSSIP_EVENTS),
-        )
-
-    def Ping(self, request, context):
-        if request.from_node.node_id:
-            self.manager._apply_nodeinfo(request.from_node, state=membership_pb2.ALIVE, source="ping")
-
-        for event in request.gossip:
-            self.manager.apply_event(event, source="ping-gossip")
-
-        return membership_pb2.PingResponse(ok=True, gossip=self.manager.gossip.sample(MAX_GOSSIP_EVENTS))
-
-    def PingReq(self, request, context):
-        if request.requester.node_id:
-            self.manager._apply_nodeinfo(request.requester, state=membership_pb2.ALIVE, source="pingreq")
-
-        for event in request.gossip:
-            self.manager.apply_event(event, source="pingreq-gossip")
-
-        ok = False
-        try:
-            stub = self.manager.channels.get(request.target.address)
-            me = membership_pb2.NodeInfo(
-                node_id=self.manager.node_id,
-                address=self.manager.address,
-                incarnation=self.manager.incarnation,
-            )
-            response = stub.Ping(
-                membership_pb2.PingRequest(
-                    from_node=me,
-                    seq=request.seq,
-                    gossip=self.manager.gossip.sample(MAX_GOSSIP_EVENTS),
-                ),
-                timeout=PING_TIMEOUT_S,
-            )
-            ok = response.ok
-            for event in response.gossip:
-                self.manager.apply_event(event, source="pingreq-helper-ack")
-        except grpc.RpcError:
-            ok = False
-
-        return membership_pb2.PingReqResponse(
-            ok=ok,
-            gossip=self.manager.gossip.sample(MAX_GOSSIP_EVENTS),
-        )
-
-    def GetMembers(self, request, context):
-        return membership_pb2.GetMembersResponse(
-            members=self.manager.get_members_snapshot(eligible_only=True)
-        )

@@ -1,0 +1,3 @@
+include README.md
+recursive-include src/stopan/protos *.proto
+recursive-include src/stopan/chunking *.c

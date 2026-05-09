@@ -19,8 +19,8 @@ enum MemberState {
 
 message NodeInfo {
   string node_id = 1;
-  string address = 2;
-  uint64 incarnation = 3;
+  string address = 2;      // "host:port" expuesto por gRPC
+  uint64 incarnation = 3;  // contador SWIM para refutar sospechas
 }
 
 message MemberEvent {
@@ -33,18 +33,19 @@ message MemberEvent {
 
 message JoinRequest {
   NodeInfo self = 1;
-  string cluster_token = 2;
+  string cluster_token = 2;  // red cerrada / aislamiento lógico del cluster
 }
 
 message JoinResponse {
-  repeated NodeInfo members = 1;
-  repeated MemberEvent gossip = 2;
+  repeated NodeInfo members = 1;   // vista inicial de miembros elegibles
+  repeated MemberEvent gossip = 2; // eventos recientes de membership
 }
 
 message PingRequest {
   NodeInfo from_node = 1;
   uint64 seq = 2;
   repeated MemberEvent gossip = 3;
+  string cluster_token = 4;  // aislamiento lógico del cluster
 }
 
 message PingResponse {
@@ -57,15 +58,18 @@ message PingReqRequest {
   NodeInfo target = 2;
   uint64 seq = 3;
   repeated MemberEvent gossip = 4;
+  string cluster_token = 5;  // aislamiento lógico del cluster
 }
 
 message PingReqResponse {
-  bool ok = 1;
+  bool ok = 1; // true si el helper pudo contactar al target
   repeated MemberEvent gossip = 2;
 }
 
-message GetMembersRequest {}
+message GetMembersRequest {
+  string cluster_token = 1;  // aislamiento lógico del cluster
+}
 
 message GetMembersResponse {
-  repeated NodeInfo members = 1;
+  repeated NodeInfo members = 1; // miembros elegibles para placement/restore
 }

@@ -1,98 +1,89 @@
 from __future__ import annotations
 
 import argparse
-import os
+from collections.abc import Sequence
 
-from stopan.protection.pusher import push_to_network
-from stopan.replication.coordinator import (
-    DEFAULT_MAX_MESSAGE_BYTES,
-    DEFAULT_PROBE_BATCH_HASHES,
-    DEFAULT_PROBE_TIMEOUT_S,
-    DEFAULT_STREAM_INFLIGHT,
-    DEFAULT_STREAM_TIMEOUT_S,
-    DEFAULT_TARGET_PARALLELISM,
+from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.metadata_auto_export import (
+    add_metadata_auto_export_args,
+    build_metadata_object_graph_auto_export,
 )
 
 
-DEFAULT_PROTECTION_RF = int(os.getenv("RF", os.getenv("REPLICATION_FACTOR", "3")))
-DEFAULT_COMMIT_EVERY = int(os.getenv("REPLICATION_COMMIT_EVERY", "100"))
-DEFAULT_STRICT_RF = os.getenv("REPLICATION_STRICT_RF", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-
-
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan push",
-        description="Protege chunks pendientes en la red P2P.",
+        description="Protección remota de chunks mediante HRW + inventario remoto + streaming.",
     )
-    parser.add_argument("--seed", default="node1:50051", help="Seed de membership, por ejemplo node1:50051")
-    parser.add_argument("--rf", type=int, default=DEFAULT_PROTECTION_RF, help="Replication factor remoto deseado")
-    parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución")
-    parser.add_argument("--target-parallelism", type=int, default=DEFAULT_TARGET_PARALLELISM, help="Nodos destino procesados en paralelo")
-    parser.add_argument("--probe-batch-hashes", type=int, default=DEFAULT_PROBE_BATCH_HASHES, help="Hashes por lote de inventario remoto")
-    parser.add_argument("--stream-inflight", type=int, default=DEFAULT_STREAM_INFLIGHT, help="Chunks máximos en vuelo por stream")
-    parser.add_argument("--probe-timeout-s", type=float, default=DEFAULT_PROBE_TIMEOUT_S, help="Timeout de ProbeMissingChunks en segundos")
-    parser.add_argument("--stream-timeout-s", type=float, default=DEFAULT_STREAM_TIMEOUT_S, help="Timeout de ReplicateChunks en segundos")
-    parser.add_argument("--max-message-bytes", type=int, default=DEFAULT_MAX_MESSAGE_BYTES, help="Límite de tamaño de mensaje gRPC")
-    parser.add_argument("--commit-every", type=int, default=DEFAULT_COMMIT_EVERY, help="Guardar progreso cada N resultados")
+    add_config_args(parser)
+
+    parser.add_argument("--membership-seed", default=None, help="Seed de membership para obtener la vista del cluster elegible.")
+    parser.add_argument("--rf", type=int, default=None, help="RF deseado para la protección remota.")
+    parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución.")
+    parser.add_argument("--target-parallelism", type=int, default=None, help="Número de targets procesados en paralelo.")
+    parser.add_argument("--probe-batch-hashes", type=int, default=None, help="Hashes por probe de inventario remoto.")
+    parser.add_argument("--stream-inflight", type=int, default=None, help="Ventana máxima de chunks en vuelo por stream.")
+    parser.add_argument("--probe-timeout-s", type=float, default=None, help="Timeout del RPC ProbeMissingChunks en segundos.")
+    parser.add_argument("--stream-timeout-s", type=float, default=None, help="Timeout del RPC ReplicateChunks en segundos.")
+    parser.add_argument("--max-message-bytes", type=int, default=None, help="Límite de mensaje gRPC.")
+    parser.add_argument("--commit-every", type=int, default=None, help="Persistir progreso cada N resultados.")
     parser.add_argument(
         "--strict-rf",
-        dest="strict_rf",
-        action="store_true",
-        default=DEFAULT_STRICT_RF,
-        help="Falla antes de modificar el estado si el cluster no puede cumplir el RF",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Exige al menos RF targets remotos elegibles antes de empezar. "
+            "Si no hay capacidad remota suficiente, aborta con rc=2 sin marcar chunks."
+        ),
     )
-    parser.add_argument(
-        "--no-strict-rf",
-        dest="strict_rf",
-        action="store_false",
-        help="Permite protección best-effort aunque el cluster no pueda cumplir el RF",
-    )
-    return parser.parse_args()
+    add_metadata_auto_export_args(parser, context="push")
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    cfg = load_runtime_config(args)
+    metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+
+    from stopan.protection.pusher import push_to_network
 
     stats = push_to_network(
-        seed=args.seed,
-        rf=int(args.rf),
+        membership_seed=args.membership_seed or first_seed(cfg),
+        rf=int(choose(args.rf, cfg.protection.rf)),
         limit=args.limit,
-        target_parallelism=int(args.target_parallelism),
-        probe_batch_hashes=int(args.probe_batch_hashes),
-        stream_inflight=int(args.stream_inflight),
-        probe_timeout_s=float(args.probe_timeout_s),
-        stream_timeout_s=float(args.stream_timeout_s),
-        max_message_bytes=int(args.max_message_bytes),
-        commit_every=int(args.commit_every),
-        strict_rf=bool(args.strict_rf),
+        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
+        probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.replication.probe_batch_hashes)),
+        stream_inflight=int(choose(args.stream_inflight, cfg.replication.stream_inflight)),
+        probe_timeout_s=float(choose(args.probe_timeout_s, cfg.replication.probe_timeout_s)),
+        stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
+        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+        commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
+        strict_rf=bool(choose(args.strict_rf, cfg.protection.strict_rf)),
+        db_file=cfg.node.db_file,
+        local_shard_dir=cfg.node.local_shard_dir,
+        self_addr=cfg.node.advertise_addr,
+        cluster_token=cfg.cluster.token,
+        membership_timeout_s=cfg.membership.rpc_timeout_s,
+        metadata_object_graph_auto_export=metadata_object_graph_auto_export,
     )
 
     print("-" * 40)
     print(
-        f"Push finished. protected={stats.protected}/{stats.attempted} | "
-        f"degraded={stats.degraded} | failed={stats.failed} | "
-        f"stored_remote={stats.stored_remote} | "
+        f"Push finalizado. protegidos={stats.protected}/{stats.attempted} | "
+        f"fallidos={stats.failed} | stored_remote={stats.stored_remote} | "
         f"already_present_remote={stats.already_present_remote}"
     )
 
-    if stats.interrupted:
-        print(f"Push interrupted. Progress persisted up to attempted={stats.attempted}.")
+    if getattr(stats, "interrupted", False):
+        print(f"Push interrumpido. Progreso persistido hasta attempted={stats.attempted}.")
         return 130
 
-    if stats.insufficient_remote_targets:
+    if getattr(stats, "insufficient_remote_targets", False):
         print(
-            "Push was not started because strict RF cannot be satisfied. "
+            "Push no iniciado por strict-rf. "
             f"desired_rf={stats.desired_rf} remote_candidates={stats.remote_candidates}"
         )
         return 2
 
-    return 0 if stats.failed == 0 and stats.degraded == 0 else 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    degraded = int(getattr(stats, "degraded", 0))
+    return 0 if int(stats.failed) == 0 and degraded == 0 else 2

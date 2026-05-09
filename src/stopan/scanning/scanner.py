@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import stat as statmod
+from collections.abc import Iterator
 
 
 class TreeWalker:
     """
     Recorrido iterativo del árbol de ficheros.
 
-    Semántica:
+    Contrato:
       - emite tuplas (rel_path, full_path, stat, item_type)
       - incluye la raíz como (".", root_path, stat, "dir")
       - ignora symlinks y archivos especiales
@@ -23,15 +24,18 @@ class TreeWalker:
         if root_path != os.path.abspath(os.sep):
             root_path = root_path.rstrip(os.sep)
 
-        if not os.path.exists(root_path):
-            raise FileNotFoundError(root_path)
-        if not os.path.isdir(root_path):
+        try:
+            root_stat = os.stat(root_path, follow_symlinks=False)
+        except FileNotFoundError:
+            raise FileNotFoundError(root_path) from None
+
+        if not statmod.S_ISDIR(root_stat.st_mode):
             raise NotADirectoryError(root_path)
 
         self.root_path = root_path
         self.deterministic = bool(deterministic)
 
-    def walk(self):
+    def walk(self) -> Iterator[tuple[str, str, os.stat_result, str]]:
         """
         Genera tuplas (ruta_relativa, ruta_absoluta, stat, item_type).
 
@@ -64,7 +68,7 @@ class TreeWalker:
 
                         try:
                             stat_info = entry.stat(follow_symlinks=False)
-                        except FileNotFoundError:
+                        except OSError:
                             continue
 
                         mode = stat_info.st_mode
@@ -76,7 +80,7 @@ class TreeWalker:
 
                         # symlinks y especiales se ignoran explícitamente
 
-            except PermissionError:
+            except OSError:
                 continue
 
             if self.deterministic:

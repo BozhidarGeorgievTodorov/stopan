@@ -6,6 +6,12 @@ service P2PStorage {
   rpc RetrieveChunkBatch(RetrieveChunkBatchRequest) returns (RetrieveChunkBatchResponse);
 }
 
+service MetadataPackService {
+  rpc StoreMetadataPack(StoreMetadataPackRequest) returns (StoreMetadataPackResponse);
+  rpc ListMetadataPacks(ListMetadataPacksRequest) returns (ListMetadataPacksResponse);
+  rpc RetrieveMetadataPack(RetrieveMetadataPackRequest) returns (RetrieveMetadataPackResponse);
+}
+
 message ProbeMissingChunksRequest {
   repeated string chunk_hashes = 1;
 }
@@ -54,4 +60,79 @@ message RetrievedChunk {
 
 message RetrieveChunkBatchResponse {
   repeated RetrievedChunk results = 1;
+}
+
+enum MetadataPackStoreStatus {
+  METADATA_PACK_STORE_STATUS_UNSPECIFIED = 0;
+  METADATA_PACK_STORE_STATUS_STORED = 1;
+  METADATA_PACK_STORE_STATUS_ALREADY_PRESENT = 2;
+  METADATA_PACK_STORE_STATUS_REJECTED_HASH_MISMATCH = 3;
+  METADATA_PACK_STORE_STATUS_REJECTED_TOO_LARGE = 4;
+  METADATA_PACK_STORE_STATUS_ERROR = 5;
+  METADATA_PACK_STORE_STATUS_REJECTED_SIGNATURE = 6;
+  METADATA_PACK_STORE_STATUS_REJECTED_QUOTA = 7;
+  METADATA_PACK_STORE_STATUS_REJECTED_INVALID_ARGUMENT = 8;
+}
+
+enum MetadataPackRetrieveStatus {
+  METADATA_PACK_RETRIEVE_STATUS_UNSPECIFIED = 0;
+  METADATA_PACK_RETRIEVE_STATUS_FOUND = 1;
+  METADATA_PACK_RETRIEVE_STATUS_NOT_FOUND = 2;
+  METADATA_PACK_RETRIEVE_STATUS_ERROR = 3;
+}
+
+message StoreMetadataPackRequest {
+  string cluster_token = 1;
+  string owner_id = 2;
+  string pack_hash = 3;
+  bytes pack_data = 4;
+  string public_key_b64 = 5;
+  string signature_b64 = 6;
+}
+
+message StoreMetadataPackResponse {
+  MetadataPackStoreStatus status = 1;
+  string detail = 2;
+  string owner_id = 3;
+  string pack_hash = 4;
+  int64 size_bytes = 5;
+  double stored_at_unix = 6;
+  string public_key_b64 = 7;
+  string signature_b64 = 8;
+}
+
+message ListMetadataPacksRequest {
+  string cluster_token = 1;
+  string owner_id = 2;
+}
+
+message MetadataPackRecord {
+  string owner_id = 1;
+  string pack_hash = 2;
+  int64 size_bytes = 3;
+  double stored_at_unix = 4;
+  string public_key_b64 = 5;
+  string signature_b64 = 6;
+}
+
+message ListMetadataPacksResponse {
+  repeated MetadataPackRecord packs = 1;
+}
+
+message RetrieveMetadataPackRequest {
+  string cluster_token = 1;
+  string owner_id = 2;
+  string pack_hash = 3;
+}
+
+message RetrieveMetadataPackResponse {
+  MetadataPackRetrieveStatus status = 1;
+  string detail = 2;
+  string owner_id = 3;
+  string pack_hash = 4;
+  bytes pack_data = 5;
+  int64 size_bytes = 6;
+  double stored_at_unix = 7;
+  string public_key_b64 = 8;
+  string signature_b64 = 9;
 }

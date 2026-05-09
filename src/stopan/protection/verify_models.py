@@ -1,10 +1,25 @@
+"""
+Modelos de verificación de protección remota.
+
+Estas estructuras agrupan resultados de ProbeMissingChunks, outcomes por chunk
+y contadores agregados del verifier.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ProbeExecutionResult:
+    """
+    Resultado de consultar un nodo remoto con ProbeMissingChunks.
+
+    present_hashes contiene solo los chunks que el nodo afirma tener. Si hubo
+    fallo de transporte, transport_error describe el error y el resultado no
+    debe contarse como copia verificada.
+    """
+
     node_id: str
     address: str
     requested_hashes: tuple[str, ...]
@@ -12,8 +27,15 @@ class ProbeExecutionResult:
     transport_error: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class VerificationOutcome:
+    """
+    Resultado de verificación para un chunk concreto.
+
+    success indica si se han confirmado al menos required_remote_copies copias
+    remotas para el placement_epoch evaluado.
+    """
+
     chunk_hash: str
     desired_rf: int
     placement_epoch: str
@@ -23,16 +45,25 @@ class VerificationOutcome:
     error: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class VerificationStats:
+    """Contadores agregados de una ejecución del verifier."""
+
     candidates: int = 0
     verified: int = 0
     degraded: int = 0
     rpc_failures: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class VerificationAccumulator:
+    """
+    Acumulador mutable usado mientras se verifican los targets de un chunk.
+
+    Registra copias remotas confirmadas y errores por nodo hasta decidir si el
+    chunk cumple el RF remoto requerido.
+    """
+
     desired_rf: int
     placement_epoch: str
     required_remote_copies: int

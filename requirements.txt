@@ -1,6 +1,7 @@
 blake3==1.0.8
 grpcio==1.80.0
 protobuf==6.33.6
-setuptools==82.0.1
+PyYAML==6.0.2
 typing_extensions==4.15.0
 zstandard==0.25.0
+cryptography==42.0.8

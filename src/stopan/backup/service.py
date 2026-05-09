@@ -1,18 +1,31 @@
+"""
+Servicio principal de backup.
+
+Coordina el recorrido del árbol de archivos, la creación del snapshot, el
+procesamiento concurrente de archivos, la asignación de recipes y la exportación
+opcional del grafo de metadata tras cerrar correctamente el snapshot.
+"""
+
 from __future__ import annotations
 
 import concurrent.futures
 import os
 import time
+from pathlib import Path
 
-from stopan.backup.config import DB_FILE
-from stopan.backup.identity import resolve_origin_node_id
-from stopan.backup.policy import build_backup_fast_path_policy
-from stopan.backup.worker import process_file_worker
+from .identity import resolve_origin_node_id
+from .policy import build_backup_fast_path_policy
+from .worker import process_file_worker
 from stopan.chunking.chunk_index import ChunkIndex
 from stopan.metadata.database import MetadataDB
+from stopan.metadata.objects.graph.auto_export import (
+    MetadataObjectGraphAutoExport,
+    export_metadata_object_graph_after_metadata_change,
+)
 from stopan.scanning.scanner import TreeWalker
 
-DEFAULT_WORKERS = 4
+
+_DEFAULT_WORKERS_FALLBACK = 4
 
 
 def backup_directory(
@@ -25,40 +38,71 @@ def backup_directory(
     deterministic: bool,
     desired_rf: int,
     membership_seed: str | None,
-) -> bool:
-    if fast_remote_enabled and safe_mode:
-        raise ValueError("'--safe' and '--fast-remote' are incompatible.")
+    self_addr: str,
+    cluster_token: str,
+    membership_timeout_s: float,
+    max_message_bytes: int,
+    local_shard_dir: str,
+    db_file: str,
+    node_id_file: str,
+    metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
+) -> None:
+    """
+    Ejecuta un backup completo de source_path.
 
-    if not os.path.isdir(source_path):
-        print(f"Directory not found: {source_path}")
-        return False
+    Crea un snapshot en metadata, recorre el árbol de archivos, procesa archivos
+    en paralelo, registra recipes y cierra el snapshot solo si todos los workers
+    terminan correctamente.
 
-    start_time = time.perf_counter()
+    Si metadata_object_graph_auto_export está configurado, exporta el grafo de
+    metadata después de confirmar el snapshot.
+    """
     root_path = os.path.abspath(source_path)
-    origin_node_id = resolve_origin_node_id(membership_seed=membership_seed)
+    if not os.path.isdir(root_path):
+        raise NotADirectoryError(f"Directorio no encontrado: {root_path}")
+
+    started_at = time.perf_counter()
+
+    origin_node_id = resolve_origin_node_id(
+        membership_seed=membership_seed,
+        self_addr=self_addr,
+        cluster_token=cluster_token,
+        node_id_file=node_id_file,
+        membership_timeout_s=membership_timeout_s,
+        max_message_bytes=max_message_bytes,
+    )
 
     policy = build_backup_fast_path_policy(
         desired_rf=desired_rf,
+        membership_seed=membership_seed,
+        self_addr=self_addr,
+        cluster_token=cluster_token,
+        membership_timeout_s=membership_timeout_s,
+        max_message_bytes=max_message_bytes,
         fast_local_enabled=fast_local_enabled,
         fast_remote_enabled=fast_remote_enabled,
         safe_mode=safe_mode,
-        membership_seed=membership_seed,
         origin_node_id=origin_node_id,
     )
 
-    db = MetadataDB(DB_FILE)
-    snapshot_id: int | None = None
+    workers = _normalize_worker_count(num_threads)
+    placement_epoch = policy.placement_epoch
 
-    print(f"Starting backup for: {root_path}")
-    print(f"Origin node: {origin_node_id[:8]}")
-    print(f"Workers: {num_threads}")
-    print(f"Replication factor: {policy.desired_rf}")
-    if policy.fast_remote_enabled:
-        print(f"Fast-path: local + remote protected chunks ({policy.placement_epoch[:12]})")
+    print(f"Iniciando backup de: {root_path}")
+    print(f"Nodo origen: {origin_node_id[:8]}")
+    print(f"Workers: {workers}")
+    print(f"RF remoto requerido: {policy.desired_rf}")
+
+    if placement_epoch and policy.fast_remote_enabled:
+        print(f"Fast-path: local + chunks protegidos en remoto ({placement_epoch[:12]})")
     elif policy.fast_local_enabled:
-        print("Fast-path: local chunks only")
+        print("Fast-path: solo chunks locales")
     else:
-        print("Fast-path: off")
+        print("Fast-path: desactivado")
+
+    db = MetadataDB(db_file)
+    snapshot_id: int | None = None
+    snapshot_completed = False
 
     try:
         walker = TreeWalker(root_path, deterministic=deterministic)
@@ -74,11 +118,10 @@ def backup_directory(
         total_skipped = 0
         total_skipped_local = 0
         total_skipped_remote = 0
-        errors: list[str] = []
 
-        workers = _normalize_worker_count(num_threads)
         max_pending_futures = max(1, workers * 3)
         future_map: dict = {}
+        failed_files: list[tuple[str, str]] = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
 
@@ -105,11 +148,11 @@ def backup_directory(
                     try:
                         success, chunks_or_error, file_size, recipe_hash, stats = future.result()
                     except Exception as exc:
-                        errors.append(f"{rel_path}: worker crashed: {exc}")
+                        failed_files.append((rel_path, f"worker falló: {exc}"))
                         continue
 
                     if not success:
-                        errors.append(f"{rel_path}: {chunks_or_error}")
+                        failed_files.append((rel_path, str(chunks_or_error)))
                         continue
 
                     recipe_id = db.get_or_create_recipe(
@@ -122,11 +165,11 @@ def backup_directory(
                     total_files += 1
                     total_size += file_size
                     total_chunks += stats.chunks_total
-                    total_processed += stats.chunks_processed
-                    total_written += stats.chunks_written
-                    total_skipped += stats.chunks_skipped
-                    total_skipped_local += stats.chunks_skipped_local
-                    total_skipped_remote += stats.chunks_skipped_remote
+                    total_processed += stats.processed
+                    total_written += stats.written
+                    total_skipped += stats.skipped
+                    total_skipped_local += stats.skipped_local
+                    total_skipped_remote += stats.skipped_remote
 
             for rel_path, full_path, stat_info, item_type in walker.walk():
                 item_id = db.add_item(snapshot_id, rel_path, stat_info, item_type)
@@ -163,12 +206,14 @@ def backup_directory(
                 future = executor.submit(
                     process_file_worker,
                     full_path,
+                    local_shard_dir=local_shard_dir,
+                    db_file=db_file,
                     fast_local_enabled=policy.fast_local_enabled,
                     fast_remote_enabled=policy.fast_remote_enabled,
                     safe_mode=safe_mode,
                     shared_index=shared_index,
                     desired_rf=policy.desired_rf,
-                    current_placement_epoch=policy.placement_epoch,
+                    placement_epoch=placement_epoch,
                 )
                 future_map[future] = (item_id, rel_path)
 
@@ -178,30 +223,26 @@ def backup_directory(
             if future_map:
                 collect_completed(wait_for_all=True)
 
-        if errors:
-            raise RuntimeError("Could not read all files: " + "; ".join(errors))
+        if failed_files:
+            preview = "; ".join(f"{path}: {error}" for path, error in failed_files[:5])
+            if len(failed_files) > 5:
+                preview += f"; ... (+{len(failed_files) - 5} más)"
+            raise RuntimeError(
+                f"Backup incompleto: fallaron {len(failed_files)} archivo(s). {preview}"
+            )
 
         db.finish_snapshot(snapshot_id, total_size, total_files)
         db.commit()
+        snapshot_completed = True
 
-        elapsed = time.perf_counter() - start_time
-        speed = _format_speed(total_size, elapsed)
-
-        print(f"Backup completed: Snapshot {snapshot_id}")
-        print(f"Files: {total_files}")
-        print(f"Size: {total_size} bytes")
-        print(f"Time: {elapsed:.2f} seconds")
-        print(f"Speed: {speed}")
-        print(f"Workers: {workers}")
-        print(f"Chunks total: {total_chunks}")
-        print(f"Chunks processed: {total_processed}")
-        print(f"Chunks written: {total_written}")
-        print(
-            "Chunks skipped: "
-            f"{total_skipped} "
-            f"(local: {total_skipped_local}, remote: {total_skipped_remote})"
-        )
-        return True
+    except KeyboardInterrupt:
+        if snapshot_id is not None:
+            try:
+                db.fail_snapshot(snapshot_id, "backup interrumpido por el usuario")
+                db.commit()
+            except Exception:
+                db.rollback()
+        raise
 
     except Exception as exc:
         if snapshot_id is not None:
@@ -210,24 +251,48 @@ def backup_directory(
                 db.commit()
             except Exception:
                 db.rollback()
-        print(f"Error creating backup: {exc}")
-        return False
+        raise
 
     finally:
         db.close()
 
+    elapsed = time.perf_counter() - started_at
+    speed = _format_speed(total_size, elapsed)
+
+    print(f"Backup completado: snapshot {snapshot_id}")
+    print(f"Archivos: {total_files}")
+    print(f"Tamaño: {total_size} bytes")
+    print(f"Tiempo: {elapsed:.2f} segundos")
+    print(f"Velocidad: {speed}")
+    print(f"Workers: {workers}")
+    print(f"Chunks totales: {total_chunks}")
+    print(f"Chunks procesados: {total_processed}")
+    print(f"Chunks escritos: {total_written}")
+    print(
+        "Chunks saltados: "
+        f"{total_skipped} "
+        f"(local: {total_skipped_local}, remoto: {total_skipped_remote})"
+    )
+
+    if snapshot_completed and metadata_object_graph_auto_export is not None:
+        export_metadata_object_graph_after_metadata_change(
+            db_file=db_file,
+            settings=metadata_object_graph_auto_export,
+            context_label="BACKUP",
+        )
+
 
 def _normalize_worker_count(workers: int) -> int:
-    cpu_count = os.cpu_count() or DEFAULT_WORKERS
+    cpu_count = os.cpu_count() or _DEFAULT_WORKERS_FALLBACK
     try:
         requested = int(workers)
     except (TypeError, ValueError):
-        requested = DEFAULT_WORKERS
+        requested = _DEFAULT_WORKERS_FALLBACK
 
     return max(1, min(requested, cpu_count))
 
 
-def _format_speed(total_size, elapsed):
+def _format_speed(total_size: int, elapsed: float) -> str:
     if elapsed <= 0:
         return "n/a"
 

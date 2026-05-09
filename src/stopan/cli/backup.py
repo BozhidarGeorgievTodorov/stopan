@@ -2,97 +2,111 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 
-from stopan.backup.config import DEFAULT_PROTECTION_RF
-from stopan.backup.service import backup_directory
+from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.metadata_auto_export import (
+    add_metadata_auto_export_args,
+    build_metadata_object_graph_auto_export,
+)
+
+_DEFAULT_WORKERS = 4
 
 
-DEFAULT_WORKERS = 4
-
-
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan backup",
-        description="Crea un snapshot local de una carpeta.",
+        description="Crea un snapshot haciendo backup de una carpeta.",
     )
+    add_config_args(parser)
+
     parser.add_argument("source_path", help="Carpeta origen a respaldar")
     parser.add_argument(
         "workers",
         nargs="?",
         type=int,
-        default=DEFAULT_WORKERS,
+        default=_DEFAULT_WORKERS,
         help="Número de hilos de trabajo",
     )
     parser.add_argument(
         "--fast",
         dest="fast_local",
         action="store_true",
-        help="Salta chunks ya presentes localmente",
+        help="Activa fast-path local para saltar chunks ya presentes localmente.",
     )
     parser.add_argument(
         "--fast-remote",
         action="store_true",
-        help="Permite saltar chunks con protección remota suficiente",
+        help="Permite saltar chunks ya protegidos remotamente si hay evidencia suficiente.",
     )
     parser.add_argument(
         "--safe",
         dest="safe_mode",
         action="store_true",
-        help="Procesa todos los chunks sin fast-path",
+        help="Modo seguro: ignora fast-path y procesa todo.",
     )
     parser.add_argument(
         "--deterministic",
         action="store_true",
-        help="Usa recorrido determinista del árbol",
+        help="Recorrido determinista del árbol.",
     )
     parser.add_argument(
         "--rf",
         type=int,
-        default=DEFAULT_PROTECTION_RF,
-        help="Replication factor deseado",
+        default=None,
+        help="RF deseado para la política de protección remota del chunk.",
     )
     parser.add_argument(
-        "--seed",
+        "--membership-seed",
         default=None,
-        help="Seed de membership para fast-path remoto y resolución del nodo origen",
+        help="Seed de membership para validar el epoch del fast-path remoto.",
     )
+    add_metadata_auto_export_args(parser, context="backup")
+    return parser.parse_args(argv)
 
-    return parser.parse_args()
 
-
-def main() -> int:
-    args = parse_args()
-
-    if args.fast_remote and args.safe_mode:
-        raise ValueError("'--safe' and '--fast-remote' are incompatible.")
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    cfg = load_runtime_config(args)
 
     fast_local_enabled = bool(args.fast_local)
     fast_remote_enabled = bool(args.fast_remote)
 
-    if fast_remote_enabled and not fast_local_enabled:
+    if args.safe_mode:
+        fast_local_enabled = False
+        fast_remote_enabled = False
+    elif fast_remote_enabled and not fast_local_enabled:
         fast_local_enabled = True
-        print("Remote fast-path enabled; local fast-path enabled implicitly.")
+        print("'--fast-remote' activa implícitamente '--fast'.")
 
-    max_workers = os.cpu_count() or DEFAULT_WORKERS
+    max_workers = os.cpu_count() or _DEFAULT_WORKERS
     workers = max(1, min(int(args.workers), max_workers))
     if args.workers > max_workers:
         print(
-            f"Requested {args.workers} workers, but this CPU exposes {max_workers}. "
-            f"Using {workers}."
+            f"Pediste {args.workers} hilos, pero la CPU expone {max_workers}. "
+            f"Usando {workers}."
         )
 
-    ok = backup_directory(
+    metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+
+    from stopan.backup.service import backup_directory
+
+    result = backup_directory(
         args.source_path,
         num_threads=workers,
         fast_local_enabled=fast_local_enabled,
         fast_remote_enabled=fast_remote_enabled,
         safe_mode=bool(args.safe_mode),
         deterministic=bool(args.deterministic),
-        desired_rf=int(args.rf),
-        membership_seed=args.seed,
+        desired_rf=int(choose(args.rf, cfg.protection.rf)),
+        membership_seed=args.membership_seed or first_seed(cfg),
+        self_addr=cfg.node.advertise_addr,
+        cluster_token=cfg.cluster.token,
+        membership_timeout_s=cfg.membership.rpc_timeout_s,
+        max_message_bytes=cfg.grpc.max_message_bytes,
+        local_shard_dir=cfg.node.local_shard_dir,
+        db_file=cfg.node.db_file,
+        node_id_file=os.path.join(cfg.node.repo_store_dir, "node_id.txt"),
+        metadata_object_graph_auto_export=metadata_object_graph_auto_export,
     )
-    return 0 if ok is not False else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return 0 if result is not False else 1

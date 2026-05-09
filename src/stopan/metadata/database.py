@@ -5,12 +5,11 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable
+from collections.abc import Iterable
 
+from stopan.config.defaults import DEFAULT_NODE_DB_FILE
 from stopan.protection.policy import ProtectionRecord, ProtectionState, is_record_sufficient
 
-
-DB_FILE = "_metadata.db"
 
 
 @dataclass(frozen=True)
@@ -34,7 +33,7 @@ class MetadataDB:
     La protección remota se decide exclusivamente desde chunk_protection.
     """
 
-    def __init__(self, db_file: str = DB_FILE, *, init_schema: bool = True):
+    def __init__(self, db_file: str = DEFAULT_NODE_DB_FILE, *, init_schema: bool = True):
         self.db_file = db_file
         self.conn = sqlite3.connect(self.db_file)
         self.conn.row_factory = sqlite3.Row
@@ -48,6 +47,23 @@ class MetadataDB:
 
         if init_schema:
             self._init_db()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
 
     def _init_db(self) -> None:
         cursor = self.conn.cursor()
@@ -153,6 +169,10 @@ class MetadataDB:
 
         self.conn.commit()
 
+    # ------------------------------------------------------------------
+    # Snapshots
+    # ------------------------------------------------------------------
+
     def create_snapshot(self, root_path: str, *, origin_node_id: str) -> int:
         """Crea un snapshot nuevo en estado CREATING."""
         origin_node_id = str(origin_node_id).strip()
@@ -215,6 +235,22 @@ class MetadataDB:
 
         return row["origin_node_id"] if row else None
 
+    def get_prev_snapshot_id(self, root_path: str, current_snapshot_id: int) -> int | None:
+        """Devuelve el snapshot completo anterior de la misma raíz."""
+        row = self.conn.execute("""
+            SELECT id
+            FROM snapshots
+            WHERE root_path = ? AND id < ? AND status = 'COMPLETE'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (root_path, current_snapshot_id)).fetchone()
+
+        return row["id"] if row else None
+
+    # ------------------------------------------------------------------
+    # Snapshot items
+    # ------------------------------------------------------------------
+
     def add_item(self, snapshot_id: int, rel_path: str, stat_info, item_type: str) -> int:
         """Registra un archivo o directorio dentro de un snapshot."""
         mtime_ns = getattr(stat_info, "st_mtime_ns", int(stat_info.st_mtime * 1_000_000_000))
@@ -237,17 +273,17 @@ class MetadataDB:
         ))
         return cursor.lastrowid
 
-    def get_prev_snapshot_id(self, root_path: str, current_snapshot_id: int) -> int | None:
-        """Devuelve el snapshot completo anterior de la misma raíz."""
-        row = self.conn.execute("""
-            SELECT id
-            FROM snapshots
-            WHERE root_path = ? AND id < ? AND status = 'COMPLETE'
-            ORDER BY id DESC
-            LIMIT 1
-        """, (root_path, current_snapshot_id)).fetchone()
+    def get_snapshot_items(self, snapshot_id: int):
+        """Genera los elementos de un snapshot en orden de ruta."""
+        cursor = self.conn.execute("""
+            SELECT *
+            FROM snapshot_items
+            WHERE snapshot_id = ?
+            ORDER BY path ASC
+        """, (snapshot_id,))
 
-        return row["id"] if row else None
+        for row in cursor:
+            yield dict(row)
 
     def get_item_by_path(self, snapshot_id: int, rel_path: str) -> dict | None:
         """Devuelve un archivo de un snapshot anterior por ruta relativa."""
@@ -268,6 +304,34 @@ class MetadataDB:
             WHERE id = ?
         """, (recipe_id, item_id))
 
+    def get_item_chunks(self, item_id: int):
+        """Genera la receta de hashes de un archivo."""
+        row = self.conn.execute("""
+            SELECT recipe_id
+            FROM snapshot_items
+            WHERE id = ?
+        """, (item_id,)).fetchone()
+
+        if row is None:
+            raise ValueError(f"Snapshot item does not exist: {item_id}")
+
+        if row["recipe_id"] is None:
+            raise ValueError(f"Snapshot item has no associated recipe: {item_id}")
+
+        cursor = self.conn.execute("""
+            SELECT chunk_hash
+            FROM recipe_chunks
+            WHERE recipe_id = ?
+            ORDER BY chunk_order ASC
+        """, (row["recipe_id"],))
+
+        for row in cursor:
+            yield row["chunk_hash"]
+
+    # ------------------------------------------------------------------
+    # Recipes / chunks
+    # ------------------------------------------------------------------
+
     def get_or_create_recipe(
         self,
         recipe_hash: str,
@@ -277,9 +341,20 @@ class MetadataDB:
     ) -> int:
         """Crea o reutiliza una receta deduplicada de chunks."""
         chunks = list(chunks)
-        desired_rf = max(int(desired_rf), 1)
+        desired_rf = int(desired_rf)
         chunk_count = len(chunks)
         total_size = sum(chunk_size for _, _, chunk_size in chunks)
+
+        for expected_order, (chunk_order, chunk_hash, chunk_size) in enumerate(chunks):
+            if chunk_order != expected_order:
+                raise RuntimeError(
+                    "recipe chunks must be contiguous from 0: "
+                    f"expected={expected_order} got={chunk_order}"
+                )
+            if not isinstance(chunk_hash, str) or len(chunk_hash) != 64 or any(c not in "0123456789abcdef" for c in chunk_hash):
+                raise RuntimeError(f"invalid chunk hash in recipe {recipe_hash}: {chunk_hash!r}")
+            if chunk_size < 1:
+                raise RuntimeError(f"invalid chunk size in recipe {recipe_hash}: {chunk_size}")
 
         with self.conn:
             self.conn.execute("""
@@ -288,23 +363,39 @@ class MetadataDB:
             """, (recipe_hash, chunk_count, total_size))
 
             row = self.conn.execute("""
-                SELECT id
+                SELECT id, chunk_count, total_size
                 FROM recipes
                 WHERE recipe_hash = ?
                 LIMIT 1
             """, (recipe_hash,)).fetchone()
             if row is None:
                 raise RuntimeError(f"Could not resolve recipe_id for {recipe_hash}")
+
+            if row["chunk_count"] != chunk_count or row["total_size"] != total_size:
+                raise RuntimeError(
+                    "Inconsistent recipe_hash: "
+                    f"{recipe_hash} already maps to chunk_count={row['chunk_count']} "
+                    f"total_size={row['total_size']}, attempted chunk_count={chunk_count} "
+                    f"total_size={total_size}"
+                )
+
             recipe_id = row["id"]
 
-            has_recipe_chunks = self.conn.execute("""
-                SELECT 1
+            existing_rows = self.conn.execute("""
+                SELECT chunk_order, chunk_hash, chunk_size
                 FROM recipe_chunks
                 WHERE recipe_id = ?
-                LIMIT 1
-            """, (recipe_id,)).fetchone()
+                ORDER BY chunk_order ASC
+            """, (recipe_id,)).fetchall()
 
-            if has_recipe_chunks is None and chunk_count > 0:
+            existing_chunks = [
+                (row["chunk_order"], row["chunk_hash"], row["chunk_size"])
+                for row in existing_rows
+            ]
+            if existing_chunks:
+                if existing_chunks != chunks:
+                    raise RuntimeError(f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}")
+            elif chunk_count > 0:
                 self.conn.executemany("""
                     INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
                     VALUES (?, ?, ?, ?)
@@ -351,7 +442,7 @@ class MetadataDB:
         *,
         desired_rf: int,
     ) -> None:
-        desired_rf = max(int(desired_rf), 1)
+        desired_rf = int(desired_rf)
         rows = [(chunk_hash, desired_rf) for _, chunk_hash, _ in chunks]
         if not rows:
             return
@@ -369,45 +460,37 @@ class MetadataDB:
 
         self.conn.executemany("""
             UPDATE chunk_protection
-            SET desired_rf = CASE WHEN desired_rf < ? THEN ? ELSE desired_rf END
+            SET desired_rf = CASE WHEN desired_rf < ? THEN ? ELSE desired_rf END,
+                protection_state = CASE
+                    WHEN desired_rf < ? AND protection_state IN (?, ?)
+                    THEN ?
+                    ELSE protection_state
+                END,
+                last_error = CASE
+                    WHEN desired_rf < ? AND protection_state IN (?, ?)
+                    THEN 'desired_rf increased'
+                    ELSE last_error
+                END
             WHERE chunk_hash = ?
-        """, ((desired_rf, desired_rf, chunk_hash) for chunk_hash, _ in rows))
+        """, (
+            (
+                desired_rf,
+                desired_rf,
+                desired_rf,
+                ProtectionState.PLACED.value,
+                ProtectionState.VERIFIED.value,
+                ProtectionState.DEGRADED.value,
+                desired_rf,
+                ProtectionState.PLACED.value,
+                ProtectionState.VERIFIED.value,
+                chunk_hash,
+            )
+            for chunk_hash, _ in rows
+        ))
 
-    def get_snapshot_items(self, snapshot_id: int):
-        """Genera los elementos de un snapshot en orden de ruta."""
-        cursor = self.conn.execute("""
-            SELECT *
-            FROM snapshot_items
-            WHERE snapshot_id = ?
-            ORDER BY path ASC
-        """, (snapshot_id,))
 
-        for row in cursor:
-            yield dict(row)
 
-    def get_item_chunks(self, item_id: int):
-        """Genera la receta de hashes de un archivo."""
-        row = self.conn.execute("""
-            SELECT recipe_id
-            FROM snapshot_items
-            WHERE id = ?
-        """, (item_id,)).fetchone()
 
-        if row is None:
-            raise ValueError(f"Snapshot item does not exist: {item_id}")
-
-        if row["recipe_id"] is None:
-            raise ValueError(f"Snapshot item has no associated recipe: {item_id}")
-
-        cursor = self.conn.execute("""
-            SELECT chunk_hash
-            FROM recipe_chunks
-            WHERE recipe_id = ?
-            ORDER BY chunk_order ASC
-        """, (row["recipe_id"],))
-
-        for row in cursor:
-            yield row["chunk_hash"]
 
     def has_chunk(self, chunk_hash: str) -> bool:
         row = self.conn.execute("""
@@ -416,6 +499,10 @@ class MetadataDB:
             WHERE hash = ?
         """, (chunk_hash,)).fetchone()
         return row is not None
+
+    # ------------------------------------------------------------------
+    # Distributed protection
+    # ------------------------------------------------------------------
 
     def get_chunk_protection(self, chunk_hash: str) -> ProtectionRecord | None:
         row = self.conn.execute("""
@@ -459,7 +546,7 @@ class MetadataDB:
         current_epoch: str | None = None,
         limit: int | None = None,
     ) -> list[str]:
-        desired_rf = max(int(desired_rf), 1)
+        desired_rf = int(desired_rf)
         params: list[object] = [
             ProtectionState.PENDING.value,
             ProtectionState.DEGRADED.value,
@@ -538,7 +625,7 @@ class MetadataDB:
         desired_rf: int,
         current_epoch: str | None = None,
     ) -> None:
-        desired_rf = max(int(desired_rf), 1)
+        desired_rf = int(desired_rf)
 
         with self.conn:
             self.conn.execute("""
@@ -613,6 +700,28 @@ class MetadataDB:
                 last_error=error,
             )
 
+    def mark_chunk_push_degraded(
+        self,
+        chunk_hash: str,
+        *,
+        desired_rf: int,
+        protected_remote_copies: int,
+        placement_epoch: str | None,
+        error: str,
+    ) -> None:
+        """Registra degradación observada durante push/replicación."""
+        with self.conn:
+            self._upsert_chunk_protection_state(
+                chunk_hash=chunk_hash,
+                desired_rf=desired_rf,
+                protection_state=ProtectionState.DEGRADED,
+                protected_remote_copies=protected_remote_copies,
+                placement_epoch=placement_epoch,
+                last_push_at=time.time(),
+                last_verify_at=None,
+                last_error=error,
+            )
+
     def mark_chunk_verified(
         self,
         chunk_hash: str,
@@ -680,7 +789,7 @@ class MetadataDB:
                 last_error = excluded.last_error
         """, (
             chunk_hash,
-            max(int(desired_rf), 1),
+            int(desired_rf),
             protection_state.value,
             max(int(protected_remote_copies), 0),
             placement_epoch,
@@ -715,7 +824,7 @@ class MetadataDB:
                 last_error = excluded.last_error
         """, (
             chunk_hash,
-            max(int(desired_rf), 1),
+            int(desired_rf),
             protection_state.value,
             max(int(protected_remote_copies), 0),
             placement_epoch,
@@ -723,11 +832,3 @@ class MetadataDB:
             last_error,
         ))
 
-    def commit(self) -> None:
-        self.conn.commit()
-
-    def rollback(self) -> None:
-        self.conn.rollback()
-
-    def close(self) -> None:
-        self.conn.close()

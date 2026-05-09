@@ -1,0 +1,163 @@
+"""
+Auto-export del metadata object graph tras cambios de metadata.
+
+Este hook se ejecuta después de una mutación ya confirmada en MetadataDB. Si el
+export o auto-pack falla, la metadata operacional sigue persistida; el fallo
+solo deja el object graph o el pack cifrado desactualizado.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+from stopan.metadata.identity.passphrase import ScryptCost
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataObjectGraphAutoExport:
+    enabled: bool
+    object_store_dir: str
+    passphrase_file: str
+    scrypt_cost: ScryptCost
+    include_protection: bool = True
+    auto_pack: bool = False
+    pack_dir: str | None = None
+    identity_file: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("metadata auto-export enabled debe ser bool")
+        if not isinstance(self.include_protection, bool):
+            raise TypeError("metadata auto-export include_protection debe ser bool")
+        if not isinstance(self.auto_pack, bool):
+            raise TypeError("metadata auto-export auto_pack debe ser bool")
+        if not isinstance(self.scrypt_cost, ScryptCost):
+            raise TypeError("metadata auto-export scrypt_cost debe ser ScryptCost")
+
+        if not self.enabled:
+            return
+
+        if (
+            not isinstance(self.object_store_dir, str)
+            or not self.object_store_dir.strip()
+        ):
+            raise ValueError(
+                "metadata auto-export requiere object_store_dir cuando está activado"
+            )
+        if (
+            not isinstance(self.passphrase_file, str)
+            or not self.passphrase_file.strip()
+        ):
+            raise ValueError(
+                "metadata auto-export requiere passphrase_file cuando está activado"
+            )
+        if self.pack_dir is not None and not isinstance(self.pack_dir, str):
+            raise TypeError("metadata auto-export pack_dir debe ser str o None")
+        if self.auto_pack and (
+            not isinstance(self.identity_file, str)
+            or not self.identity_file.strip()
+        ):
+            raise ValueError("metadata auto-pack requiere identity_file")
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataObjectGraphAutoExportResult:
+    root_dir: Path
+    catalog_hash: str
+    state_digest: str
+    objects_total: int
+    objects_written: int
+    objects_reused: int
+    snapshot_count: int
+    known_chunk_count: int
+    protection_record_count: int
+    pack_path: Path | None = None
+    pack_hash: str | None = None
+    objects_packed: int | None = None
+
+
+def export_metadata_object_graph_after_metadata_change(
+    *,
+    db_file: str,
+    settings: MetadataObjectGraphAutoExport | None,
+    context_label: str,
+) -> MetadataObjectGraphAutoExportResult | None:
+    if settings is None or not settings.enabled:
+        return None
+
+    try:
+        from stopan.metadata.identity.passphrase import read_passphrase_file
+        from stopan.metadata.objects.service import MetadataObjectGraphStoreService
+
+        passphrase = read_passphrase_file(settings.passphrase_file)
+        service = MetadataObjectGraphStoreService(
+            db_file=db_file,
+            scrypt_cost=settings.scrypt_cost,
+        )
+        result = service.export_current_state(
+            object_store_dir=settings.object_store_dir,
+            passphrase=passphrase,
+            include_protection=settings.include_protection,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"{context_label} completado, pero falló el export del metadata "
+            f"object graph cifrado: {exc}"
+        ) from exc
+
+    print(f"Metadata object graph actualizado tras {context_label.lower()}")
+    print(f"   object_store: {result.root_dir}")
+    print(f"   catalog_hash: {result.catalog_hash}")
+    print(f"   state_digest: {result.state_digest}")
+    print(f"   objects_total: {result.objects_total}")
+    print(f"   objects_written: {result.objects_written}")
+    print(f"   objects_reused: {result.objects_reused}")
+    print(f"   snapshots: {result.snapshot_count}")
+    print(f"   known_chunks: {result.known_chunk_count}")
+    print(f"   protection_records: {result.protection_record_count}")
+
+    pack_path = None
+    pack_hash = None
+    objects_packed = None
+
+    if settings.auto_pack:
+        try:
+            from stopan.metadata.packs.object_pack import MetadataObjectPackService
+
+            pack_result = MetadataObjectPackService(
+                scrypt_cost=settings.scrypt_cost,
+            ).export_latest_pack(
+                object_store_dir=settings.object_store_dir,
+                passphrase=passphrase,
+                identity_file=settings.identity_file or "",
+                pack_dir=settings.pack_dir,
+            )
+            pack_path = pack_result.path
+            pack_hash = pack_result.pack_hash
+            objects_packed = pack_result.objects_packed
+        except Exception as exc:
+            raise RuntimeError(
+                f"{context_label} completado y object graph actualizado, "
+                f"pero falló metadata auto-pack: {exc}"
+            ) from exc
+
+        print(f"Metadata object pack creado tras {context_label.lower()}")
+        print(f"   path: {pack_result.path}")
+        print(f"   pack_hash: {pack_result.pack_hash}")
+        print(f"   objects_packed: {pack_result.objects_packed}")
+
+    return MetadataObjectGraphAutoExportResult(
+        root_dir=Path(result.root_dir),
+        catalog_hash=result.catalog_hash,
+        state_digest=result.state_digest,
+        objects_total=result.objects_total,
+        objects_written=result.objects_written,
+        objects_reused=result.objects_reused,
+        snapshot_count=result.snapshot_count,
+        known_chunk_count=result.known_chunk_count,
+        protection_record_count=result.protection_record_count,
+        pack_path=Path(pack_path) if pack_path is not None else None,
+        pack_hash=pack_hash,
+        objects_packed=objects_packed,
+    )

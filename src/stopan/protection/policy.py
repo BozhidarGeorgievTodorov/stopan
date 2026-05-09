@@ -1,15 +1,25 @@
+"""
+Modelo común de protección remota de chunks.
+
+Este módulo define los estados persistidos en chunk_protection y las reglas para
+decidir si una evidencia de protección remota sigue siendo suficiente para el
+placement actual.
+"""
+
 from __future__ import annotations
 
-import hashlib
-from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
 
-DEFAULT_DESIRED_RF = 3
-
-
 class ProtectionState(StrEnum):
+    """
+    Estado persistido de protección remota de un chunk.
+
+    Solo PLACED y VERIFIED cuentan como evidencia suficiente para saltos rápidos
+    o para considerar el chunk protegido.
+    """
+
     PENDING = "PENDING"
     PLACED = "PLACED"
     DEGRADED = "DEGRADED"
@@ -23,6 +33,13 @@ class ProtectionState(StrEnum):
 
 @dataclass(frozen=True)
 class ProtectionRecord:
+    """
+    Vista en memoria de una fila de chunk_protection.
+
+    desired_rf y protected_remote_copies se interpretan siempre como copias
+    remotas, no como copias totales incluyendo el CAS local.
+    """
+
     chunk_hash: str
     desired_rf: int
     protection_state: ProtectionState
@@ -37,29 +54,18 @@ class ProtectionRecord:
         return self.protection_state.counts_as_protected
 
 
-def compute_placement_epoch(
-    *,
-    cluster_token: str,
-    desired_rf: int,
-    eligible_node_ids: Iterable[str],
-) -> str:
+def normalize_remote_rf(value: int, *, field_name: str = "rf") -> int:
     """
-    Calcula un identificador estable del contexto de placement vigente.
-    """
-    normalized_node_ids = tuple(sorted(str(node_id) for node_id in eligible_node_ids if node_id))
-    material = (str(cluster_token), max(int(desired_rf), 1), normalized_node_ids)
-    return hashlib.sha256(repr(material).encode("utf-8")).hexdigest()
+    Normaliza un RF remoto.
 
-
-def required_remote_copies_for_remote_skip(required_rf: int) -> int:
+    RF representa copias remotas requeridas. RF=0 es válido y
+    significa que no se solicita protección remota. La copia local del CAS de
+    backup nunca cuenta como réplica P2P.
     """
-    Criterio conservador para permitir fast-path/skip remoto.
-
-    El planner no sabe si el nodo local pertenece al top-k HRW de un chunk concreto.
-    Por eso, si RF > 1, exigimos al menos RF-1 copias remotas protegidas.
-    Para RF=1, no exigimos copias remotas.
-    """
-    return max(int(required_rf), 1)
+    remote_rf = int(value)
+    if remote_rf < 0:
+        raise ValueError(f"{field_name} debe ser >= 0")
+    return remote_rf
 
 
 def is_record_sufficient(
@@ -69,24 +75,31 @@ def is_record_sufficient(
     current_epoch: str | None = None,
 ) -> bool:
     """
-    Devuelve True si la evidencia de protección del chunk es suficiente
-    para el contexto actual de planificación.
+    Devuelve True si una fila de chunk_protection permite confiar en el chunk.
+
+    La evidencia solo es suficiente si el estado cuenta como protegido, el RF
+    registrado cubre las copias remotas requeridas, el número de copias
+    verificadas/protegidas es suficiente y, cuando se proporciona, el
+    placement_epoch coincide con el contexto actual.
     """
+    required_remote_copies = normalize_remote_rf(required_rf, field_name="required_rf")
+
+    if required_remote_copies == 0:
+        return True
+
     if record is None:
         return False
-
-    required_rf = max(int(required_rf), 1)
 
     if not record.is_protected:
         return False
 
-    if int(record.desired_rf) < required_rf:
+    if int(record.desired_rf) < required_remote_copies:
         return False
 
     if current_epoch is not None and record.placement_epoch != current_epoch:
         return False
 
-    if int(record.protected_remote_copies) < required_remote_copies_for_remote_skip(required_rf):
+    if int(record.protected_remote_copies) < required_remote_copies:
         return False
 
     return True

@@ -1,21 +1,31 @@
+"""
+Push de chunks pendientes hacia nodos remotos.
+
+Este módulo coordina la protección P2P de chunks completos: resuelve membership,
+calcula placement remoto excluyendo el nodo origen, replica chunks mediante
+streaming y actualiza chunk_protection con el resultado.
+"""
+
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+import sys
 
 from stopan.cas.repository import CASRepository
 from stopan.metadata.database import MetadataDB
-from stopan.placement.cluster_view import ClusterMembershipClient
+from stopan.metadata.objects.graph.auto_export import (
+    MetadataObjectGraphAutoExport,
+    export_metadata_object_graph_after_metadata_change,
+)
+from stopan.placement.cluster_resolver import require_cluster_view
+from stopan.protection.policy import normalize_remote_rf
 from stopan.replication.coordinator import StreamingReplicationCoordinator
-
-
-LOCAL_SHARD_DIR = os.getenv("LOCAL_SHARD_DIR", "_data_chunks")
-DB_FILE = os.getenv("DB_FILE", "_metadata.db")
-CLUSTER_TOKEN = os.getenv("CLUSTER_TOKEN", "")
 
 
 @dataclass(frozen=True)
 class PushStats:
+    """Contadores agregados de una ejecución de push."""
+
     attempted: int = 0
     protected: int = 0
     degraded: int = 0
@@ -28,41 +38,9 @@ class PushStats:
     interrupted: bool = False
 
 
-def resolve_membership_seed(explicit_seed: str | None = None) -> str | None:
-    if explicit_seed:
-        return explicit_seed.strip()
-
-    seeds = [seed.strip() for seed in os.getenv("SEEDS", "").split(",") if seed.strip()]
-    if seeds:
-        return seeds[0]
-
-    advertise_addr = os.getenv("ADVERTISE_ADDR", "").strip()
-    return advertise_addr or None
-
-
-def build_cluster_view(seed: str | None):
-    resolved_seed = resolve_membership_seed(seed)
-    if not resolved_seed:
-        raise ValueError("A non-empty membership seed is required.")
-
-    self_addr = os.getenv("ADVERTISE_ADDR", "")
-    cluster = ClusterMembershipClient(resolved_seed, self_addr=self_addr).get_cluster_view()
-
-    if not cluster.members:
-        raise RuntimeError(f"No eligible members returned by seed {resolved_seed}.")
-
-    if not cluster.self_node_id:
-        raise RuntimeError(
-            "Could not resolve origin_node_id from membership. "
-            "Make sure ADVERTISE_ADDR matches an eligible cluster member."
-        )
-
-    return resolved_seed, cluster
-
-
 def push_to_network(
     *,
-    seed: str | None,
+    membership_seed: str | None,
     rf: int,
     limit: int | None,
     target_parallelism: int,
@@ -73,48 +51,86 @@ def push_to_network(
     max_message_bytes: int,
     commit_every: int,
     strict_rf: bool,
+    db_file: str,
+    local_shard_dir: str,
+    self_addr: str,
+    cluster_token: str,
+    membership_timeout_s: float,
+    metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
 ) -> PushStats:
-    desired_rf = max(int(rf), 1)
+    """
+    Replica chunks pendientes en nodos remotos según la política RF.
+
+    En Stopan, rf representa copias remotas requeridas. RF=0 es un no-op
+    remoto; el nodo origen se excluye del placement y la copia local del CAS no
+    cuenta como réplica P2P.
+    """
+    desired_rf = int(rf)
+    if desired_rf < 1:
+        raise ValueError("push requiere rf >= 1.")
+
+    required_remote_copies = desired_rf
     commit_every = max(1, int(commit_every))
+    self_addr = str(self_addr or "").strip()
+    cluster_token = str(cluster_token or "")
 
-    repo = CASRepository(LOCAL_SHARD_DIR)
-    db = MetadataDB(DB_FILE)
+    if not self_addr:
+        raise RuntimeError(
+            "Falta node.advertise_addr. Push necesita identificar el nodo origen en membership."
+        )
+
+    repo = CASRepository(local_shard_dir)
+    db = MetadataDB(db_file)
     coordinator: StreamingReplicationCoordinator | None = None
-
-    attempted = 0
-    protected = 0
-    degraded = 0
-    failed = 0
-    stored_remote = 0
-    already_present_remote = 0
-    remote_candidate_count = 0
-    interrupted = False
+    metadata_changed = False
 
     try:
-        resolved_seed, cluster = build_cluster_view(seed)
+        resolved = require_cluster_view(
+            membership_seed=membership_seed,
+            self_addr=self_addr,
+            cluster_token=cluster_token,
+            timeout_s=membership_timeout_s,
+            max_message_bytes=max_message_bytes,
+            missing_seed_message=(
+                "Falta membership seed. Usa '--membership-seed' o define cluster.seeds en node.yaml."
+            ),
+        )
+        resolved_seed = resolved.seed
+        cluster = resolved.cluster
         origin_node_id = cluster.self_node_id
+        if not origin_node_id:
+            raise RuntimeError(
+                "No pude resolver origin_node_id desde membership. "
+                "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
+            )
+
+        current_epoch = (
+            cluster.placement_epoch_excluding(
+                desired_rf=required_remote_copies,
+                cluster_token=cluster_token,
+                excluded_node_ids={origin_node_id},
+            )
+            if required_remote_copies > 0
+            else None
+        )
+
         remote_candidate_node_ids = cluster.candidate_node_ids_excluding({origin_node_id})
         remote_candidate_count = len(remote_candidate_node_ids)
 
-        if strict_rf and remote_candidate_count < desired_rf:
-            print(
-                "Not enough remote candidates to satisfy strict RF: "
-                f"desired_rf={desired_rf}, remote_candidates={remote_candidate_count}."
-            )
-            print(f"Remote candidates: {[node_id[:8] for node_id in remote_candidate_node_ids]}")
+        if strict_rf and remote_candidate_count < required_remote_copies:
+            print("RF estricto: no hay suficientes targets remotos elegibles.")
+            print(f"   desired_rf={desired_rf} required_remote_copies={required_remote_copies} remote_candidates={remote_candidate_count}")
+            print(f"   candidates={[node_id[:8] for node_id in remote_candidate_node_ids]}")
+            print("   No se modifica chunk_protection; reintenta cuando el cluster recupere capacidad.")
             return PushStats(
+                insufficient_remote_targets=True,
                 desired_rf=desired_rf,
                 remote_candidates=remote_candidate_count,
-                insufficient_remote_targets=True,
             )
 
-        current_epoch = cluster.placement_epoch_excluding(
-            desired_rf=desired_rf,
-            cluster_token=CLUSTER_TOKEN,
-            excluded_node_ids={origin_node_id},
-        )
-
         db.mark_stale_protection(desired_rf=desired_rf, current_epoch=current_epoch)
+        metadata_changed = True
+
         pending_chunks = db.get_pending_protection_chunks(
             desired_rf=desired_rf,
             current_epoch=current_epoch,
@@ -122,7 +138,7 @@ def push_to_network(
         )
 
         if not pending_chunks:
-            print("No chunks pending for the current protection policy.")
+            print("No hay chunks pendientes de protección para la política actual.")
             return PushStats(
                 desired_rf=desired_rf,
                 remote_candidates=remote_candidate_count,
@@ -131,8 +147,8 @@ def push_to_network(
         coordinator = StreamingReplicationCoordinator(
             repo=repo,
             cluster=cluster,
-            rf=desired_rf,
-            cluster_token=CLUSTER_TOKEN,
+            rf=required_remote_copies,
+            cluster_token=cluster_token,
             origin_node_id=origin_node_id,
             probe_timeout_s=probe_timeout_s,
             stream_timeout_s=stream_timeout_s,
@@ -142,15 +158,15 @@ def push_to_network(
             max_message_bytes=max_message_bytes,
         )
 
-        self_addr = os.getenv("ADVERTISE_ADDR", "")
-        print(f"Push stream: {len(pending_chunks)} chunks pending for protection")
+        print(f"Push: {len(pending_chunks)} chunks pendientes de protección")
         print(f"Membership seed: {resolved_seed}")
         print(f"Eligible members: {[f'{member.node_id[:8]}@{member.address}' for member in cluster.members]}")
-        print(f"Origin node: {origin_node_id[:8]}@{self_addr}")
+        print(f"Self: {origin_node_id[:8]}@{self_addr}")
         print(f"Remote candidates: {remote_candidate_count}")
-        print(f"Desired RF: {desired_rf}")
-        print(f"Strict RF: {bool(strict_rf)}")
-        print(f"placement_epoch={current_epoch[:12]}")
+        print(f"RF remoto requerido: {desired_rf}")
+        print(f"Copias remotas requeridas: {required_remote_copies}")
+        print(f"RF estricto: {bool(strict_rf)}")
+        print(f"placement_epoch={current_epoch[:12] if current_epoch else '-'}")
         print(
             f"Pipeline: target_parallelism={target_parallelism} "
             f"probe_batch_hashes={probe_batch_hashes} "
@@ -159,15 +175,20 @@ def push_to_network(
             f"stream_timeout_s={stream_timeout_s}"
         )
 
+        attempted = 0
+        protected = 0
+        degraded = 0
+        failed = 0
+        stored_remote = 0
+        already_present_remote = 0
+
         try:
             for outcome in coordinator.replicate_chunks(pending_chunks):
                 attempted += 1
                 stored_remote += outcome.stored_remote_copies
                 already_present_remote += outcome.already_present_remote_copies
 
-                policy_satisfied = outcome.protected_remote_copies >= desired_rf
-
-                if policy_satisfied:
+                if outcome.protected_remote_copies >= required_remote_copies:
                     db.mark_chunk_placed(
                         outcome.chunk_hash,
                         desired_rf=desired_rf,
@@ -178,14 +199,14 @@ def push_to_network(
 
                 elif outcome.protected_remote_copies > 0:
                     error = (
-                        f"partial placement: protected_remote_copies="
-                        f"{outcome.protected_remote_copies}/{desired_rf} "
+                        f"placement parcial: protected_remote_copies="
+                        f"{outcome.protected_remote_copies}/{required_remote_copies} "
                         f"(planned_targets={outcome.required_remote_copies})"
                     )
                     if outcome.error:
                         error = f"{error}; {outcome.error}"
 
-                    db.mark_chunk_degraded(
+                    db.mark_chunk_push_degraded(
                         outcome.chunk_hash,
                         desired_rf=desired_rf,
                         protected_remote_copies=outcome.protected_remote_copies,
@@ -194,14 +215,14 @@ def push_to_network(
                     )
                     degraded += 1
                     print(
-                        f"   {outcome.chunk_hash[:8]} degraded: "
-                        f"protected={outcome.protected_remote_copies}/{desired_rf} "
+                        f"   {outcome.chunk_hash[:8]} degradado: "
+                        f"protected={outcome.protected_remote_copies}/{required_remote_copies} "
                         f"planned={outcome.required_remote_copies} "
                         f"error={error}"
                     )
 
                 else:
-                    error = outcome.error or "replication failed with zero protected remote copies"
+                    error = outcome.error or "replicación fallida sin copias remotas protegidas"
                     db.mark_chunk_failed(
                         outcome.chunk_hash,
                         desired_rf=desired_rf,
@@ -211,39 +232,63 @@ def push_to_network(
                     )
                     failed += 1
                     print(
-                        f"   {outcome.chunk_hash[:8]} failed: "
-                        f"protected=0/{desired_rf} "
+                        f"   {outcome.chunk_hash[:8]} fallido: "
+                        f"protected=0/{required_remote_copies} "
                         f"planned={outcome.required_remote_copies} "
                         f"error={error}"
                     )
 
+                metadata_changed = True
+
                 if attempted % commit_every == 0:
                     db.commit()
                     print(
-                        f"   progress {attempted}/{len(pending_chunks)} | "
+                        f"   progreso {attempted}/{len(pending_chunks)} | "
                         f"protected={protected} | degraded={degraded} | failed={failed} | "
                         f"stored_remote={stored_remote} | "
                         f"already_present_remote={already_present_remote}"
                     )
 
-        except KeyboardInterrupt:
-            interrupted = True
-            print("\nPush interrupted by user.")
+            return PushStats(
+                attempted=attempted,
+                protected=protected,
+                degraded=degraded,
+                failed=failed,
+                stored_remote=stored_remote,
+                already_present_remote=already_present_remote,
+                desired_rf=desired_rf,
+                remote_candidates=remote_candidate_count,
+            )
 
-        return PushStats(
-            attempted=attempted,
-            protected=protected,
-            degraded=degraded,
-            failed=failed,
-            stored_remote=stored_remote,
-            already_present_remote=already_present_remote,
-            desired_rf=desired_rf,
-            remote_candidates=remote_candidate_count,
-            interrupted=interrupted,
-        )
+        except KeyboardInterrupt:
+            print("\nPush interrumpido por el usuario.")
+            db.commit()
+            return PushStats(
+                attempted=attempted,
+                protected=protected,
+                degraded=degraded,
+                failed=failed,
+                stored_remote=stored_remote,
+                already_present_remote=already_present_remote,
+                desired_rf=desired_rf,
+                remote_candidates=remote_candidate_count,
+                interrupted=True,
+            )
 
     finally:
         if coordinator is not None:
             coordinator.close()
         db.commit()
         db.close()
+
+        if (
+            metadata_changed
+            and metadata_object_graph_auto_export is not None
+            and metadata_object_graph_auto_export.enabled
+            and sys.exc_info()[0] is None
+        ):
+            export_metadata_object_graph_after_metadata_change(
+                db_file=db_file,
+                settings=metadata_object_graph_auto_export,
+                context_label="PUSH",
+            )

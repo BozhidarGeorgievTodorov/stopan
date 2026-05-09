@@ -4,150 +4,48 @@ Sistema de backup distribuido direccionado por contenido.
 
 Stopan permite crear snapshots locales de una carpeta, proteger sus chunks en una red P2P, verificar posteriormente esa protección remota y restaurar snapshots desde el CAS local o desde los nodos remotos.
 
-## Flujo general
+También puede exportar la metadata del snapshot como un grafo de objetos cifrado y firmado, empaquetarlo y distribuirlo por la red para poder reconstruir la base SQLite si se pierde el nodo origen.
 
-El sistema tiene cuatro operaciones principales:
+## Tecnologías principales
 
-1. crear snapshots locales de una carpeta;
-2. proteger los chunks pendientes en una red P2P;
-3. verificar que la protección remota registrada sigue siendo cierta;
-4. restaurar un snapshot usando la caché local o la red.
+* **Core:** Python 3
+* **Red P2P y RPC:** gRPC y Protocol Buffers (Protobuf)
+* **Chunking (CDC):** Algoritmo Rabin (extensión nativa en C) y hashing BLAKE3
+* **Almacenamiento:** SQLite para metadata y CAS sobre sistema de ficheros para chunks locales y P2P
+* **Infraestructura:** Docker y Docker Compose para clústeres P2P con membership SWIM
 
-### Backup local
+## Arquitectura y flujo general
 
-El backup recorre la carpeta origen con `TreeWalker`.
-
-Por cada archivo encontrado, `FileChunker` lo divide en chunks de tamaño variable mediante Content-Defined Chunking. La extensión nativa `fast_rabin` calcula las fronteras de chunk y cada chunk se identifica con BLAKE3.
-
-Antes de escribir un chunk, `ChunkPlanner` decide si debe procesarse o si puede saltarse por fast-path. Para ello consulta el CAS local, la metadata guardada en SQLite y una caché en memoria llamada `ChunkIndex`.
-
-La metadata del snapshot se guarda en SQLite. Cada snapshot contiene los archivos y carpetas recorridos, sus metadatos básicos, el estado del snapshot, el `origin_node_id` que lo creó y una referencia a la receta de chunks necesaria para reconstruir cada archivo.
-
-Si existe un snapshot anterior completo de la misma raíz, los archivos que no han cambiado reutilizan directamente su receta anterior. Esto evita volver a leer y trocear archivos idénticos.
-
-### Identidad del nodo origen
-
-Cada snapshot se crea asociado a un `origin_node_id`.
-
-Cuando el proceso puede resolver su identidad mediante membership, usa el `node_id` del miembro que coincide con `ADVERTISE_ADDR`. Si se ejecuta en modo local u offline, usa una identidad local persistida en `node_store/node_id.txt`.
-
-El `origin_node_id` es importante porque la protección remota no debe contar el nodo que originó el snapshot como copia remota. Por eso replicación, verificación y restauración calculan el placement excluyendo ese nodo.
-
-### Protección P2P
-
-Después de crear un snapshot, los chunks quedan registrados en SQLite con estado de protección.
-
-`stopan push` lee los chunks pendientes, obtiene una vista de nodos mediante membership y calcula los nodos destino usando HRW / rendezvous hashing. El replication factor indica cuántos nodos remotos deben proteger cada chunk.
-
-Antes de enviar datos, el replicador pregunta a cada nodo qué hashes le faltan mediante `ProbeMissingChunks`. Después envía solo los chunks ausentes usando `ReplicateChunks`.
-
-El protocolo de almacenamiento usa estados estructurados:
-
-- `StoreStatus` para escritura remota;
-- `RetrieveStatus` para lectura remota.
-
-Cada nodo P2P mantiene su propio CAS, recibe chunks comprimidos por gRPC, valida su BLAKE3 antes de guardarlos y los devuelve cuando otro proceso los necesita.
-
-### Verificación de protección remota
-
-`stopan verify` audita la protección remota registrada en SQLite.
-
-No descarga blobs completos. Recalcula el placement HRW vigente para cada chunk, excluye el `origin_node_id` y usa `ProbeMissingChunks` para comprobar si los nodos esperados siguen teniendo el chunk.
-
-Si encuentra suficientes copias remotas, marca el chunk como `VERIFIED`. Si faltan copias, lo marca como `DEGRADED` y actualiza el error asociado.
-
-Esto permite distinguir entre:
-
-- chunks pendientes de protección;
-- chunks colocados por `stopan push`;
-- chunks verificados posteriormente;
-- chunks cuya protección se ha degradado por pérdida de nodos, borrado de datos o cambios de cluster.
-
-### Restauración
-
-`stopan restore` reconstruye un snapshot a partir de la metadata guardada en SQLite.
-
-Primero consulta los archivos y recetas del snapshot. Para cada chunk intenta leerlo desde el CAS local. Si no está disponible, puede consultar también el CAS local del nodo P2P y, si sigue faltando, obtiene la vista de nodos y lo solicita a los nodos que deberían tenerlo según HRW excluyendo el `origin_node_id` del snapshot.
-
-La restauración remota usa `RetrieveChunkBatch`, por lo que puede pedir varios chunks a un mismo nodo en una sola llamada gRPC. Los chunks se resuelven por ventanas, pero se escriben siempre en el orden original del archivo.
-
-La restauración se hace en una carpeta temporal `.incomplete`. Cada archivo se escribe primero como temporal y solo se mueve a su ruta final cuando se ha reconstruido completo.
-
-Cuando todos los archivos se han restaurado correctamente, la carpeta incompleta se renombra como resultado final.
+1. **Backup local:** Troceado de archivos mediante *Content-Defined Chunking*, deduplicación y guardado en CAS local.
+2. **Protección P2P (`push`):** Cálculo de nodos destino mediante HRW / Rendezvous Hashing y envío exclusivo de chunks faltantes. El replication factor `--rf` indica las copias remotas requeridas; la copia local no cuenta como copia remota y el nodo origen se excluye.
+3. **Verificación (`verify`):** Auditoría remota sin descarga de blobs para comprobar si los nodos esperados siguen teniendo los chunks asignados, detectando degradación o pérdida de nodos.
+4. **Restauración (`restore`):** Reconstrucción priorizada. Busca cada chunk en el CAS local, luego en el store P2P local del nodo y, finalmente, lo solicita a la red P2P si se ha indicado membership.
+5. **Metadata distribuida:** La metadata SQLite local puede exportarse a un grafo de objetos, empaquetarse, firmarse y cifrarse para permitir la recuperación de snapshots ante la pérdida total del nodo de origen.
 
 ## Estructura
 
 ```text
-.
-├── Dockerfile
-├── docker-compose.yml
-├── README.md
-├── requirements.txt
-├── setup_fast_rabin.py
-└── src/
-    └── stopan/
-        ├── __init__.py
-        ├── __main__.py
-        ├── backup/
-        │   ├── config.py
-        │   ├── identity.py
-        │   ├── models.py
-        │   ├── policy.py
-        │   ├── service.py
-        │   └── worker.py
-        ├── cas/
-        │   └── repository.py
-        ├── chunking/
-        │   ├── chunker.py
-        │   ├── chunk_index.py
-        │   ├── fast_rabin.c
-        │   └── planner.py
-        ├── cli/
-        │   ├── backup.py
-        │   ├── push.py
-        │   ├── restore.py
-        │   ├── root.py
-        │   └── verify.py
-        ├── metadata/
-        │   └── database.py
-        ├── node/
-        │   ├── commit_engine.py
-        │   ├── identity.py
-        │   ├── membership.py
-        │   ├── server.py
-        │   └── storage_rpc.py
-        ├── placement/
-        │   ├── cluster_view.py
-        │   └── hrw.py
-        ├── protection/
-        │   ├── policy.py
-        │   ├── pusher.py
-        │   ├── verifier.py
-        │   ├── verify_config.py
-        │   └── verify_models.py
-        ├── protos/
-        │   ├── membership.proto
-        │   └── p2p_storage.proto
-        ├── replication/
-        │   ├── coordinator.py
-        │   ├── outcomes.py
-        │   ├── queue_iterator.py
-        │   ├── rpc_pool.py
-        │   └── streaming.py
-        ├── restore/
-        │   ├── cluster.py
-        │   ├── config.py
-        │   ├── fetch.py
-        │   ├── paths.py
-        │   ├── prefetcher.py
-        │   ├── remote_client.py
-        │   ├── restorer.py
-        │   └── service.py
-        └── scanning/
-            └── scanner.py
+src/stopan/
+├── backup/       # creación de snapshots y workers de backup
+├── cas/          # repositorio de chunks direccionado por hash
+├── chunking/     # CDC, recetas y planificación de chunks
+├── cli/          # interfaz de línea de comandos
+├── common/       # utilidades compartidas
+├── config/       # modelo, defaults y carga de configuración
+├── metadata/     # SQLite, identidad, object graph y packs distribuidos
+├── node/         # nodo P2P, membership, storage RPC y metadata RPC
+├── placement/    # HRW, cluster view y placement_epoch
+├── protection/   # política, push y verify de protección remota
+├── protos/       # definiciones protobuf
+├── replication/  # coordinación y streaming de ReplicateChunks
+├── restore/      # recuperación local/P2P/red y escritura segura
+├── rpc/          # opciones y pools gRPC comunes
+└── scanning/     # recorrido de árboles de ficheros
 ```
 
-## Requisitos locales
+## Requisitos y compilación
+
+Crear un entorno virtual e instalar las dependencias de ejecución:
 
 ```bash
 python -m venv venv
@@ -155,162 +53,119 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-El archivo `requirements.txt` debe incluir al menos:
-
-```text
-grpcio
-grpcio-tools
-blake3
-zstandard
-```
-
-## Compilar componentes generados
-
-Regenerar los módulos Python de protobuf:
+Regenerar los módulos Python de protobuf y compilar la extensión C:
 
 ```bash
-python -m grpc_tools.protoc   -I.   --python_out=.   --grpc_python_out=.   src/protos/p2p_storage.proto   src/protos/membership.proto
-```
-
-Compilar la extensión C:
-
-```bash
+python -m grpc_tools.protoc -Isrc/stopan/protos --python_out=src/stopan/protos --grpc_python_out=src/stopan/protos src/stopan/protos/p2p_storage.proto src/stopan/protos/membership.proto
 python setup_fast_rabin.py build_ext --inplace
 ```
 
-## Prueba local sin red
+## Configuración y nodos P2P
 
-Crear una carpeta de prueba:
-
-```bash
-mkdir -p test_data/docs
-printf "hola mundo\n" > test_data/archivo.txt
-printf "contenido interno\n" > test_data/docs/info.txt
-```
-
-Crear un snapshot:
+Generar configuración base local:
 
 ```bash
-python -m stopan backup test_data
+python -m stopan init node --config node.yaml --advertise-addr localhost:50051
 ```
 
-Indicar el número de hilos para procesar archivos:
-
-```bash
-python -m stopan backup test_data 4
-```
-
-Crear un snapshot con recorrido determinista:
-
-```bash
-python -m stopan backup test_data 4 --deterministic
-```
-
-Activar el fast-path local para reutilizar chunks ya presentes en el CAS:
-
-```bash
-python -m stopan backup test_data 4 --fast
-```
-
-Activar el fast-path remoto para saltar chunks que ya tienen evidencia suficiente de protección remota:
-
-```bash
-python -m stopan backup test_data 4 --fast-remote --seed localhost:50051 --rf 3
-```
-
-Forzar modo seguro, procesando todo sin saltos rápidos:
-
-```bash
-python -m stopan backup test_data 4 --safe
-```
-
-Restaurar el snapshot 1 en otra carpeta:
-
-```bash
-python -m stopan restore 1 restore_out
-```
-
-## Levantar nodos P2P con Docker
-
-Construir y arrancar los nodos definidos en `docker-compose.yml`:
+Levantar nodos P2P con Docker (membership SWIM, CAS propio e identidad persistente):
 
 ```bash
 docker compose up --build
 ```
 
-Para pararlos y borrar los volúmenes de prueba:
+## Flujo solo local
+
+Crear una carpeta de prueba y generar un snapshot:
 
 ```bash
-docker compose down -v
+mkdir -p test_data/docs && printf "hola mundo\n" > test_data/archivo.txt
+python -m stopan backup test_data
 ```
 
-El `docker-compose.yml` define nodos con membership SWIM, repositorio CAS propio, identidad persistente por nodo y variables de rendimiento para replicación, verificación, restore y commit de almacenamiento.
-
-## Sincronizar chunks a la red
-
-Primero crea al menos un snapshot local:
+Restaurar el snapshot 1 en otra carpeta usando solo la metadata y el CAS local:
 
 ```bash
-python -m stopan backup test_data 4 --deterministic --rf 3
+python -m stopan restore 1 --out restore_out
 ```
 
-Con los nodos levantados, enviar los chunks pendientes usando replication factor 3:
+## Flujo conectado a la red
+
+Con los nodos levantados, proteger los chunks pendientes en 1 nodo remoto:
 
 ```bash
-python -m stopan push --seed localhost:50051 --rf 3
+python -m stopan push --membership-seed localhost:50051 --rf 1
 ```
 
-Opciones útiles:
+Auditar la protección remota registrada:
 
 ```bash
-python -m stopan push   --seed localhost:50051   --rf 3   --target-parallelism 4   --probe-batch-hashes 2048   --stream-inflight 64   --probe-timeout-s 10   --stream-timeout-s 60
+python -m stopan verify --membership-seed localhost:50051
 ```
 
-Por defecto, `stopan push` aplica RF estricto: si no hay suficientes candidatos remotos para cumplir el RF deseado, no modifica `chunk_protection`.
-
-Para permitir protección best-effort:
+Restaurar permitiendo recuperación remota desde nodos P2P:
 
 ```bash
-python -m stopan push --seed localhost:50051 --rf 3 --no-strict-rf
+python -m stopan restore 1 --out restored_from_network --membership-seed localhost:50051 --rf 1
 ```
 
-## Verificar protección remota
+> **Nota:** Para probar recuperación desde red, después de hacer `push` se puede apartar o borrar el repositorio local `_data_chunks` y ejecutar `restore` de nuevo.
 
-Después de hacer `push`, se puede auditar la protección remota:
+## Metadata
+
+Stopan permite separar la operativa de metadatos en flujos estrictamente locales o distribuidos.
+
+### Metadata local / offline
+
+Crear una identidad de metadata:
 
 ```bash
-python -m stopan verify --seed localhost:50051
+python -m stopan metadata identity-create --identity-file id.json --passphrase-file pass.txt
 ```
 
-Opciones útiles:
+Se puede realizar un backup que actualice automáticamente el object graph local y genere un pack:
 
 ```bash
-python -m stopan verify   --seed localhost:50051   --target-parallelism 4   --probe-batch-hashes 2048   --probe-timeout-s 10
+python -m stopan backup test_data --metadata-passphrase-file pass.txt --metadata-identity-file id.json --metadata-object-store meta_store --metadata-object-pack
 ```
 
-Para volver a comprobar también chunks ya marcados como `VERIFIED`:
+Alternativamente, el flujo manual permite exportar el grafo, empaquetarlo e importarlo paso a paso:
 
 ```bash
-python -m stopan verify --seed localhost:50051 --reverify-verified
+python -m stopan metadata export-graph --object-store meta_store --passphrase-file pass.txt --identity-file id.json
+python -m stopan metadata pack-graph --object-store meta_store --passphrase-file pass.txt --identity-file id.json --out latest.stopanmetapack
+python -m stopan metadata import-pack latest.stopanmetapack --object-store imported_store --passphrase-file pass.txt --identity-file id.json
+python -m stopan metadata import-graph --object-store imported_store --passphrase-file pass.txt
 ```
 
-El verifier actualiza `chunk_protection`:
+### Metadata conectada a la red
 
-- `VERIFIED` si el chunk tiene suficientes copias remotas comprobadas;
-- `DEGRADED` si faltan copias o hay errores al comprobar targets.
-
-## Restaurar usando caché local o red
-
-Si el bloque existe en el repositorio local, `restore` lo usa directamente. Si falta, intenta recuperarlo desde los nodos P2P que le corresponden.
+Distribuir el último pack de metadata a la red P2P (1 copia remota):
 
 ```bash
-python -m stopan restore 1 restored --seed localhost:50051 --rf 3
+python -m stopan metadata push --object-store meta_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --rf 1
 ```
 
-Opciones útiles:
+Recuperar metadata desde packs remotos y reconstruir un object store local en un nodo nuevo:
 
 ```bash
-python -m stopan restore 1 restored   --seed localhost:50051   --rf 3   --batch-target-parallelism 4   --prefetch-window 32
+python -m stopan metadata recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051
 ```
 
-Para probar la recuperación desde red, una vez hecho `push`, se puede apartar o borrar el repositorio local `_data_chunks` y ejecutar `restore` de nuevo.
+## GC de metadata
+
+Stopan incluye comandos de garbage collection para limpiar objetos y packs de metadata que ya no son necesarios (se recomienda usar `--dry-run` primero para verificar qué se eliminará sin modificar el store).
+
+Limpieza local del object store (detecta objetos o packs que no forman parte del estado vivo):
+
+```bash
+python -m stopan metadata gc --object-store meta_store --passphrase-file pass.txt --identity-file id.json --dry-run
+```
+
+Limpieza del store distribuido de packs (se ejecuta en el nodo que mantiene el store remoto):
+
+```bash
+python -m stopan metadata-store-gc --config configs/node1.yaml --dry-run
+```
+
+*(Para aplicar la limpieza de forma definitiva, se sustituye el flag `--dry-run` por `--apply`).*

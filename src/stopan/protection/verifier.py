@@ -1,26 +1,31 @@
+"""
+Verificación de protección remota de chunks.
+
+El verifier reevalúa el placement HRW vigente y usa ProbeMissingChunks para
+confirmar copias remotas sin descargar blobs completos.
+"""
+
 from __future__ import annotations
 
-import os
-import threading
+import sys
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import grpc
 
-from stopan.protos import p2p_storage_pb2
-from stopan.protos import p2p_storage_pb2_grpc
+from stopan.common.batching import iter_batches
 from stopan.metadata.database import MetadataDB, VerificationCandidate
-from stopan.placement.cluster_view import ClusterMembershipClient
-from stopan.protection.verify_config import (
-    CLUSTER_TOKEN,
-    DB_FILE,
-    DEFAULT_MAX_MESSAGE_BYTES,
-    DEFAULT_PROBE_BATCH_HASHES,
-    DEFAULT_PROBE_TIMEOUT_S,
-    DEFAULT_TARGET_PARALLELISM,
+from stopan.metadata.objects.graph.auto_export import (
+    MetadataObjectGraphAutoExport,
+    export_metadata_object_graph_after_metadata_change,
 )
-from stopan.protection.verify_models import (
+from stopan.placement.cluster_resolver import require_cluster_view
+from stopan.protection.policy import normalize_remote_rf
+from stopan.protos import p2p_storage_pb2
+from stopan.rpc.errors import format_rpc_error
+from stopan.rpc.p2p_storage_pool import P2PStorageStubPool
+
+from .verify_models import (
     ProbeExecutionResult,
     VerificationAccumulator,
     VerificationOutcome,
@@ -28,54 +33,15 @@ from stopan.protection.verify_models import (
 )
 
 
-class ProbeClientPool:
-    """
-    Reusable gRPC client pool for verifier probes.
-    """
-
-    def __init__(self, *, max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES):
-        self._lock = threading.Lock()
-        self._channels: dict[str, grpc.Channel] = {}
-        self._stubs: dict[str, p2p_storage_pb2_grpc.P2PStorageStub] = {}
-        self._options = [
-            ("grpc.max_send_message_length", int(max_message_bytes)),
-            ("grpc.max_receive_message_length", int(max_message_bytes)),
-            ("grpc.keepalive_time_ms", 30_000),
-            ("grpc.keepalive_timeout_ms", 10_000),
-            ("grpc.http2.max_pings_without_data", 0),
-            ("grpc.keepalive_permit_without_calls", 1),
-        ]
-
-    def get_stub(self, address: str) -> p2p_storage_pb2_grpc.P2PStorageStub:
-        with self._lock:
-            stub = self._stubs.get(address)
-            if stub is not None:
-                return stub
-
-            channel = grpc.insecure_channel(address, options=self._options)
-            stub = p2p_storage_pb2_grpc.P2PStorageStub(channel)
-            self._channels[address] = channel
-            self._stubs[address] = stub
-            return stub
-
-    def close(self) -> None:
-        with self._lock:
-            for channel in self._channels.values():
-                channel.close()
-            self._channels.clear()
-            self._stubs.clear()
-
-
 class ChunkProtectionVerifier:
     """
-    Canonical remote protection auditor.
+    Auditor canónico de protección remota.
 
-    Contract:
-      - does not transfer chunk blobs;
-      - uses only ProbeMissingChunks;
-      - recalculates current HRW placement for each chunk;
-      - excludes the snapshot origin node from remote protection;
-      - converts PLACED/DEGRADED evidence into VERIFIED or DEGRADED.
+    Contrato:
+      - no transfiere blobs;
+      - solo usa ProbeMissingChunks;
+      - reevalúa el placement HRW vigente para cada chunk;
+      - convierte evidencia PLACED/DEGRADED en VERIFIED o DEGRADED.
     """
 
     def __init__(
@@ -85,42 +51,52 @@ class ChunkProtectionVerifier:
         cluster,
         cluster_token: str,
         origin_node_id: str,
-        probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
-        target_parallelism: int = DEFAULT_TARGET_PARALLELISM,
-        probe_batch_hashes: int = DEFAULT_PROBE_BATCH_HASHES,
-        max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        self_addr: str,
+        probe_timeout_s: float,
+        target_parallelism: int,
+        probe_batch_hashes: int,
+        max_message_bytes: int,
     ):
-        origin_node_id = str(origin_node_id).strip()
-        if not origin_node_id:
-            raise ValueError("ChunkProtectionVerifier requires a non-empty origin_node_id.")
-
         self.db = db
         self.cluster = cluster
-        self.cluster_token = cluster_token
-        self.origin_node_id = origin_node_id
-        self._excluded_node_ids = frozenset({origin_node_id})
+        self.cluster_token = str(cluster_token)
+        self.origin_node_id = str(origin_node_id).strip()
+        if not self.origin_node_id:
+            raise ValueError("ChunkProtectionVerifier requiere origin_node_id no vacío.")
+
+        self.self_addr = str(self_addr).strip()
+        self._excluded_node_ids = frozenset({self.origin_node_id})
+
         self.probe_timeout_s = float(probe_timeout_s)
         self.target_parallelism = max(1, int(target_parallelism))
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
-        self._client_pool = ProbeClientPool(max_message_bytes=max_message_bytes)
+        self._client_pool = P2PStorageStubPool(max_message_bytes=max_message_bytes)
         self._epoch_cache: dict[int, str] = {}
 
     def close(self) -> None:
         self._client_pool.close()
 
     def verify(self, candidates: list[VerificationCandidate]) -> VerificationStats:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if normalize_remote_rf(candidate.desired_rf, field_name="candidate.desired_rf") > 0
+        ]
+
         if not candidates:
-            print("No chunks are pending verification.")
+            print("No hay chunks candidatos con protección remota que verificar.")
             return VerificationStats()
 
-        remote_candidates = len(
+        print(f"Verify: {len(candidates)} chunks candidatos")
+        print(f"Miembros elegibles: {[f'{member.node_id[:8]}@{member.address}' for member in self.cluster.members]}")
+        if self.cluster.self_node_id:
+            print(f"Nodo local: {self.cluster.self_node_id[:8]}@{self.self_addr}")
+
+        remote_candidate_count = len(
             self.cluster.candidate_node_ids_excluding(self._excluded_node_ids)
         )
-
-        print(f"Verify: {len(candidates)} candidate chunks")
-        print(f"Eligible members: {[f'{member.node_id[:8]}@{member.address}' for member in self.cluster.members]}")
-        print(f"Origin node: {self.origin_node_id[:8]}")
-        print(f"Remote candidates: {remote_candidates}")
+        print(f"Origin excluido de protección: {self.origin_node_id[:8]}")
+        print(f"Candidatos remotos: {remote_candidate_count}")
         print(
             f"Pipeline: target_parallelism={self.target_parallelism} "
             f"probe_batch_hashes={self.probe_batch_hashes} "
@@ -148,13 +124,13 @@ class ChunkProtectionVerifier:
                 desired_rf=outcome.desired_rf,
                 protected_remote_copies=outcome.verified_remote_copies,
                 placement_epoch=outcome.placement_epoch,
-                error=outcome.error or "verification failed",
+                error=outcome.error or "verificación fallida",
             )
             degraded += 1
             if outcome.error and "RPC" in outcome.error:
                 rpc_failures += 1
             print(
-                f"   {outcome.chunk_hash[:8]} degraded: "
+                f"   {outcome.chunk_hash[:8]} degradado: "
                 f"verified={outcome.verified_remote_copies}/{outcome.required_remote_copies} "
                 f"error={outcome.error}"
             )
@@ -171,7 +147,13 @@ class ChunkProtectionVerifier:
 
         if target_chunks:
             max_workers = min(self.target_parallelism, len(target_chunks))
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="verify-probe") as executor:
+            executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="verify-probe",
+            )
+            future_map = {}
+
+            try:
                 future_map = {
                     executor.submit(
                         self._execute_target_probe,
@@ -194,7 +176,7 @@ class ChunkProtectionVerifier:
                             address=member.address,
                             requested_hashes=tuple(planned_hashes),
                             present_hashes=frozenset(),
-                            transport_error=f"target probe crashed: {exc}",
+                            transport_error=f"probe del target falló: {exc}",
                         )
 
                     if result.transport_error:
@@ -206,6 +188,14 @@ class ChunkProtectionVerifier:
                     for chunk_hash in result.requested_hashes:
                         if chunk_hash in result.present_hashes:
                             accumulators[chunk_hash].verified_remote_copies += 1
+
+            except BaseException:
+                for future in future_map:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True, cancel_futures=False)
 
         outcomes: list[VerificationOutcome] = []
         for candidate in candidates:
@@ -225,25 +215,51 @@ class ChunkProtectionVerifier:
         return outcomes
 
     def _plan(self, candidates: list[VerificationCandidate]):
+        """
+        Agrupa las consultas por target remoto.
+
+        Para cada chunk recalcula sus targets HRW excluyendo origin_node_id. El
+        resultado permite consultar cada nodo una sola vez por lote de hashes.
+        """
+
         accumulators: dict[str, VerificationAccumulator] = {}
         target_chunks: dict[str, list[str]] = defaultdict(list)
         target_members: dict[str, object] = {}
 
         for candidate in candidates:
-            desired_rf = max(int(candidate.desired_rf), 1)
-            placement_epoch = self._placement_epoch(desired_rf)
-            remote_targets = self.cluster.hrw_targets_excluding(
-                candidate.chunk_hash,
-                rf=desired_rf,
-                salt=self.cluster_token,
-                excluded_node_ids=self._excluded_node_ids,
+            desired_rf = normalize_remote_rf(candidate.desired_rf, field_name="candidate.desired_rf")
+            required_remote_copies = desired_rf
+            placement_epoch = (
+                self._placement_epoch(required_remote_copies)
+                if required_remote_copies > 0
+                else ""
+            )
+            remote_targets = (
+                self.cluster.hrw_targets_excluding(
+                    candidate.chunk_hash,
+                    rf=required_remote_copies,
+                    salt=self.cluster_token,
+                    excluded_node_ids=self._excluded_node_ids,
+                )
+                if required_remote_copies > 0
+                else []
             )
 
-            accumulators[candidate.chunk_hash] = VerificationAccumulator(
+            accumulator = VerificationAccumulator(
                 desired_rf=desired_rf,
                 placement_epoch=placement_epoch,
-                required_remote_copies=len(remote_targets),
+                required_remote_copies=required_remote_copies,
             )
+
+            if len(remote_targets) < required_remote_copies:
+                accumulator.errors.append(
+                    "targets remotos elegibles insuficientes: "
+                    f"planned={len(remote_targets)} "
+                    f"required_remote_copies={required_remote_copies} "
+                    f"desired_rf={desired_rf}"
+                )
+
+            accumulators[candidate.chunk_hash] = accumulator
 
             for member in remote_targets:
                 target_chunks[member.address].append(candidate.chunk_hash)
@@ -251,27 +267,40 @@ class ChunkProtectionVerifier:
 
         return accumulators, target_chunks, target_members
 
-    def _placement_epoch(self, desired_rf: int) -> str:
-        desired_rf = max(int(desired_rf), 1)
-        cached = self._epoch_cache.get(desired_rf)
+    def _placement_epoch(self, required_remote_copies: int) -> str:
+        required_remote_copies = normalize_remote_rf(
+            required_remote_copies,
+            field_name="required_remote_copies",
+        )
+        if required_remote_copies == 0:
+            return ""
+        cached = self._epoch_cache.get(required_remote_copies)
         if cached is not None:
             return cached
 
         epoch = self.cluster.placement_epoch_excluding(
-            desired_rf=desired_rf,
+            desired_rf=required_remote_copies,
             cluster_token=self.cluster_token,
             excluded_node_ids=self._excluded_node_ids,
         )
-        self._epoch_cache[desired_rf] = epoch
+        self._epoch_cache[required_remote_copies] = epoch
         return epoch
 
     def _execute_target_probe(self, member, chunk_hashes: list[str]) -> ProbeExecutionResult:
+        """
+        Consulta un target remoto con ProbeMissingChunks.
+
+        Devuelve hashes presentes sin descargar blobs completos. Los
+        errores de transporte se encapsulan en ProbeExecutionResult para que el
+        caller pueda degradar los chunks afectados.
+        """
+
         ordered_hashes = tuple(dict.fromkeys(chunk_hashes))
         present_hashes: set[str] = set()
 
         try:
             stub = self._client_pool.get_stub(member.address)
-            for batch in iter_hash_batches(ordered_hashes, self.probe_batch_hashes):
+            for batch in iter_batches(ordered_hashes, self.probe_batch_hashes):
                 requested = set(batch)
                 response = stub.ProbeMissingChunks(
                     p2p_storage_pb2.ProbeMissingChunksRequest(chunk_hashes=batch),
@@ -306,85 +335,53 @@ class ChunkProtectionVerifier:
             )
 
 
-def iter_hash_batches(chunk_hashes: Sequence[str], batch_size: int) -> Iterator[list[str]]:
-    batch_size = max(1, int(batch_size))
-    current: list[str] = []
-
-    for chunk_hash in chunk_hashes:
-        current.append(chunk_hash)
-        if len(current) >= batch_size:
-            yield current
-            current = []
-
-    if current:
-        yield current
-
-
-def format_rpc_error(exc: grpc.RpcError) -> str:
-    code = "UNKNOWN"
-    details = str(exc)
-
-    try:
-        code = exc.code().name
-    except Exception:
-        pass
-
-    try:
-        details = exc.details() or details
-    except Exception:
-        pass
-
-    return f"{code}: {details}"
-
-
-def resolve_membership_seed(explicit_seed: str | None = None) -> str | None:
-    if explicit_seed:
-        return explicit_seed.strip()
-
-    seeds = [seed.strip() for seed in os.getenv("SEEDS", "").split(",") if seed.strip()]
-    if seeds:
-        return seeds[0]
-
-    advertise_addr = os.getenv("ADVERTISE_ADDR", "").strip()
-    return advertise_addr or None
-
-
-def build_cluster_view(seed: str | None):
-    resolved_seed = resolve_membership_seed(seed)
-    if not resolved_seed:
-        raise ValueError("A non-empty membership seed is required.")
-
-    self_addr = os.getenv("ADVERTISE_ADDR", "")
-    cluster = ClusterMembershipClient(resolved_seed, self_addr=self_addr).get_cluster_view()
-
-    if not cluster.members:
-        raise RuntimeError(f"No eligible members returned by seed {resolved_seed}.")
-
-    if not cluster.self_node_id:
-        raise RuntimeError(
-            "Could not resolve origin_node_id from membership. "
-            "Make sure ADVERTISE_ADDR matches an eligible cluster member."
-        )
-
-    return resolved_seed, cluster
-
-
 def verify_remote_protection(
     *,
-    seed: str | None,
+    membership_seed: str | None,
+    db_file: str,
+    self_addr: str,
+    cluster_token: str,
+    membership_timeout_s: float,
     include_verified: bool,
     limit: int | None,
     target_parallelism: int,
     probe_batch_hashes: int,
     probe_timeout_s: float,
     max_message_bytes: int,
+    metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
 ) -> VerificationStats:
-    db = MetadataDB(DB_FILE)
+    """
+    Ejecuta una verificación remota de chunk_protection.
+
+    Resuelve membership, obtiene candidatos desde metadata, audita los targets
+    esperados mediante ProbeMissingChunks y actualiza cada chunk como VERIFIED
+    o DEGRADED.
+    """
+
+    db = MetadataDB(db_file)
     verifier: ChunkProtectionVerifier | None = None
+    metadata_changed = False
 
     try:
-        resolved_seed, cluster = build_cluster_view(seed)
+        resolved = require_cluster_view(
+            membership_seed=membership_seed,
+            self_addr=self_addr,
+            cluster_token=cluster_token,
+            timeout_s=membership_timeout_s,
+            max_message_bytes=max_message_bytes,
+            missing_seed_message=(
+                "Falta membership seed. Usa '--membership-seed' o configura cluster.seeds."
+            ),
+        )
+        resolved_seed = resolved.seed
+        cluster = resolved.cluster
+
         origin_node_id = cluster.self_node_id
+        if not origin_node_id:
+            raise RuntimeError(
+                "No pude resolver origin_node_id desde membership. "
+                "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
+            )
 
         candidates = db.get_verification_candidates(
             include_verified=include_verified,
@@ -394,8 +391,9 @@ def verify_remote_protection(
         verifier = ChunkProtectionVerifier(
             db=db,
             cluster=cluster,
-            cluster_token=CLUSTER_TOKEN,
+            cluster_token=cluster_token,
             origin_node_id=origin_node_id,
+            self_addr=self_addr,
             probe_timeout_s=probe_timeout_s,
             target_parallelism=target_parallelism,
             probe_batch_hashes=probe_batch_hashes,
@@ -404,12 +402,26 @@ def verify_remote_protection(
 
         print(f"Membership seed: {resolved_seed}")
         if include_verified:
-            print("Reverify mode: VERIFIED chunks are included.")
+            print("Modo reverify: incluyendo chunks ya VERIFIED.")
 
-        return verifier.verify(candidates)
+        stats = verifier.verify(candidates)
+        metadata_changed = bool(candidates)
+        return stats
 
     finally:
         if verifier is not None:
             verifier.close()
         db.commit()
         db.close()
+
+        if (
+            metadata_changed
+            and metadata_object_graph_auto_export is not None
+            and metadata_object_graph_auto_export.enabled
+            and sys.exc_info()[0] is None
+        ):
+            export_metadata_object_graph_after_metadata_change(
+                db_file=db_file,
+                settings=metadata_object_graph_auto_export,
+                context_label="VERIFY",
+            )

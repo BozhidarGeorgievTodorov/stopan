@@ -5,9 +5,10 @@
 /*
  * CDC basado en fingerprint "gear-like".
  *
- * Semántica:
- *   - pre_avg_mask: máscara usada antes de alcanzar avg_size (más estricta)
- *   - post_avg_mask: máscara usada después de avg_size (más relajada)
+ * Contrato:
+ *   - pre_avg_mask: máscara usada antes de alcanzar avg_size (más estricta);
+ *   - post_avg_mask: máscara usada después de avg_size (más relajada);
+ *   - el iterador devuelve offsets absolutos de final de chunk, en orden creciente.
  */
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -24,6 +25,11 @@
 static uint64_t gear_table[256];
 
 static void init_tables(void) {
+    /*
+     * Tabla determinista usada por el fingerprint gear-like.
+     * No depende de aleatoriedad externa para mantener cortes reproducibles.
+     */
+
     uint64_t value = 0x123456789abcdef0ULL;
 
     for (int i = 0; i < 256; i++) {
@@ -36,7 +42,7 @@ static void init_tables(void) {
 
 
 /* ============================================================================
- * Iterador de fronteras
+ * Iterador de puntos de corte
  * ========================================================================== */
 
 typedef struct {
@@ -159,7 +165,7 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
 
 static PyTypeObject ChunkIteratorType = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "core.fast_rabin.ChunkIterator",
+    .tp_name = "stopan.chunking.fast_rabin.ChunkIterator",
     .tp_basicsize = sizeof(ChunkIterator),
     .tp_dealloc = (destructor)ChunkIterator_dealloc,
     .tp_flags = Py_TPFLAGS_DEFAULT,
@@ -192,17 +198,17 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
     }
 
     if (min_size <= 0) {
-        PyErr_SetString(PyExc_ValueError, "min_size must be > 0");
+        PyErr_SetString(PyExc_ValueError, "min_size debe ser > 0");
         return NULL;
     }
 
     if (avg_size < min_size) {
-        PyErr_SetString(PyExc_ValueError, "avg_size must be >= min_size");
+        PyErr_SetString(PyExc_ValueError, "avg_size debe ser >= min_size");
         return NULL;
     }
 
     if (max_size < avg_size) {
-        PyErr_SetString(PyExc_ValueError, "max_size must be >= avg_size");
+        PyErr_SetString(PyExc_ValueError, "max_size debe ser >= avg_size");
         return NULL;
     }
 
@@ -240,14 +246,14 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
  * ========================================================================== */
 
 static PyMethodDef FastRabinMethods[] = {
-    {"get_chunk_boundaries", get_chunk_boundaries, METH_VARARGS, "Return a lazy CDC iterator."},
+    {"get_chunk_boundaries", get_chunk_boundaries, METH_VARARGS, "Devuelve un iterador lazy de puntos de corte CDC."},
     {NULL, NULL, 0, NULL}
 };
 
 static struct PyModuleDef fast_rabin_module = {
     PyModuleDef_HEAD_INIT,
     "fast_rabin",
-    "High-performance FastCDC-style iterator",
+    "Iterador estilo FastCDC",
     -1,
     FastRabinMethods
 };

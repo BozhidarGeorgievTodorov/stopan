@@ -1,86 +1,58 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 
-from stopan.protection.verifier import verify_remote_protection
-from stopan.protection.verify_config import (
-    DEFAULT_MAX_MESSAGE_BYTES,
-    DEFAULT_PROBE_BATCH_HASHES,
-    DEFAULT_PROBE_TIMEOUT_S,
-    DEFAULT_TARGET_PARALLELISM,
-    DEFAULT_SEED,
+from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.metadata_auto_export import (
+    add_metadata_auto_export_args,
+    build_metadata_object_graph_auto_export,
 )
 
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan verify",
-        description="Audita la protección remota de chunks usando HRW y ProbeMissingChunks.",
+        description="Audita protección remota de chunks mediante HRW + ProbeMissingChunks.",
     )
-    parser.add_argument(
-        "--seed",
-        default=DEFAULT_SEED,
-        help="Seed de membership para obtener la vista elegible del cluster",
-    )
-    parser.add_argument(
-        "--probe-timeout-s",
-        type=float,
-        default=DEFAULT_PROBE_TIMEOUT_S,
-        help="Timeout del RPC ProbeMissingChunks en segundos",
-    )
-    parser.add_argument(
-        "--target-parallelism",
-        type=int,
-        default=DEFAULT_TARGET_PARALLELISM,
-        help="Número de targets remotos verificados en paralelo",
-    )
-    parser.add_argument(
-        "--probe-batch-hashes",
-        type=int,
-        default=DEFAULT_PROBE_BATCH_HASHES,
-        help="Hashes por lote de inventario remoto",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Límite de chunks a verificar en esta ejecución",
-    )
-    parser.add_argument(
-        "--reverify-verified",
-        action="store_true",
-        help="Incluye chunks que ya están marcados como VERIFIED",
-    )
-    parser.add_argument(
-        "--max-message-bytes",
-        type=int,
-        default=DEFAULT_MAX_MESSAGE_BYTES,
-        help="Límite de tamaño de mensaje gRPC",
-    )
-    return parser.parse_args()
+    add_config_args(parser)
+
+    parser.add_argument("--membership-seed", default=None, help="Seed de membership para obtener la vista del cluster elegible.")
+    parser.add_argument("--probe-timeout-s", type=float, default=None, help="Timeout del RPC ProbeMissingChunks en segundos.")
+    parser.add_argument("--target-parallelism", type=int, default=None, help="Número de targets procesados en paralelo.")
+    parser.add_argument("--probe-batch-hashes", type=int, default=None, help="Hashes por probe de inventario remoto.")
+    parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a verificar en esta ejecución.")
+    parser.add_argument("--reverify-verified", action="store_true", help="Incluye chunks en estado VERIFIED para auditarlos de nuevo.")
+    parser.add_argument("--max-message-bytes", type=int, default=None, help="Límite de mensaje gRPC.")
+    add_metadata_auto_export_args(parser, context="verify")
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    cfg = load_runtime_config(args)
+    metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+
+    from stopan.protection.verifier import verify_remote_protection
 
     stats = verify_remote_protection(
-        seed=args.seed,
+        membership_seed=args.membership_seed or first_seed(cfg),
+        db_file=cfg.node.db_file,
+        self_addr=cfg.node.advertise_addr,
+        cluster_token=cfg.cluster.token,
+        membership_timeout_s=cfg.membership.rpc_timeout_s,
         include_verified=bool(args.reverify_verified),
         limit=args.limit,
-        target_parallelism=int(args.target_parallelism),
-        probe_batch_hashes=int(args.probe_batch_hashes),
-        probe_timeout_s=float(args.probe_timeout_s),
-        max_message_bytes=int(args.max_message_bytes),
+        target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
+        probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.verify.probe_batch_hashes)),
+        probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
+        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+        metadata_object_graph_auto_export=metadata_object_graph_auto_export,
     )
 
     print("-" * 40)
     print(
-        f"Verify finished. verified={stats.verified}/{stats.candidates} | "
+        f"Verify finalizado. verified={stats.verified}/{stats.candidates} | "
         f"degraded={stats.degraded} | rpc_failures={stats.rpc_failures}"
     )
-
     return 0 if stats.degraded == 0 else 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

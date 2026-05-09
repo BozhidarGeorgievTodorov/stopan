@@ -1,36 +1,6 @@
-x-node-env: &node-env
-  BIND_ADDR: "[::]:50051"
-  SEEDS: "node1:50051,node2:50051,node3:50051,node4:50051"
-  CLUSTER_TOKEN: "oficina-demo"
-
-  REPO_STORE_DIR: "/app/node_store"
-  LOCAL_SHARD_DIR: "/app/state/_data_chunks"
-  DB_FILE: "/app/state/_metadata.db"
-
-  RF: "3"
-  GRPC_MAX_MESSAGE_BYTES: "8388608"
-  MAX_CHUNK_SIZE: "8388608"
-
-  STORAGE_RPC_WORKERS: "64"
-  STORAGE_COMMIT_WORKERS: "16"
-  STORAGE_COMMIT_QUEUE_ITEMS: "256"
-
-  REPLICATION_TARGET_PARALLELISM: "4"
-  REPLICATION_PROBE_BATCH_HASHES: "2048"
-  REPLICATION_STREAM_INFLIGHT: "64"
-  REPLICATION_PROBE_TIMEOUT_S: "10"
-  REPLICATION_STREAM_TIMEOUT_S: "60"
-  REPLICATION_COMMIT_EVERY: "100"
-
-  VERIFIER_TARGET_PARALLELISM: "4"
-  VERIFIER_PROBE_BATCH_HASHES: "2048"
-  VERIFIER_PROBE_TIMEOUT_S: "10"
-
-  RESTORE_BATCH_TARGET_PARALLELISM: "4"
-  RESTORE_PREFETCH_WINDOW: "32"
-
 x-node-common: &node-common
   build: .
+  command: ["python", "-m", "stopan", "node"]
 
 services:
   node1:
@@ -38,22 +8,19 @@ services:
     container_name: p2p_node_1
     ports:
       - "50051:50051"
-    environment:
-      <<: *node-env
-      ADVERTISE_ADDR: "node1:50051"
     volumes:
+      - ./configs/node1.yaml:/etc/stopan/node.yaml:ro
       - node1_data:/app/node_store
       - node1_state:/app/state
+      - ./test_data:/app/test_data:ro
 
   node2:
     <<: *node-common
     container_name: p2p_node_2
     ports:
       - "50052:50051"
-    environment:
-      <<: *node-env
-      ADVERTISE_ADDR: "node2:50051"
     volumes:
+      - ./configs/node2.yaml:/etc/stopan/node.yaml:ro
       - node2_data:/app/node_store
       - node2_state:/app/state
 
@@ -62,10 +29,8 @@ services:
     container_name: p2p_node_3
     ports:
       - "50053:50051"
-    environment:
-      <<: *node-env
-      ADVERTISE_ADDR: "node3:50051"
     volumes:
+      - ./configs/node3.yaml:/etc/stopan/node.yaml:ro
       - node3_data:/app/node_store
       - node3_state:/app/state
 
@@ -74,10 +39,8 @@ services:
     container_name: p2p_node_4
     ports:
       - "50054:50051"
-    environment:
-      <<: *node-env
-      ADVERTISE_ADDR: "node4:50051"
     volumes:
+      - ./configs/node4.yaml:/etc/stopan/node.yaml:ro
       - node4_data:/app/node_store
       - node4_state:/app/state
 

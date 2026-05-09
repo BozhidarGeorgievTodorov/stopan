@@ -1,23 +1,28 @@
+"""
+Motor de commit para chunks recibidos por gRPC.
+
+Valida chunks comprimidos antes de incorporarlos al CAS local: formato de hash,
+Zstandard, tamaño máximo descomprimido y BLAKE3 del contenido raw.
+"""
+
 from __future__ import annotations
 
-import os
 import threading
 from concurrent import futures
 from dataclasses import dataclass
 
 import blake3
+from stopan.protos import p2p_storage_pb2
 import zstandard as zstd
 
+from stopan.cas.hashes import is_valid_chunk_hash
 from stopan.cas.repository import CASRepository
-from stopan.protos import p2p_storage_pb2
 
 
-MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", str(8 * 1024 * 1024)))
-STORAGE_COMMIT_WORKERS = int(os.getenv("STORAGE_COMMIT_WORKERS", str(max(4, (os.cpu_count() or 4)))))
-STORAGE_COMMIT_QUEUE_ITEMS = int(os.getenv("STORAGE_COMMIT_QUEUE_ITEMS", "256"))
+_SUBMIT_SLOT_ACQUIRE_TIMEOUT_S = 0.05
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StorageCommitResult:
     chunk_hash: str
     status: int
@@ -39,41 +44,70 @@ class StorageCommitEngine:
     persistir bloques en el CAS. La cola acotada aplica backpressure cuando
     el disco o la CPU no siguen el ritmo del stream.
     """
-
-    def __init__(self, repo: CASRepository):
+    def __init__(
+        self,
+        repo: CASRepository,
+        *,
+        max_chunk_size: int,
+        worker_count: int,
+        max_pending: int,
+    ):
         self.repo = repo
-        self._max_chunk_size = MAX_CHUNK_SIZE
-        self._slots = threading.Semaphore(max(1, STORAGE_COMMIT_QUEUE_ITEMS))
+        self._max_chunk_size = max(1, int(max_chunk_size))
+        self._worker_count = max(1, int(worker_count))
+        self._max_pending = max(1, int(max_pending))
+        self._slots = threading.Semaphore(self._max_pending)
         self._executor = futures.ThreadPoolExecutor(
-            max_workers=STORAGE_COMMIT_WORKERS,
+            max_workers=self._worker_count,
             thread_name_prefix="storage-commit",
         )
         self._tls = threading.local()
+        self._closed = threading.Event()
+        self._lifecycle_lock = threading.Lock()
 
     @property
     def worker_count(self) -> int:
-        return STORAGE_COMMIT_WORKERS
+        return self._worker_count
 
     @property
     def max_pending(self) -> int:
-        return STORAGE_COMMIT_QUEUE_ITEMS
+        return self._max_pending
+
+    @property
+    def max_chunk_size(self) -> int:
+        return self._max_chunk_size
 
     def close(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        with self._lifecycle_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            executor = self._executor
+
+        executor.shutdown(wait=True, cancel_futures=False)
 
     def _decompressor(self) -> zstd.ZstdDecompressor:
-        decompressor = getattr(self._tls, "decompressor", None)
-        if decompressor is None:
-            decompressor = zstd.ZstdDecompressor()
-            self._tls.decompressor = decompressor
-        return decompressor
+        value = getattr(self._tls, "decompressor", None)
+        if value is None:
+            value = zstd.ZstdDecompressor()
+            self._tls.decompressor = value
+        return value
 
     def process_one(self, chunk_hash: str, chunk_data: bytes) -> StorageCommitResult:
+        """Valida un chunk comprimido y lo incorpora al CAS si es correcto."""
+
+        if not is_valid_chunk_hash(chunk_hash):
+            return StorageCommitResult(
+                chunk_hash=str(chunk_hash),
+                status=p2p_storage_pb2.STORE_STATUS_REJECTED_HASH_MISMATCH,
+                detail="chunk_hash inválido: se esperaba BLAKE3 hex lowercase de 64 caracteres",
+            )
+
         if self.repo.exists_local(chunk_hash):
             return StorageCommitResult(
                 chunk_hash=chunk_hash,
                 status=p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
-                detail="already present",
+                detail="Chunk ya presente",
             )
 
         try:
@@ -85,13 +119,13 @@ class StorageCommitEngine:
             return StorageCommitResult(
                 chunk_hash=chunk_hash,
                 status=p2p_storage_pb2.STORE_STATUS_REJECTED_CORRUPT,
-                detail="rejected: corrupt zstd data",
+                detail="zstd corrupto",
             )
         except Exception:
             return StorageCommitResult(
                 chunk_hash=chunk_hash,
                 status=p2p_storage_pb2.STORE_STATUS_REJECTED_CORRUPT,
-                detail="rejected: decompressed output too large",
+                detail="salida descomprimida demasiado grande",
             )
 
         calculated_hash = blake3.blake3(raw).hexdigest()
@@ -99,11 +133,11 @@ class StorageCommitEngine:
             return StorageCommitResult(
                 chunk_hash=chunk_hash,
                 status=p2p_storage_pb2.STORE_STATUS_REJECTED_HASH_MISMATCH,
-                detail="rejected: hash mismatch",
+                detail="hash no coincide",
             )
 
         try:
-            is_new = self.repo.put_compressed(chunk_hash, chunk_data)
+            written = self.repo.put_compressed(chunk_hash, chunk_data)
         except Exception as exc:
             return StorageCommitResult(
                 chunk_hash=chunk_hash,
@@ -111,22 +145,46 @@ class StorageCommitEngine:
                 detail=str(exc),
             )
 
-        if is_new:
+        if written:
             return StorageCommitResult(
                 chunk_hash=chunk_hash,
                 status=p2p_storage_pb2.STORE_STATUS_STORED,
-                detail="stored",
+                detail="guardado",
             )
 
         return StorageCommitResult(
             chunk_hash=chunk_hash,
             status=p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
-            detail="already present",
+            detail="chunk ya presente",
         )
 
-    def submit(self, chunk_hash: str, chunk_data: bytes):
-        self._slots.acquire()
-        future = self._executor.submit(self.process_one, chunk_hash, chunk_data)
+    def submit(
+        self,
+        chunk_hash: str,
+        chunk_data: bytes,
+        *,
+        cancel_event: threading.Event | None = None,
+    ):
+        """Agenda un commit aplicando backpressure mediante slots acotados."""
+
+        while True:
+            if self._closed.is_set():
+                raise RuntimeError("commit engine cerrado")
+
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("submit de commit cancelado")
+
+            if self._slots.acquire(timeout=_SUBMIT_SLOT_ACQUIRE_TIMEOUT_S):
+                break
+
+        try:
+            with self._lifecycle_lock:
+                if self._closed.is_set():
+                    raise RuntimeError("commit engine cerrado")
+                future = self._executor.submit(self.process_one, chunk_hash, chunk_data)
+        except Exception:
+            self._slots.release()
+            raise
 
         def release_slot(_):
             self._slots.release()

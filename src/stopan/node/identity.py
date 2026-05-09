@@ -1,9 +1,47 @@
+"""
+Identidad persistente de nodo P2P.
+
+Cada nodo mantiene un node_id estable y una incarnation que aumenta en cada
+arranque. El formato persistido es estricto: dos líneas, node_id e incarnation.
+"""
+
 from __future__ import annotations
 
 import os
 import threading
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
+
+from stopan.common.fs import atomic_write_bytes
+
+
+_NODE_ID_HEX_ALPHABET = set("0123456789abcdef")
+
+
+def _require_node_id(value: str, *, source: str) -> str:
+    node_id = str(value).strip()
+    if len(node_id) != 32 or any(char not in _NODE_ID_HEX_ALPHABET for char in node_id):
+        raise RuntimeError(
+            f"Archivo de identidad inválido: node_id debe tener 32 caracteres "
+            f"hexadecimales lowercase en {source}"
+        )
+    return node_id
+
+
+def _require_incarnation(value: int, *, source: str) -> int:
+    try:
+        incarnation = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Archivo de identidad inválido: incarnation debe ser un entero en {source}"
+        ) from exc
+
+    if incarnation < 1:
+        raise RuntimeError(
+            f"Archivo de identidad inválido: incarnation debe ser >= 1 en {source}"
+        )
+    return incarnation
 
 
 @dataclass(frozen=True)
@@ -36,6 +74,8 @@ class NodeIdentityStore:
         self._lock = threading.Lock()
 
     def load_for_startup(self) -> NodeIdentity:
+        """Carga o crea la identidad del nodo e incrementa incarnation para este arranque."""
+
         with self._lock:
             if os.path.exists(self.file_path):
                 node_id, incarnation = self._read_unlocked()
@@ -48,19 +88,21 @@ class NodeIdentityStore:
             return NodeIdentity(node_id=node_id, incarnation=next_incarnation)
 
     def bump_above(self, *, node_id: str, observed_incarnation: int) -> int:
+        """Eleva incarnation por encima de una incarnation observada en membership."""
+
         node_id = str(node_id).strip()
         if not node_id:
-            raise ValueError("NodeIdentityStore.bump_above requires a non-empty node_id.")
+            raise ValueError("NodeIdentityStore.bump_above requiere node_id no vacío.")
 
         observed_incarnation = int(observed_incarnation)
         if observed_incarnation < 0:
-            raise ValueError("observed_incarnation must be >= 0.")
+            raise ValueError("observed_incarnation debe ser >= 0.")
 
         with self._lock:
             stored_node_id, stored_incarnation = self._read_unlocked()
             if stored_node_id != node_id:
                 raise RuntimeError(
-                    "Persisted node_id is inconsistent: "
+                    "node_id persistido inconsistente: "
                     f"store={stored_node_id} runtime={node_id}"
                 )
 
@@ -74,41 +116,23 @@ class NodeIdentityStore:
 
         if len(lines) != 2:
             raise RuntimeError(
-                f"Invalid node identity file format: {self.file_path}. "
-                "Expected exactly two lines: node_id and incarnation."
+                f"Formato inválido de archivo de identidad: {self.file_path}. "
+                "Se esperaban exactamente dos líneas: node_id e incarnation."
             )
 
-        node_id = lines[0]
-        if not node_id:
-            raise RuntimeError(f"Invalid node identity file: empty node_id in {self.file_path}")
-
-        try:
-            incarnation = int(lines[1])
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Invalid node identity file: incarnation must be an integer in {self.file_path}"
-            ) from exc
-
-        if incarnation < 1:
-            raise RuntimeError(
-                f"Invalid node identity file: incarnation must be >= 1 in {self.file_path}"
-            )
-
+        node_id = _require_node_id(lines[0], source=self.file_path)
+        incarnation = _require_incarnation(lines[1], source=self.file_path)
         return node_id, incarnation
 
     def _write_unlocked(self, *, node_id: str, incarnation: int) -> None:
-        node_id = str(node_id).strip()
-        if not node_id:
-            raise ValueError("NodeIdentityStore requires a non-empty node_id.")
+        try:
+            node_id = _require_node_id(node_id, source=self.file_path)
+            incarnation = _require_incarnation(incarnation, source=self.file_path)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
 
-        incarnation = int(incarnation)
-        if incarnation < 1:
-            raise ValueError("NodeIdentityStore requires incarnation >= 1.")
-
-        os.makedirs(self.root_path, exist_ok=True)
-        temp_path = f"{self.file_path}.{uuid.uuid4().hex}.tmp"
-
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            handle.write(f"{node_id}\n{incarnation}\n")
-
-        os.replace(temp_path, self.file_path)
+        atomic_write_bytes(
+            Path(self.file_path),
+            f"{node_id}\n{incarnation}\n".encode("utf-8"),
+            mode=0o600,
+        )

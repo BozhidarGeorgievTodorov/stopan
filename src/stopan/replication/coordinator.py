@@ -1,11 +1,26 @@
+"""
+Coordinación de replicación remota de chunks.
+
+El coordinator planifica targets remotos mediante HRW, consulta qué chunks faltan
+en cada nodo con ProbeMissingChunks y envía únicamente los chunks ausentes usando
+streaming gRPC.
+"""
+
 from __future__ import annotations
 
-import os
 import threading
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from stopan.config.defaults import (
+    DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    DEFAULT_REPLICATION_PROBE_BATCH_HASHES,
+    DEFAULT_REPLICATION_PROBE_TIMEOUT_S,
+    DEFAULT_REPLICATION_STREAM_INFLIGHT,
+    DEFAULT_REPLICATION_STREAM_TIMEOUT_S,
+    DEFAULT_REPLICATION_TARGET_PARALLELISM,
+)
 from stopan.protos import p2p_storage_pb2
 from stopan.replication.outcomes import (
     ChunkAccumulator,
@@ -14,20 +29,17 @@ from stopan.replication.outcomes import (
     TargetAck,
     TargetExecutionResult,
 )
-from stopan.replication.rpc_pool import StorageRpcPool
 from stopan.replication.streaming import TargetStreamingSession
-
-
-DEFAULT_PROBE_TIMEOUT_S = float(os.getenv("REPLICATION_PROBE_TIMEOUT_S", "10.0"))
-DEFAULT_STREAM_TIMEOUT_S = float(os.getenv("REPLICATION_STREAM_TIMEOUT_S", "60.0"))
-DEFAULT_TARGET_PARALLELISM = int(os.getenv("REPLICATION_TARGET_PARALLELISM", "4"))
-DEFAULT_PROBE_BATCH_HASHES = int(os.getenv("REPLICATION_PROBE_BATCH_HASHES", "2048"))
-DEFAULT_STREAM_INFLIGHT = int(os.getenv("REPLICATION_STREAM_INFLIGHT", "64"))
-DEFAULT_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(8 * 1024 * 1024)))
+from stopan.rpc.p2p_storage_pool import P2PStorageStubPool
 
 
 class StreamingReplicationCoordinator:
-    """Coordina la protección RF usando probe por lotes y streaming de chunks."""
+    """
+    Coordina la protección RF remota usando probes por lote y streaming de chunks.
+
+    RF representa copias remotas requeridas. El origin_node_id se excluye del
+    placement porque la copia local del CAS no cuenta como réplica P2P.
+    """
 
     def __init__(
         self,
@@ -37,21 +49,23 @@ class StreamingReplicationCoordinator:
         rf: int,
         cluster_token: str,
         origin_node_id: str,
-        probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
-        stream_timeout_s: float = DEFAULT_STREAM_TIMEOUT_S,
-        target_parallelism: int = DEFAULT_TARGET_PARALLELISM,
-        probe_batch_hashes: int = DEFAULT_PROBE_BATCH_HASHES,
-        stream_inflight: int = DEFAULT_STREAM_INFLIGHT,
-        max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        probe_timeout_s: float = DEFAULT_REPLICATION_PROBE_TIMEOUT_S,
+        stream_timeout_s: float = DEFAULT_REPLICATION_STREAM_TIMEOUT_S,
+        target_parallelism: int = DEFAULT_REPLICATION_TARGET_PARALLELISM,
+        probe_batch_hashes: int = DEFAULT_REPLICATION_PROBE_BATCH_HASHES,
+        stream_inflight: int = DEFAULT_REPLICATION_STREAM_INFLIGHT,
+        max_message_bytes: int = DEFAULT_GRPC_MAX_MESSAGE_BYTES,
     ):
         origin_node_id = str(origin_node_id).strip()
         if not origin_node_id:
-            raise ValueError("StreamingReplicationCoordinator requires a non-empty origin_node_id.")
+            raise ValueError("StreamingReplicationCoordinator requiere origin_node_id no vacío.")
 
         self.repo = repo
         self.cluster = cluster
-        self.rf = max(1, int(rf))
-        self.cluster_token = cluster_token
+        self.rf = int(rf)
+        if self.rf < 1:
+            raise ValueError("StreamingReplicationCoordinator requiere rf >= 1.")
+        self.cluster_token = str(cluster_token or "")
         self.origin_node_id = origin_node_id
         self.probe_timeout_s = float(probe_timeout_s)
         self.stream_timeout_s = float(stream_timeout_s)
@@ -59,7 +73,7 @@ class StreamingReplicationCoordinator:
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
         self.stream_inflight = max(1, int(stream_inflight))
 
-        self._rpc_pool = StorageRpcPool(max_message_bytes=max_message_bytes)
+        self._rpc_pool = P2PStorageStubPool(max_message_bytes=max_message_bytes)
         self._sessions: dict[str, TargetStreamingSession] = {}
         self._sessions_lock = threading.Lock()
 
@@ -87,6 +101,13 @@ class StreamingReplicationCoordinator:
             return session
 
     def _plan(self, chunk_hashes: Sequence[str]):
+        """
+        Calcula targets remotos por chunk y agrupa chunks por target.
+
+        Cada chunk se asigna mediante HRW excluyendo origin_node_id. La agrupación
+        inversa permite consultar y enviar lotes por nodo remoto.
+        """
+
         chunk_targets: dict[str, list] = {}
         target_chunks: dict[str, list[str]] = defaultdict(list)
         target_members: dict[str, object] = {}
@@ -108,6 +129,13 @@ class StreamingReplicationCoordinator:
         return chunk_targets, target_chunks, target_members
 
     def _execute_target_plan(self, member, chunk_hashes: Sequence[str]) -> TargetExecutionResult:
+        """
+        Ejecuta el plan de un target remoto.
+
+        Primero consulta qué chunks faltan en el nodo. Después envía solo los chunks
+        ausentes y conserva ACKs parciales si falla el stream.
+        """
+
         session = self._get_session(member)
         ordered_hashes = list(dict.fromkeys(chunk_hashes))
 
@@ -118,7 +146,7 @@ class StreamingReplicationCoordinator:
                 node_id=member.node_id,
                 address=member.address,
                 acks={},
-                transport_error=f"probe failed: {exc}",
+                transport_error=f"probe falló: {exc}",
             )
 
         acks: dict[str, TargetAck] = {}
@@ -131,7 +159,7 @@ class StreamingReplicationCoordinator:
                     node_id=member.node_id,
                     address=member.address,
                     status=p2p_storage_pb2.STORE_STATUS_ALREADY_PRESENT,
-                    detail="already present on remote target",
+                    detail="ya presente en target remoto",
                 )
 
         if to_send:
@@ -151,7 +179,7 @@ class StreamingReplicationCoordinator:
                     node_id=member.node_id,
                     address=member.address,
                     acks=acks,
-                    transport_error=f"stream replication failed: {exc}",
+                    transport_error=f"replicación por stream falló: {exc}",
                 )
 
         return TargetExecutionResult(
@@ -162,7 +190,14 @@ class StreamingReplicationCoordinator:
         )
 
     def replicate_chunks(self, chunk_hashes: Iterable[str]) -> Iterator[ChunkReplicationOutcome]:
-        ordered_hashes = list(chunk_hashes)
+        """
+        Replica chunks en sus targets remotos y produce un outcome por chunk.
+
+        Los outcomes conservan resultados parciales: un chunk puede quedar DEGRADED
+        si algunos targets confirman almacenamiento y otros fallan.
+        """
+
+        ordered_hashes = list(dict.fromkeys(chunk_hashes))
         chunk_targets, target_chunks, target_members = self._plan(ordered_hashes)
 
         accumulators: dict[str, ChunkAccumulator] = {
@@ -176,10 +211,13 @@ class StreamingReplicationCoordinator:
             if not targets
         }
 
-        with ThreadPoolExecutor(
+        executor = ThreadPoolExecutor(
             max_workers=self.target_parallelism,
             thread_name_prefix="target-stream",
-        ) as executor:
+        )
+        future_map = {}
+
+        try:
             future_map = {
                 executor.submit(self._execute_target_plan, target_members[address], hashes): address
                 for address, hashes in target_chunks.items()
@@ -196,7 +234,7 @@ class StreamingReplicationCoordinator:
                         node_id=member.node_id,
                         address=member.address,
                         acks={},
-                        transport_error=f"target execution crashed: {exc}",
+                        transport_error=f"ejecución del target falló: {exc}",
                     )
 
                 planned_hashes = target_chunks[address]
@@ -215,7 +253,7 @@ class StreamingReplicationCoordinator:
                             accumulators[chunk_hash].errors.append(transport_message)
                         else:
                             accumulators[chunk_hash].errors.append(
-                                f"{target_result.node_id[:8]}@{target_result.address}: missing ack"
+                                f"{target_result.node_id[:8]}@{target_result.address}: falta ACK"
                             )
                         continue
 
@@ -229,18 +267,26 @@ class StreamingReplicationCoordinator:
                             f"{ack.node_id[:8]}@{ack.address}: {ack.detail}"
                         )
 
+        except BaseException:
+            for future in future_map:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True, cancel_futures=False)
+
         for chunk_hash in ordered_hashes:
             accumulator = accumulators[chunk_hash]
 
             if chunk_hash in chunks_without_remote_targets:
                 yield ChunkReplicationOutcome(
                     chunk_hash=chunk_hash,
-                    success=True,
-                    required_remote_copies=0,
+                    success=False,
+                    required_remote_copies=self.rf,
                     protected_remote_copies=0,
                     stored_remote_copies=0,
                     already_present_remote_copies=0,
-                    error=None,
+                    error="no se planificaron targets remotos para el chunk",
                 )
                 continue
 
@@ -251,5 +297,5 @@ class StreamingReplicationCoordinator:
                 protected_remote_copies=accumulator.protected_remote_copies,
                 stored_remote_copies=accumulator.stored_remote_copies,
                 already_present_remote_copies=accumulator.already_present_remote_copies,
-                error=("; ".join(accumulator.errors)[:2000] if accumulator.errors else None),
+                error="; ".join(accumulator.errors) if accumulator.errors else None,
             )

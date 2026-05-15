@@ -4,7 +4,8 @@ Servicio de lectura de chunks para restore.
 La lectura sigue una cadena conservadora:
   1. CAS local;
   2. CAS P2P local;
-  3. red remota mediante RetrieveChunkBatch.
+  3. red remota mediante RetrieveChunkBatch (si está habilitado);
+  4. reconstrucción por data packs EC si sigue faltando el chunk (si está habilitado).
 
 Todo chunk recuperado fuera del CAS local principal se valida con Zstandard y
 BLAKE3 antes de aceptarse.
@@ -20,6 +21,7 @@ import zstandard as zstd
 
 from stopan.cas.repository import CASRepository
 from stopan.restore.cluster import LazyClusterResolver
+from stopan.restore.ec_fetch import ErasureChunkRecoveryService
 from stopan.restore.remote_client import RemoteStorageClientPool
 from stopan.protection.policy import normalize_remote_rf
 from stopan.rpc.errors import format_rpc_error, is_rpc_error
@@ -32,9 +34,10 @@ class ChunkFetchService:
     Prioridad:
       1. CAS local principal;
       2. CAS P2P local del nodo, si existe;
-      3. red bajo demanda con RetrieveChunkBatch.
+      3. red bajo demanda con RetrieveChunkBatch (si remote_chunk_recovery es True);
+      4. reconstrucción por data packs EC si sigue faltando el chunk y ec_recovery_service está presente.
 
-    rf=0 desactiva la búsqueda remota. Los blobs recuperados desde P2P local o
+          rf=0 desactiva la búsqueda remota. Los blobs recuperados desde P2P local o
     red se descomprimen y se validan contra el BLAKE3 esperado antes de usarse.
     """
 
@@ -43,11 +46,13 @@ class ChunkFetchService:
         *,
         repo: CASRepository,
         p2p_local_repo: CASRepository | None,
-        cluster_resolver: LazyClusterResolver,
-        remote_pool: RemoteStorageClientPool,
+        cluster_resolver: LazyClusterResolver | None,
+        remote_pool: RemoteStorageClientPool | None,
         rf: int,
         cluster_token: str,
         max_chunk_size: int,
+        ec_recovery_service: ErasureChunkRecoveryService | None = None,
+        remote_chunk_recovery: bool = True,
     ):
         self.repo = repo
         self.p2p_local_repo = p2p_local_repo
@@ -56,6 +61,8 @@ class ChunkFetchService:
         self.rf = normalize_remote_rf(rf)
         self.cluster_token = str(cluster_token or "").strip()
         self.max_chunk_size = max(int(max_chunk_size), 1)
+        self.ec_recovery_service = ec_recovery_service
+        self.remote_chunk_recovery = bool(remote_chunk_recovery)
 
     def fetch_many_raw_chunks(
         self,
@@ -64,12 +71,11 @@ class ChunkFetchService:
         target_parallelism: int,
     ) -> dict[str, bytes | Exception]:
         """
-        Recupera varios chunks en formato raw.
+        Recupera varios chunks en formato raw siguiendo el orden de prioridades configurado.
 
         Devuelve bytes para los chunks recuperados y Exception para los que no se
         pudieron resolver. No lanza por fallo individual de chunk.
         """
-        
         ordered_hashes = list(chunk_hashes)
         results: dict[str, bytes | Exception] = {}
         missing_hashes: list[str] = []
@@ -108,14 +114,84 @@ class ChunkFetchService:
             missing_hashes.append(chunk_hash)
 
         if missing_hashes:
-            remote_results = self._fetch_missing_many_from_remote(
-                missing_hashes,
-                target_parallelism=max(int(target_parallelism), 1),
-                initial_errors=local_errors,
-            )
+            if self.remote_chunk_recovery:
+                remote_results = self._fetch_missing_many_from_remote(
+                    missing_hashes,
+                    target_parallelism=max(int(target_parallelism), 1),
+                    initial_errors=local_errors,
+                )
+            else:
+                remote_results = self._remote_chunk_recovery_disabled_results(
+                    missing_hashes,
+                    initial_errors=local_errors,
+                )
+
+            if self.ec_recovery_service is not None:
+                remote_results = self._recover_unresolved_with_ec(
+                    missing_hashes,
+                    remote_results,
+                    target_parallelism=max(int(target_parallelism), 1),
+                )
             results.update(remote_results)
 
         return results
+
+    def _remote_chunk_recovery_disabled_results(
+        self,
+        missing_hashes: list[str],
+        *,
+        initial_errors: dict[str, list[str]] | None = None,
+    ) -> dict[str, bytes | Exception]:
+        error_map = {
+            chunk_hash: list((initial_errors or {}).get(chunk_hash, []))
+            for chunk_hash in missing_hashes
+        }
+        return {
+            chunk_hash: FileNotFoundError(
+                f"El chunk {chunk_hash[:8]} no está localmente y la recuperación "
+                "remota por chunks está desactivada. "
+                + " | ".join(error_map[chunk_hash])
+            )
+            for chunk_hash in missing_hashes
+        }
+
+    def _recover_unresolved_with_ec(
+        self,
+        missing_hashes: list[str],
+        remote_results: dict[str, bytes | Exception],
+        *,
+        target_parallelism: int,
+    ) -> dict[str, bytes | Exception]:
+        unresolved = [
+            chunk_hash
+            for chunk_hash in missing_hashes
+            if isinstance(remote_results.get(chunk_hash), Exception)
+        ]
+        if not unresolved:
+            return remote_results
+
+        ec_results = self.ec_recovery_service.recover_many_raw_chunks(
+            unresolved,
+            target_parallelism=target_parallelism,
+        )
+
+        for chunk_hash in unresolved:
+            value = ec_results.get(chunk_hash)
+            if value is None:
+                continue
+            if not isinstance(value, Exception):
+                remote_results[chunk_hash] = value
+                continue
+
+            previous = remote_results.get(chunk_hash)
+            if isinstance(previous, Exception):
+                remote_results[chunk_hash] = FileNotFoundError(
+                    f"{previous} | EC: {value}"
+                )
+            else:
+                remote_results[chunk_hash] = value
+
+        return remote_results
 
     def _validate_compressed_chunk(
         self,
@@ -164,11 +240,12 @@ class ChunkFetchService:
             for chunk_hash in missing_hashes
         }
 
-        if self.rf == 0:
+        if self.rf == 0 or self.cluster_resolver is None or self.remote_pool is None:
             for chunk_hash in missing_hashes:
                 result_map[chunk_hash] = FileNotFoundError(
-                    f"Chunk {chunk_hash[:8]} no encontrado localmente; "
-                    "rf=0 desactiva la búsqueda remota"
+                    f"El chunk {chunk_hash[:8]} no está localmente y la recuperación "
+                    "remota por chunks no está disponible o rf=0. "
+                    + " | ".join(error_map[chunk_hash])
                 )
             return result_map
 

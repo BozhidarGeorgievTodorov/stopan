@@ -4,6 +4,13 @@ service P2PStorage {
   rpc ProbeMissingChunks(ProbeMissingChunksRequest) returns (ProbeMissingChunksResponse);
   rpc ReplicateChunks(stream ReplicateChunkRequest) returns (stream ReplicateChunkResult);
   rpc RetrieveChunkBatch(RetrieveChunkBatchRequest) returns (RetrieveChunkBatchResponse);
+
+  rpc ProbeMissingDataPackShards(ProbeMissingDataPackShardsRequest)
+      returns (ProbeMissingDataPackShardsResponse);
+  rpc ReplicateDataPackShards(stream ReplicateDataPackShardRequest)
+      returns (stream ReplicateDataPackShardResult);
+  rpc RetrieveDataPackShardBatch(RetrieveDataPackShardBatchRequest)
+      returns (RetrieveDataPackShardBatchResponse);
 }
 
 service MetadataPackService {
@@ -60,6 +67,70 @@ message RetrievedChunk {
 
 message RetrieveChunkBatchResponse {
   repeated RetrievedChunk results = 1;
+}
+
+message DataPackShardRef {
+  string pack_hash = 1;
+  uint32 shard_index = 2;
+  string shard_hash = 3;
+}
+
+message ProbeMissingDataPackShardsRequest {
+  repeated DataPackShardRef shards = 1;
+}
+
+message ProbeMissingDataPackShardsResponse {
+  repeated DataPackShardRef missing_shards = 1;
+}
+
+enum DataPackShardStoreStatus {
+  DATA_PACK_SHARD_STORE_STATUS_UNSPECIFIED = 0;
+  DATA_PACK_SHARD_STORE_STATUS_STORED = 1;
+  DATA_PACK_SHARD_STORE_STATUS_ALREADY_PRESENT = 2;
+  DATA_PACK_SHARD_STORE_STATUS_REJECTED_HASH_MISMATCH = 3;
+  DATA_PACK_SHARD_STORE_STATUS_REJECTED_INVALID_ARGUMENT = 4;
+  DATA_PACK_SHARD_STORE_STATUS_REJECTED_TOO_LARGE = 5;
+  DATA_PACK_SHARD_STORE_STATUS_ERROR = 6;
+}
+
+message ReplicateDataPackShardRequest {
+  string pack_hash = 1;
+  uint32 shard_index = 2;
+  string shard_hash = 3;
+  bytes shard_data = 4;
+}
+
+message ReplicateDataPackShardResult {
+  string pack_hash = 1;
+  uint32 shard_index = 2;
+  string shard_hash = 3;
+  DataPackShardStoreStatus status = 4;
+  string detail = 5;
+}
+
+enum DataPackShardRetrieveStatus {
+  DATA_PACK_SHARD_RETRIEVE_STATUS_UNSPECIFIED = 0;
+  DATA_PACK_SHARD_RETRIEVE_STATUS_FOUND = 1;
+  DATA_PACK_SHARD_RETRIEVE_STATUS_NOT_FOUND = 2;
+  DATA_PACK_SHARD_RETRIEVE_STATUS_HASH_MISMATCH = 3;
+  DATA_PACK_SHARD_RETRIEVE_STATUS_ERROR = 4;
+}
+
+message RetrieveDataPackShardBatchRequest {
+  repeated DataPackShardRef shards = 1;
+}
+
+message RetrievedDataPackShard {
+  string pack_hash = 1;
+  uint32 shard_index = 2;
+  string shard_hash = 3;
+  DataPackShardRetrieveStatus status = 4;
+  bytes shard_data = 5;
+  string detail = 6;
+}
+
+message RetrieveDataPackShardBatchResponse {
+  repeated RetrievedDataPackShard results = 1;
 }
 
 enum MetadataPackStoreStatus {

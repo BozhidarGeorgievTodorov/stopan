@@ -10,10 +10,15 @@ from __future__ import annotations
 from stopan.cas.repository import CASRepository
 from stopan.metadata.database import MetadataDB
 from stopan.restore.cluster import LazyClusterResolver
+from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
+from stopan.restore.ec_fetch import ErasureChunkRecoveryService
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.remote_client import RemoteStorageClientPool
 from stopan.restore.restorer import RestoreResult, SnapshotRestorer
 from stopan.protection.policy import normalize_remote_rf
+
+
+_REMOTE_RECOVERY_MODES = {"none", "replication", "ec", "auto"}
 
 
 def restore_snapshot(
@@ -33,16 +38,24 @@ def restore_snapshot(
     rpc_timeout_s: float,
     max_message_bytes: int,
     max_chunk_size: int,
+    remote_recovery: str = "replication",
 ) -> RestoreResult:
     """
     Restaura un snapshot preparando todos los servicios necesarios.
 
     El restore intenta leer primero desde el CAS local principal, después desde
-    el CAS P2P local y, si rf > 0, desde targets remotos calculados por HRW.
+    el CAS P2P local y, según el modo de remote_recovery, desde réplicas remota HRW
+    o mediante reconstrucción por borrado (Erasure Coding).
     """
+    remote_recovery = _normalize_remote_recovery(remote_recovery)
+    use_remote_chunks = remote_recovery in {"replication", "auto"}
+    use_ec_recovery = remote_recovery in {"ec", "auto"}
 
     db = MetadataDB(db_file)
     remote_pool: RemoteStorageClientPool | None = None
+    ec_remote_pool: RemoteDataPackShardClientPool | None = None
+    cluster_resolver: LazyClusterResolver | None = None
+    ec_recovery_service: ErasureChunkRecoveryService | None = None
 
     try:
         origin_node_id = db.get_snapshot_origin_node_id(snapshot_id)
@@ -54,28 +67,46 @@ def restore_snapshot(
 
         repo = CASRepository(local_shard_dir)
         p2p_local_repo = CASRepository(repo_store_dir)
-        remote_rf = normalize_remote_rf(rf)
-        remote_pool = RemoteStorageClientPool(
-            timeout_s=rpc_timeout_s,
-            max_message_bytes=max_message_bytes,
-        )
-        cluster_resolver = LazyClusterResolver(
-            membership_seed=membership_seed,
-            rf=remote_rf,
-            origin_node_id=origin_node_id,
-            self_addr=self_addr,
-            cluster_token=cluster_token,
-            membership_timeout_s=membership_timeout_s,
-            max_message_bytes=max_message_bytes,
-        )
+        cluster_rf = normalize_remote_rf(rf)
+
+        if use_remote_chunks or use_ec_recovery:
+            cluster_resolver = LazyClusterResolver(
+                membership_seed=membership_seed,
+                rf=cluster_rf,
+                origin_node_id=origin_node_id,
+                self_addr=self_addr,
+                cluster_token=cluster_token,
+                membership_timeout_s=membership_timeout_s,
+                max_message_bytes=max_message_bytes,
+            )
+
+        if use_remote_chunks:
+            remote_pool = RemoteStorageClientPool(
+                timeout_s=rpc_timeout_s,
+                max_message_bytes=max_message_bytes,
+            )
+
+        if use_ec_recovery:
+            ec_remote_pool = RemoteDataPackShardClientPool(
+                timeout_s=rpc_timeout_s,
+                max_message_bytes=max_message_bytes,
+            )
+            ec_recovery_service = ErasureChunkRecoveryService(
+                db=db,
+                repo=repo,
+                remote_pool=ec_remote_pool,
+                cluster_resolver=cluster_resolver,
+            )
         fetch_service = ChunkFetchService(
             repo=repo,
             p2p_local_repo=p2p_local_repo,
             cluster_resolver=cluster_resolver,
             remote_pool=remote_pool,
-            rf=remote_rf,
+            rf=cluster_rf,
             cluster_token=cluster_token,
             max_chunk_size=max_chunk_size,
+            ec_recovery_service=ec_recovery_service,
+            remote_chunk_recovery=use_remote_chunks,
         )
         restorer = SnapshotRestorer(
             db=db,
@@ -90,4 +121,15 @@ def restore_snapshot(
     finally:
         if remote_pool is not None:
             remote_pool.close()
+        if ec_remote_pool is not None:
+            ec_remote_pool.close()
         db.close()
+
+
+def _normalize_remote_recovery(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in _REMOTE_RECOVERY_MODES:
+        raise ValueError(
+            "remote_recovery debe ser one of: " + ", ".join(sorted(_REMOTE_RECOVERY_MODES))
+        )
+    return mode

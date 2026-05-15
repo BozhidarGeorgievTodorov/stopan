@@ -18,7 +18,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_config_args(parser)
 
     parser.add_argument("--membership-seed", default=None, help="Seed de membership para obtener la vista del cluster elegible.")
-    parser.add_argument("--rf", type=int, default=None, help="RF deseado para la protección remota.")
+    parser.add_argument(
+        "--protection-mode",
+        choices=("replication", "ec"),
+        default="replication",
+        help="Modo de protección remota: replication mantiene RF por chunk; ec usa data packs con erasure coding.",
+    )
+    parser.add_argument("--rf", type=int, default=None, help="RF deseado para la protección remota por replicación.")
+    parser.add_argument("--ec-k", type=int, default=None, help="Número de data shards por data pack EC.")
+    parser.add_argument("--ec-m", type=int, default=None, help="Número de parity shards por data pack EC.")
+    parser.add_argument("--ec-pack-size-bytes", type=int, default=None, help="Tamaño objetivo máximo del payload de cada data pack EC.")
     parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución.")
     parser.add_argument("--target-parallelism", type=int, default=None, help="Número de targets procesados en paralelo.")
     parser.add_argument("--probe-batch-hashes", type=int, default=None, help="Hashes por probe de inventario remoto.")
@@ -37,13 +46,85 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     add_metadata_auto_export_args(parser, context="push")
-    return parser.parse_args(argv)
+    
+    args = parser.parse_args(argv)
+
+    if args.protection_mode == "ec":
+        if args.rf is not None:
+            parser.error("--rf solo aplica a --protection-mode replication")
+        if args.strict_rf is not None:
+            parser.error("--strict-rf/--no-strict-rf solo aplica a --protection-mode replication")
+        if args.target_parallelism is not None:
+            parser.error("--target-parallelism solo aplica a --protection-mode replication")
+        if args.probe_batch_hashes is not None:
+            parser.error("--probe-batch-hashes solo aplica a --protection-mode replication")
+        if args.stream_inflight is not None:
+            parser.error("--stream-inflight solo aplica a --protection-mode replication")
+        if args.probe_timeout_s is not None:
+            parser.error("--probe-timeout-s solo aplica a --protection-mode replication")
+            
+        args.ec_k = 2 if args.ec_k is None else args.ec_k
+        args.ec_m = 1 if args.ec_m is None else args.ec_m
+        args.ec_pack_size_bytes = (8 * 1024 * 1024) if args.ec_pack_size_bytes is None else args.ec_pack_size_bytes
+
+    else:
+        if args.ec_k is not None:
+            parser.error("--ec-k solo aplica a --protection-mode ec")
+        if args.ec_m is not None:
+            parser.error("--ec-m solo aplica a --protection-mode ec")
+        if args.ec_pack_size_bytes is not None:
+            parser.error("--ec-pack-size-bytes solo aplica a --protection-mode ec")
+
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_runtime_config(args)
     metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+
+    if args.protection_mode == "ec":
+        from stopan.protection.ec.pusher import push_erasure_data_packs_to_network
+
+        stats = push_erasure_data_packs_to_network(
+            membership_seed=args.membership_seed or first_seed(cfg),
+            limit=args.limit,
+            ec_k=args.ec_k,
+            ec_m=args.ec_m,
+            ec_pack_size_bytes=args.ec_pack_size_bytes,
+            stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
+            max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+            commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
+            db_file=cfg.node.db_file,
+            local_shard_dir=cfg.node.local_shard_dir,
+            self_addr=cfg.node.advertise_addr,
+            cluster_token=cfg.cluster.token,
+            membership_timeout_s=cfg.membership.rpc_timeout_s,
+            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+        )
+
+        print("-" * 40)
+        print(
+            f"Push EC finalizado. packs={stats.placed_packs}/{stats.attempted_packs} | "
+            f"chunks={stats.placed_chunks}/{stats.packed_chunks} | "
+            f"degraded_packs={stats.degraded_packs} | failed_packs={stats.failed_packs} | "
+            f"stored_shards={stats.stored_shards} | "
+            f"already_present_shards={stats.already_present_shards}"
+        )
+
+        if getattr(stats, "interrupted", False):
+            print(f"Push EC interrumpido. Progreso persistido hasta packs={stats.attempted_packs}.")
+            return 130
+
+        if getattr(stats, "insufficient_remote_targets", False):
+            print(
+                "Push EC no iniciado. "
+                f"required_remote_targets={stats.required_remote_targets} "
+                f"remote_candidates={stats.remote_candidates}"
+            )
+            return 2
+
+        return 0 if int(stats.failed_packs) == 0 and int(stats.degraded_packs) == 0 else 2
 
     from stopan.protection.pusher import push_to_network
 

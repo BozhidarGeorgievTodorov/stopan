@@ -17,6 +17,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_config_args(parser)
 
+    parser.add_argument(
+        "--protection-mode",
+        choices=("replication", "ec"),
+        default="replication",
+        help="Modo de verificación: replication audita copias remotas por chunk; ec audita shards de data packs.",
+    )
     parser.add_argument("--membership-seed", default=None, help="Seed de membership para obtener la vista del cluster elegible.")
     parser.add_argument("--probe-timeout-s", type=float, default=None, help="Timeout del RPC ProbeMissingChunks en segundos.")
     parser.add_argument("--target-parallelism", type=int, default=None, help="Número de targets procesados en paralelo.")
@@ -25,13 +31,45 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reverify-verified", action="store_true", help="Incluye chunks en estado VERIFIED para auditarlos de nuevo.")
     parser.add_argument("--max-message-bytes", type=int, default=None, help="Límite de mensaje gRPC.")
     add_metadata_auto_export_args(parser, context="verify")
-    return parser.parse_args(argv)
+    
+    args = parser.parse_args(argv)
+
+    if args.protection_mode == "ec" and args.probe_batch_hashes is not None:
+        parser.error("--probe-batch-hashes solo aplica a --protection-mode replication")
+
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    
     cfg = load_runtime_config(args)
     metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+
+    if args.protection_mode == "ec":
+        from stopan.protection.ec.verifier import verify_erasure_data_packs
+
+        stats = verify_erasure_data_packs(
+            membership_seed=args.membership_seed or first_seed(cfg),
+            self_addr=cfg.node.advertise_addr,
+            cluster_token=cfg.cluster.token,
+            membership_timeout_s=cfg.membership.rpc_timeout_s,
+            db_file=cfg.node.db_file,
+            include_verified=bool(args.reverify_verified),
+            limit=args.limit,
+            target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
+            probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
+            max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+        )
+
+        print("-" * 40)
+        print(
+            f"Verify EC finalizado. verified={stats.verified}/{stats.candidates} | "
+            f"degraded={stats.degraded} | failed={stats.failed} | "
+            f"rpc_failures={stats.rpc_failures}"
+        )
+        return 0 if stats.degraded == 0 and stats.failed == 0 else 2
 
     from stopan.protection.verifier import verify_remote_protection
 

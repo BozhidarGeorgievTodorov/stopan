@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+import concurrent.futures
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from stopan.restore.cluster import LazyClusterResolver
+from stopan.cas.repository import CASRepository
+from stopan.metadata.database import MetadataDB, ErasureDataPackShardRecord
+from stopan.protection.ec.manifest import DataPackManifest
+from stopan.protection.ec.models import DataPackEntry, DataPackShard, ErasureSpec
+from stopan.protection.ec.packer import extract_pack_chunks, reconstruct_payload
+from stopan.protection.ec.remote_client import (
+    RemoteDataPackShardClientPool,
+    RemoteDataPackShardRef,
+)
+
+
+@dataclass(frozen=True)
+class _ErasurePackRecoveryJob:
+    pack_hash: str
+    manifest: DataPackManifest
+    shard_rows: tuple[ErasureDataPackShardRecord, ...]
+    wanted_hashes: tuple[str, ...]
+
+
+class ErasureChunkRecoveryService:
+    """
+    Recupera chunks faltantes reconstruyendo data packs EC.
+
+    Las lecturas SQLite se hacen en el hilo llamador. Los workers solo hacen
+    I/O remoto, decodificación y validación de hashes.
+    """
+
+    def __init__(
+        self,
+        *,
+        db: MetadataDB,
+        repo: CASRepository,
+        remote_pool: RemoteDataPackShardClientPool,
+        cluster_resolver: LazyClusterResolver,
+    ):
+        self.db = db
+        self.repo = repo
+        self.remote_pool = remote_pool
+        self._announced = False
+        self.cluster_resolver = cluster_resolver
+
+    def recover_many_raw_chunks(
+        self,
+        chunk_hashes: Sequence[str],
+        *,
+        target_parallelism: int,
+    ) -> dict[str, bytes | Exception]:
+        ordered_hashes = list(dict.fromkeys(chunk_hashes))
+        if not ordered_hashes:
+            return {}
+
+        result_map: dict[str, bytes | Exception] = {}
+        chunks_by_pack = self._group_missing_chunks_by_pack(ordered_hashes, result_map)
+        if not chunks_by_pack:
+            return result_map
+
+        jobs = self._build_recovery_jobs(chunks_by_pack, result_map)
+        if not jobs:
+            return result_map
+
+        self._announce_once(len(jobs), sum(len(job.wanted_hashes) for job in jobs))
+
+        max_workers = min(max(int(target_parallelism), 1), len(jobs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(self._recover_pack_chunks, job): job
+                for job in jobs
+            }
+
+            for future in concurrent.futures.as_completed(future_map):
+                job = future_map[future]
+                try:
+                    recovered = future.result()
+                except Exception as exc:
+                    for chunk_hash in job.wanted_hashes:
+                        result_map[chunk_hash] = FileNotFoundError(
+                            f"No se pudo reconstruir data pack EC {job.pack_hash[:8]} "
+                            f"para chunk {chunk_hash[:8]}: {exc}"
+                        )
+                    continue
+
+                for chunk_hash in job.wanted_hashes:
+                    value = recovered.get(chunk_hash)
+                    if value is None:
+                        result_map[chunk_hash] = FileNotFoundError(
+                            f"Data pack EC {job.pack_hash[:8]} no devolvió chunk {chunk_hash[:8]}"
+                        )
+                        continue
+
+                    try:
+                        self.repo.put(chunk_hash, value)
+                    except Exception as exc:
+                        # El chunk ya está validado por hash; si el cache falla, el restore puede continuar.
+                        print(f"   EC restore: no pude cachear {chunk_hash[:8]} en CAS local: {exc}")
+
+                    result_map[chunk_hash] = value
+
+        return result_map
+
+    def _group_missing_chunks_by_pack(
+        self,
+        ordered_hashes: list[str],
+        result_map: dict[str, bytes | Exception],
+    ) -> dict[str, list[str]]:
+        locations = self.db.get_erasure_chunk_locations(ordered_hashes)
+        chunks_by_pack: dict[str, list[str]] = defaultdict(list)
+
+        for chunk_hash in ordered_hashes:
+            location = locations.get(chunk_hash)
+            if location is None:
+                result_map[chunk_hash] = FileNotFoundError(
+                    f"El chunk {chunk_hash[:8]} no pertenece a ningún data pack EC"
+                )
+                continue
+            chunks_by_pack[location.pack_hash].append(chunk_hash)
+
+        return chunks_by_pack
+
+    def _build_recovery_jobs(
+        self,
+        chunks_by_pack: dict[str, list[str]],
+        result_map: dict[str, bytes | Exception],
+    ) -> list[_ErasurePackRecoveryJob]:
+        jobs: list[_ErasurePackRecoveryJob] = []
+
+        for pack_hash, wanted_hashes in chunks_by_pack.items():
+            try:
+                jobs.append(self._build_recovery_job(pack_hash, wanted_hashes))
+            except Exception as exc:
+                for chunk_hash in wanted_hashes:
+                    result_map[chunk_hash] = FileNotFoundError(
+                        f"No se pudo preparar metadata EC del pack {pack_hash[:8]} "
+                        f"para chunk {chunk_hash[:8]}: {exc}"
+                    )
+
+        return jobs
+
+    def _build_recovery_job(
+        self,
+        pack_hash: str,
+        wanted_hashes: list[str],
+    ) -> _ErasurePackRecoveryJob:
+        pack = self.db.get_erasure_data_pack(pack_hash)
+        if pack is None:
+            raise FileNotFoundError(f"metadata de data pack EC no encontrada: {pack_hash[:8]}")
+
+        pack_chunks = self.db.get_erasure_pack_chunks(pack_hash)
+        pack_shards = self.db.get_erasure_pack_shards(pack_hash)
+        if not pack_chunks:
+            raise FileNotFoundError(f"data pack EC sin chunks: {pack_hash[:8]}")
+        if len(pack_shards) < pack.data_shards:
+            raise FileNotFoundError(
+                f"data pack EC sin suficientes shards registrados: "
+                f"{len(pack_shards)}/{pack.data_shards}"
+            )
+
+        manifest = DataPackManifest(
+            pack_hash=pack.pack_hash,
+            payload_size=pack.payload_size,
+            padded_size=pack.padded_size,
+            shard_size=pack.shard_size,
+            spec=ErasureSpec(
+                data_shards=pack.data_shards,
+                parity_shards=pack.parity_shards,
+                codec=pack.codec,
+            ),
+            entries=tuple(
+                DataPackEntry(
+                    chunk_hash=item.chunk_hash,
+                    offset=item.offset,
+                    length=item.length,
+                    ordinal=item.ordinal,
+                )
+                for item in pack_chunks
+            ),
+        )
+        return _ErasurePackRecoveryJob(
+            pack_hash=pack_hash,
+            manifest=manifest,
+            shard_rows=tuple(pack_shards),
+            wanted_hashes=tuple(wanted_hashes),
+        )
+
+    def _recover_pack_chunks(self, job: _ErasurePackRecoveryJob) -> dict[str, bytes]:
+        shards = self._retrieve_pack_shards(
+            job.pack_hash,
+            job.shard_rows,
+            required=job.manifest.spec.data_shards,
+        )
+        payload = reconstruct_payload(manifest=job.manifest, shards=shards)
+
+        return extract_pack_chunks(
+            payload=payload,
+            manifest=job.manifest,
+            wanted_hashes=set(job.wanted_hashes),
+        )
+
+    def _retrieve_pack_shards(
+        self,
+        pack_hash: str,
+        shard_rows: tuple[ErasureDataPackShardRecord, ...],
+        *,
+        required: int,
+    ) -> list[DataPackShard]:
+        cluster = self.cluster_resolver.get_cluster()
+        
+        refs_by_addr: dict[str, list[RemoteDataPackShardRef]] = defaultdict(list)
+        found: list[DataPackShard] = []
+        errors: list[str] = []
+
+        active_nodes = {m.node_id: m.address for m in cluster.members}
+
+        for row in shard_rows:
+            target_address = active_nodes.get(row.node_id)
+            
+            if not target_address:
+                errors.append(f"shard={row.shard_index}: nodo {row.node_id} offline/ilocalizable")
+                continue
+
+            refs_by_addr[target_address].append(
+                RemoteDataPackShardRef(
+                    pack_hash=row.pack_hash,
+                    shard_index=row.shard_index,
+                    shard_hash=row.shard_hash,
+                )
+            )
+
+        if len(refs_by_addr) < required:
+            raise FileNotFoundError(
+                f"data pack EC {pack_hash[:8]}: nodos online insuficientes para K shards "
+                f"({len(refs_by_addr)}/{required}). " + " | ".join(errors)
+            )
+
+        max_workers = min(len(refs_by_addr), max(int(required), 1))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self.remote_pool.retrieve_shard_batch,
+                    addr=address,
+                    refs=refs,
+                ): address
+                for address, refs in refs_by_addr.items()
+            }
+
+            for future in concurrent.futures.as_completed(future_map):
+                address = future_map[future]
+                try:
+                    results = future.result()
+                except Exception as exc:
+                    errors.append(f"{address}: {exc}")
+                    continue
+
+                for item in results.values():
+                    if not item.is_found(self.remote_pool.retrieve_status_found):
+                        errors.append(f"{address}: shard={item.ref.shard_index}: {item.detail}")
+                        continue
+
+                    try:
+                        found.append(
+                            DataPackShard(
+                                pack_hash=item.ref.pack_hash,
+                                shard_index=item.ref.shard_index,
+                                data=item.data,
+                                shard_hash=item.ref.shard_hash,
+                            )
+                        )
+                    except Exception as exc:
+                        errors.append(f"{address}: shard={item.ref.shard_index}: {exc}")
+
+        found.sort(key=lambda item: item.shard_index)
+        if len(found) < required:
+            raise FileNotFoundError(
+                f"data pack EC {pack_hash[:8]} no tiene K shards recuperables: "
+                f"{len(found)}/{required}. " + " | ".join(errors)
+            )
+
+        return found[:required]
+
+    def _announce_once(self, pack_count: int, chunk_count: int) -> None:
+        if self._announced:
+            return
+        self._announced = True
+        print(
+            "Activando recuperación por erasure coding. "
+            f"data_packs={pack_count} chunks={chunk_count}"
+        )

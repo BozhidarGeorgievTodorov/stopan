@@ -19,6 +19,13 @@ from stopan.protos import p2p_storage_pb2_grpc
 from stopan.cas.hashes import is_valid_chunk_hash
 from stopan.cas.repository import CASRepository
 from .commit_engine import StorageCommitEngine
+from .ec_shard_store import (
+    DataPackShardHashMismatchError,
+    DataPackShardStore,
+    DataPackShardStoreError,
+    DataPackShardTooLargeError,
+    is_valid_hash64,
+)
 
 
 _INVALID_HASH_PREVIEW_CHARS = 32
@@ -29,6 +36,11 @@ _STREAM_READER_JOIN_TIMEOUT_S = 2.0
 def _invalid_chunk_hash_detail(chunk_hash: str) -> str:
     visible = str(chunk_hash)[:_INVALID_HASH_PREVIEW_CHARS]
     return f"chunk_hash inválido: {visible!r}; se esperaba BLAKE3 hex lowercase de 64 caracteres"
+
+
+def _invalid_pack_hash_detail(name: str, value: object) -> str:
+    visible = str(value)[:_INVALID_HASH_PREVIEW_CHARS]
+    return f"{name} inválido: {visible!r}; se esperaba BLAKE3 hex lowercase de 64 caracteres"
 
 
 class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
@@ -53,6 +65,10 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             worker_count=commit_workers,
             max_pending=commit_queue_items,
         )
+        self.ec_shard_store = DataPackShardStore(
+            repo_store_dir,
+            max_shard_size=max_chunk_size,
+        )
         print(f"Nodo P2P listo. Almacenando en: {os.path.abspath(repo_store_dir)}")
         print(
             f"Commit engine: workers={self.commit_engine.worker_count} "
@@ -70,7 +86,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         Nota:
         - este método verifica presencia, no integridad profunda;
         - la integridad se valida al aceptar blobs nuevos en ReplicateChunks
-        y al consumir blobs en restore/retrieve mediante BLAKE3.
+            y al consumir blobs en restore/retrieve mediante BLAKE3.
         """
         try:
             invalid = [
@@ -297,3 +313,212 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(exc))
             return p2p_storage_pb2.RetrieveChunkBatchResponse()
+
+    def ProbeMissingDataPackShards(self, request, context):
+        """
+        Devuelve qué shards EC no existen localmente.
+
+        Este método solo comprueba presencia por identificador canónico. La
+        integridad se valida al aceptar y al leer cada shard mediante BLAKE3.
+        """
+        try:
+            invalid_detail = _first_invalid_shard_ref_detail(request.shards)
+            if invalid_detail is not None:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(invalid_detail)
+                return p2p_storage_pb2.ProbeMissingDataPackShardsResponse()
+
+            missing = [
+                shard
+                for shard in request.shards
+                if not self.ec_shard_store.exists(
+                    pack_hash=shard.pack_hash,
+                    shard_index=int(shard.shard_index),
+                    shard_hash=shard.shard_hash,
+                )
+            ]
+            return p2p_storage_pb2.ProbeMissingDataPackShardsResponse(
+                missing_shards=missing,
+            )
+        except Exception as exc:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return p2p_storage_pb2.ProbeMissingDataPackShardsResponse()
+
+    def ReplicateDataPackShards(self, request_iterator, context):
+        """
+        Recibe shards EC por stream y devuelve un ACK por shard.
+
+        Los shards no pasan por el CAS de chunks ni por StorageCommitEngine:
+        tienen formato, validación y ruta de almacenamiento propios.
+        """
+        try:
+            for item in request_iterator:
+                yield self._store_data_pack_shard(item)
+        except Exception as exc:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return
+
+    def RetrieveDataPackShardBatch(self, request, context):
+        """Devuelve shards EC por batch para reconstrucción de data packs."""
+        try:
+            results = []
+
+            for shard in request.shards:
+                detail = _invalid_shard_ref_detail(shard)
+                if detail is not None:
+                    results.append(
+                        p2p_storage_pb2.RetrievedDataPackShard(
+                            pack_hash=str(shard.pack_hash),
+                            shard_index=int(shard.shard_index),
+                            shard_hash=str(shard.shard_hash),
+                            status=(
+                                p2p_storage_pb2
+                                .DATA_PACK_SHARD_RETRIEVE_STATUS_ERROR
+                            ),
+                            detail=detail,
+                        )
+                    )
+                    continue
+
+                try:
+                    stored = self.ec_shard_store.get(
+                        pack_hash=shard.pack_hash,
+                        shard_index=int(shard.shard_index),
+                        shard_hash=shard.shard_hash,
+                    )
+                    results.append(
+                        p2p_storage_pb2.RetrievedDataPackShard(
+                            pack_hash=stored.pack_hash,
+                            shard_index=stored.shard_index,
+                            shard_hash=stored.shard_hash,
+                            status=(
+                                p2p_storage_pb2
+                                .DATA_PACK_SHARD_RETRIEVE_STATUS_FOUND
+                            ),
+                            shard_data=stored.data,
+                            detail="ok",
+                        )
+                    )
+                except FileNotFoundError:
+                    results.append(
+                        p2p_storage_pb2.RetrievedDataPackShard(
+                            pack_hash=shard.pack_hash,
+                            shard_index=int(shard.shard_index),
+                            shard_hash=shard.shard_hash,
+                            status=(
+                                p2p_storage_pb2
+                                .DATA_PACK_SHARD_RETRIEVE_STATUS_NOT_FOUND
+                            ),
+                            detail="shard EC no encontrado",
+                        )
+                    )
+                except DataPackShardHashMismatchError as exc:
+                    results.append(
+                        p2p_storage_pb2.RetrievedDataPackShard(
+                            pack_hash=shard.pack_hash,
+                            shard_index=int(shard.shard_index),
+                            shard_hash=shard.shard_hash,
+                            status=(
+                                p2p_storage_pb2
+                                .DATA_PACK_SHARD_RETRIEVE_STATUS_HASH_MISMATCH
+                            ),
+                            detail=str(exc),
+                        )
+                    )
+                except Exception as exc:
+                    results.append(
+                        p2p_storage_pb2.RetrievedDataPackShard(
+                            pack_hash=shard.pack_hash,
+                            shard_index=int(shard.shard_index),
+                            shard_hash=shard.shard_hash,
+                            status=(
+                                p2p_storage_pb2
+                                .DATA_PACK_SHARD_RETRIEVE_STATUS_ERROR
+                            ),
+                            detail=str(exc),
+                        )
+                    )
+
+            return p2p_storage_pb2.RetrieveDataPackShardBatchResponse(results=results)
+        except Exception as exc:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return p2p_storage_pb2.RetrieveDataPackShardBatchResponse()
+
+    def _store_data_pack_shard(self, item):
+        detail = _invalid_shard_request_detail(item)
+        if detail is not None:
+            return p2p_storage_pb2.ReplicateDataPackShardResult(
+                pack_hash=str(item.pack_hash),
+                shard_index=int(item.shard_index),
+                shard_hash=str(item.shard_hash),
+                status=(
+                    p2p_storage_pb2
+                    .DATA_PACK_SHARD_STORE_STATUS_REJECTED_INVALID_ARGUMENT
+                ),
+                detail=detail,
+            )
+
+        try:
+            stored = self.ec_shard_store.put(
+                pack_hash=item.pack_hash,
+                shard_index=int(item.shard_index),
+                shard_hash=item.shard_hash,
+                data=bytes(item.shard_data),
+            )
+            status = (
+                p2p_storage_pb2.DATA_PACK_SHARD_STORE_STATUS_STORED
+                if stored
+                else p2p_storage_pb2.DATA_PACK_SHARD_STORE_STATUS_ALREADY_PRESENT
+            )
+            detail = "almacenado" if stored else "ya presente"
+        except DataPackShardHashMismatchError as exc:
+            status = p2p_storage_pb2.DATA_PACK_SHARD_STORE_STATUS_REJECTED_HASH_MISMATCH
+            detail = str(exc)
+        except DataPackShardTooLargeError as exc:
+            status = p2p_storage_pb2.DATA_PACK_SHARD_STORE_STATUS_REJECTED_TOO_LARGE
+            detail = str(exc)
+        except DataPackShardStoreError as exc:
+            status = p2p_storage_pb2.DATA_PACK_SHARD_STORE_STATUS_REJECTED_INVALID_ARGUMENT
+            detail = str(exc)
+        except Exception as exc:
+            status = p2p_storage_pb2.DATA_PACK_SHARD_STORE_STATUS_ERROR
+            detail = str(exc)
+
+        return p2p_storage_pb2.ReplicateDataPackShardResult(
+            pack_hash=item.pack_hash,
+            shard_index=int(item.shard_index),
+            shard_hash=item.shard_hash,
+            status=status,
+            detail=detail,
+        )
+
+
+def _first_invalid_shard_ref_detail(shards) -> str | None:
+    for shard in shards:
+        detail = _invalid_shard_ref_detail(shard)
+        if detail is not None:
+            return detail
+    return None
+
+
+def _invalid_shard_ref_detail(shard) -> str | None:
+    if not is_valid_hash64(shard.pack_hash):
+        return _invalid_pack_hash_detail("pack_hash", shard.pack_hash)
+    if not is_valid_hash64(shard.shard_hash):
+        return _invalid_pack_hash_detail("shard_hash", shard.shard_hash)
+    if int(shard.shard_index) < 0:
+        return "shard_index debe ser >= 0"
+    return None
+
+
+def _invalid_shard_request_detail(item) -> str | None:
+    detail = _invalid_shard_ref_detail(item)
+    if detail is not None:
+        return detail
+    if not item.shard_data:
+        return "shard_data no puede estar vacío"
+    return None
+

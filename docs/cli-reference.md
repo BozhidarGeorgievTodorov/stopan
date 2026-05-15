@@ -33,7 +33,7 @@ python -m stopan backup test_data --safe
 ## 2. Opciones avanzadas de Red y Protección
 
 **Fast-path remoto durante el backup:**
-Permite saltar chunks durante el backup si la metadata ya contiene evidencia suficiente de protección remota para el placement actual (no sube chunks a la red).
+Permite saltar chunks durante el backup si la metadata ya contiene evidencia suficiente de protección remota por replicación para el placement actual (no sube chunks a la red).
 
 ```bash
 python -m stopan backup test_data 4 \
@@ -41,28 +41,119 @@ python -m stopan backup test_data 4 \
   --membership-seed localhost:50051
 ```
 
-**RF estricto y modo best-effort:**
+**Protección por replicación de chunks:**
 
-Por defecto, `push` usa RF estricto. Si no hay suficientes candidatos remotos para cumplir las copias pedidas con `--rf`, el comando aborta antes de modificar `chunk_protection`.
+Por defecto, `push` usa `--protection-mode replication`. En este modo, `--rf` indica cuántas copias remotas completas se requieren por chunk. La copia local no cuenta y el nodo origen se excluye del placement.
 
 ```bash
 python -m stopan push \
   --membership-seed localhost:50051 \
   --rf 4
 ```
-Para permitir protección best-effort, se puede usar --no-strict-rf. En ese modo, push intenta colocar tantas copias como pueda y deja los chunks como DEGRADED si no alcanza las copias remotas pedidas.
+
+**RF estricto y modo best-effort:**
+
+Por defecto, `push` usa RF estricto. Si no hay suficientes candidatos remotos para cumplir las copias pedidas con `--rf`, el comando aborta antes de modificar `chunk_protection`.
+
+Para permitir protección best-effort, se puede usar `--no-strict-rf`. En ese modo, `push` intenta colocar tantas copias como pueda y deja los chunks como `DEGRADED` si no alcanza las copias remotas pedidas.
 
 ```bash
+python -m stopan push \
   --membership-seed localhost:50051 \
   --rf 4 \
   --no-strict-rf
 ```
 
-**Forzar re-verificación de chunks:**
-Por defecto, el verifier salta chunks ya verificados. Para forzar una auditoría completa:
+**Protección por erasure coding:**
+
+El modo EC agrupa chunks deduplicados en data packs, codifica cada pack con `ec_k` data shards y `ec_m` shards extra de redundancia, y guarda cada shard en un nodo remoto distinto. En el clúster Docker de 4 nodos, el nodo origen queda excluido y los 3 nodos remotos permiten usar `ec_k=2`, `ec_m=1`.
+
+`ec_m=0` está permitido. En ese caso Stopan hace striping sin redundancia: genera `ec_k` shards, necesita todos para reconstruir y cualquier shard perdido deja el pack en `FAILED`.
+
+```bash
+python -m stopan push \
+  --membership-seed localhost:50051 \
+  --protection-mode ec \
+  --ec-k 2 \
+  --ec-m 1
+```
+
+El tamaño objetivo máximo del payload de cada data pack se puede ajustar con `--ec-pack-size-bytes`:
+
+```bash
+python -m stopan push \
+  --membership-seed localhost:50051 \
+  --protection-mode ec \
+  --ec-k 2 \
+  --ec-m 1 \
+  --ec-pack-size-bytes 8388608
+```
+
+Semántica de estados EC:
+
+```text
+VERIFIED  -> están presentes todos los shards del pack
+DEGRADED  -> faltan shards, pero quedan al menos ec_k shards recuperables; con ec_m=0 no hay estado degradado útil
+FAILED    -> quedan menos de ec_k shards recuperables
+```
+
+**Forzar re-verificación de chunks replicados:**
+Por defecto, el verifier salta chunks ya verificados. Para forzar una auditoría completa del modo de replicación:
 
 ```bash
 python -m stopan verify --membership-seed localhost:50051 --reverify-verified
+```
+
+**Verificar data packs EC:**
+
+```bash
+python -m stopan verify --protection-mode ec
+```
+
+Para volver a auditar packs EC ya verificados:
+
+```bash
+python -m stopan verify --protection-mode ec --reverify-verified
+```
+
+**Restore y selección explícita de recuperación remota:**
+
+`restore` siempre prioriza CAS local y store P2P local. La recuperación remota se activa de forma explícita con `--remote-recovery`:
+
+```text
+none         -> no usa red; solo stores locales
+replication  -> recupera chunks completos desde nodos P2P; usa --membership-seed y --rf
+ec           -> reconstruye desde data packs EC registrados; no usa --rf
+auto         -> intenta replication y usa EC como fallback para lo que siga faltando
+```
+
+Recuperación por replicación de chunks:
+
+```bash
+python -m stopan restore 1 \
+  --out restored_from_replication \
+  --remote-recovery replication \
+  --membership-seed localhost:50051 \
+  --rf 1
+```
+
+Recuperación desde data packs EC:
+
+```bash
+python -m stopan restore 1 \
+  --out restored_from_ec \
+  --remote-recovery ec \
+  --membership-seed localhost:50051 \
+```
+
+Ruta combinada con fallback explícito:
+
+```bash
+python -m stopan restore 1 \
+  --out restored_auto \
+  --remote-recovery auto \
+  --membership-seed localhost:50051 \
+  --rf 1
 ```
 
 ## 3. Flujo manual de Metadata Distribuida

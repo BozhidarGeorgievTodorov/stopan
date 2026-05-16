@@ -25,6 +25,7 @@ from stopan.restore.ec_fetch import ErasureChunkRecoveryService
 from stopan.restore.remote_client import RemoteStorageClientPool
 from stopan.protection.policy import normalize_remote_rf
 from stopan.rpc.errors import format_rpc_error, is_rpc_error
+from stopan.restore.errors import ChunkUnavailableError, RestoreDataError
 
 
 class ChunkFetchService:
@@ -147,7 +148,7 @@ class ChunkFetchService:
             for chunk_hash in missing_hashes
         }
         return {
-            chunk_hash: FileNotFoundError(
+            chunk_hash: ChunkUnavailableError(
                 f"El chunk {chunk_hash[:8]} no está localmente y la recuperación "
                 "remota por chunks está desactivada. "
                 + " | ".join(error_map[chunk_hash])
@@ -185,7 +186,7 @@ class ChunkFetchService:
 
             previous = remote_results.get(chunk_hash)
             if isinstance(previous, Exception):
-                remote_results[chunk_hash] = FileNotFoundError(
+                remote_results[chunk_hash] = ChunkUnavailableError(
                     f"{previous} | EC: {value}"
                 )
             else:
@@ -206,15 +207,15 @@ class ChunkFetchService:
                 max_output_size=self.max_chunk_size,
             )
         except zstd.ZstdError as exc:
-            raise ValueError(f"{source_label} corrupto al descomprimir: {chunk_hash[:8]}: {exc}") from exc
+            raise RestoreDataError(f"{source_label} corrupto al descomprimir: {chunk_hash[:8]}: {exc}") from exc
         except Exception as exc:
-            raise ValueError(
+            raise RestoreDataError(
                 f"{source_label} inválido o demasiado grande al descomprimir: {chunk_hash[:8]}: {exc}"
             ) from exc
 
         calculated_hash = blake3.blake3(raw_data).hexdigest()
         if calculated_hash != chunk_hash:
-            raise ValueError(
+            raise RestoreDataError(
                 f"hash inválido en {source_label} {chunk_hash[:8]}: calculado {calculated_hash}"
             )
 
@@ -242,7 +243,7 @@ class ChunkFetchService:
 
         if self.rf == 0 or self.cluster_resolver is None or self.remote_pool is None:
             for chunk_hash in missing_hashes:
-                result_map[chunk_hash] = FileNotFoundError(
+                result_map[chunk_hash] = ChunkUnavailableError(
                     f"El chunk {chunk_hash[:8]} no está localmente y la recuperación "
                     "remota por chunks no está disponible o no hay targets de replicación. "
                     + " | ".join(error_map[chunk_hash])
@@ -266,7 +267,7 @@ class ChunkFetchService:
             target_lists[chunk_hash] = remote_targets
 
             if not remote_targets:
-                result_map[chunk_hash] = FileNotFoundError(
+                result_map[chunk_hash] = ChunkUnavailableError(
                     f"El chunk {chunk_hash[:8]} no está localmente y no hay targets remotos HRW utilizables. "
                     + " | ".join(error_map[chunk_hash])
                 )
@@ -362,7 +363,7 @@ class ChunkFetchService:
                         unresolved.discard(chunk_hash)
 
         for chunk_hash in list(unresolved):
-            result_map[chunk_hash] = FileNotFoundError(
+            result_map[chunk_hash] = ChunkUnavailableError(
                 f"Ningún target HRW devolvió el bloque {chunk_hash[:8]}. "
                 + " | ".join(error_map[chunk_hash])
             )

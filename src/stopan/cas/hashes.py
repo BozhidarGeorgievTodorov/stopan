@@ -8,6 +8,12 @@ hexadecimal canónico: 64 caracteres, minúsculas y sin separadores.
 
 from __future__ import annotations
 
+from stopan.errors import StopanDataError
+
+
+class CASHashError(StopanDataError, ValueError):
+    """Hash de chunk inválido, preservando compatibilidad con ValueError."""
+
 
 _BLAKE3_HEX_LENGTH = 64
 _HEX_LOWER = frozenset("0123456789abcdef")
@@ -34,14 +40,14 @@ def is_valid_chunk_hash(value: object) -> bool:
 
 def require_valid_chunk_hash(value: object, *, field_name: str = "chunk_hash") -> str:
     """
-    Devuelve value como hash de chunk válido o lanza ValueError.
+    Devuelve value como hash de chunk válido o lanza CASHashError.
 
     Esta función se usa en los límites de confianza del sistema cuando un hash
     recibido desde CLI, metadata, red o almacenamiento persistente debe pasar a
     formar parte de rutas internas o consultas sobre el CAS.
     """
     if not is_valid_chunk_hash(value):
-        raise ValueError(
+        raise CASHashError(
             f"{field_name} inválido: se esperaba BLAKE3 hexadecimal en minúsculas "
             f"de {_BLAKE3_HEX_LENGTH} caracteres"
         )

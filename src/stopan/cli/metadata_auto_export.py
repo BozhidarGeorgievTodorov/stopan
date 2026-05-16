@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
+from stopan.errors import StopanUsageError
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.graph import MetadataObjectGraphAutoExport
 
@@ -77,7 +78,7 @@ def build_metadata_object_graph_auto_export(args: argparse.Namespace, cfg: Any) 
     cli_pack_dir = getattr(args, "metadata_object_pack_dir", None)
 
     if cli_store and cli_graph is False:
-        raise ValueError("--metadata-object-store y --no-metadata-object-graph son incompatibles.")
+        raise StopanUsageError("--metadata-object-store y --no-metadata-object-graph son incompatibles.")
 
     if cli_store:
         enabled = True
@@ -88,13 +89,13 @@ def build_metadata_object_graph_auto_export(args: argparse.Namespace, cfg: Any) 
 
     if not enabled:
         if cli_pack or cli_pack_dir:
-            raise ValueError(
+            raise StopanUsageError(
                 "--metadata-object-pack/--metadata-object-pack-dir requieren metadata object graph activo."
             )
         return None
 
     if cli_pack_dir and cli_pack is False:
-        raise ValueError("--metadata-object-pack-dir y --no-metadata-object-pack son incompatibles.")
+        raise StopanUsageError("--metadata-object-pack-dir y --no-metadata-object-pack son incompatibles.")
 
     if cli_pack_dir:
         auto_pack = True

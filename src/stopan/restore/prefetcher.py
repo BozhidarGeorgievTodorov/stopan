@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 
 from stopan.restore.fetch import ChunkFetchService
+from stopan.restore.errors import ChunkUnavailableError
 
 
 class OrderedBatchChunkPrefetcher:
@@ -60,7 +61,7 @@ class OrderedBatchChunkPrefetcher:
         for chunk_hash in window_hashes:
             value = results.get(chunk_hash)
             if value is None:
-                raise FileNotFoundError(f"Chunk {chunk_hash[:8]} no resuelto en ventana de restore")
+                raise ChunkUnavailableError(f"Chunk {chunk_hash[:8]} no resuelto en ventana de restore")
             if isinstance(value, Exception):
                 raise value
             yield chunk_hash, value

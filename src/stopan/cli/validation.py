@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import NoReturn
 
+from stopan.errors import StopanUsageError
+
 
 @dataclass(frozen=True, slots=True)
 class IntRange:
@@ -27,7 +29,7 @@ class Flag:
     flag: str
 
 
-class CLIUsageError(ValueError):
+class CLIUsageError(StopanUsageError):
     """Error de uso detectado después de mezclar CLI y configuración."""
 
 

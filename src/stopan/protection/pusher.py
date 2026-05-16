@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import sys
 
 from stopan.cas.repository import CASRepository
+from stopan.errors import StopanConfigRuntimeError, StopanConfigValueError
 from stopan.metadata.database import MetadataDB
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
@@ -67,7 +68,7 @@ def push_to_network(
     """
     desired_rf = int(rf)
     if desired_rf < 1:
-        raise ValueError("push requiere rf >= 1.")
+        raise StopanConfigValueError("push requiere rf >= 1.")
 
     required_remote_copies = desired_rf
     commit_every = max(1, int(commit_every))
@@ -75,7 +76,7 @@ def push_to_network(
     cluster_token = str(cluster_token or "")
 
     if not self_addr:
-        raise RuntimeError(
+        raise StopanConfigRuntimeError(
             "Falta node.advertise_addr. Push necesita identificar el nodo origen en membership."
         )
 
@@ -99,7 +100,7 @@ def push_to_network(
         cluster = resolved.cluster
         origin_node_id = cluster.self_node_id
         if not origin_node_id:
-            raise RuntimeError(
+            raise StopanConfigRuntimeError(
                 "No pude resolver origin_node_id desde membership. "
                 "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
             )

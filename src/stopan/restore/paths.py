@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from stopan.restore.errors import RestorePathError
+
 
 def safe_restore_path(base_dir: str, rel_path: str) -> str:
     """
@@ -24,13 +26,13 @@ def safe_restore_path(base_dir: str, rel_path: str) -> str:
     if normalized_rel in ("", "."):
         return os.path.abspath(base_dir)
     if os.path.isabs(normalized_rel) or normalized_rel.startswith(".."):
-        raise ValueError(f"Ruta fuera del árbol destino: {rel_path}")
+        raise RestorePathError(f"Ruta fuera del árbol destino: {rel_path}")
 
     full_path = os.path.abspath(os.path.join(base_dir, normalized_rel))
     base_dir_abs = os.path.abspath(base_dir)
 
     if os.path.commonpath([base_dir_abs, full_path]) != base_dir_abs:
-        raise ValueError(f"Ruta fuera del árbol destino: {rel_path}")
+        raise RestorePathError(f"Ruta fuera del árbol destino: {rel_path}")
 
     return full_path
 

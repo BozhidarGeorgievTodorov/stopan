@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 from stopan.cli.validation import IntRange, validate_int_ranges
+from stopan.errors import StopanStorageError, StopanUsageError
 from stopan.config.defaults import (
     DEFAULT_NODE_CONFIG,
     DEFAULT_SYSTEM_DB_FILE,
@@ -129,27 +130,37 @@ def _build_node_config(args: argparse.Namespace) -> StopanConfig:
 
 
 def _write_yaml_atomic(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise StopanStorageError(f"No se pudo crear el directorio de configuración {path.parent}: {exc}") from exc
 
-    with NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as tmp:
-        tmp.write(rendered)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
+    rendered = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    tmp_path: Path | None = None
 
     try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as tmp:
+            tmp.write(rendered)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
+    except OSError as exc:
+        raise StopanStorageError(f"No se pudo escribir la configuración {path}: {exc}") from exc
     finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def _prepare_node_directories(cfg: StopanConfig) -> list[Path]:
@@ -159,14 +170,17 @@ def _prepare_node_directories(cfg: StopanConfig) -> list[Path]:
         Path(cfg.node.db_file).parent,
     ]
     for directory in directories:
-        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise StopanStorageError(f"No se pudo preparar el directorio {directory}: {exc}") from exc
     return directories
 
 
 def _init_node(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     if config_path.exists() and not args.force:
-        raise FileExistsError(
+        raise StopanUsageError(
             f"Ya existe {config_path}. Usa --force si quieres sobrescribirlo."
         )
 
@@ -198,7 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.target == "node":
         return _init_node(args)
 
-    raise ValueError(f"Target desconocido: {args.target}")
+    raise StopanUsageError(f"Target desconocido: {args.target}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from stopan.common.fs import atomic_write_bytes
+from stopan.node.errors import NodeIdentityError, NodeIdentityValueError
 
 
 _NODE_ID_HEX_ALPHABET = set("0123456789abcdef")
@@ -22,7 +23,7 @@ _NODE_ID_HEX_ALPHABET = set("0123456789abcdef")
 def _require_node_id(value: str, *, source: str) -> str:
     node_id = str(value).strip()
     if len(node_id) != 32 or any(char not in _NODE_ID_HEX_ALPHABET for char in node_id):
-        raise RuntimeError(
+        raise NodeIdentityError(
             f"Archivo de identidad inválido: node_id debe tener 32 caracteres "
             f"hexadecimales lowercase en {source}"
         )
@@ -33,12 +34,12 @@ def _require_incarnation(value: int, *, source: str) -> int:
     try:
         incarnation = int(value)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(
+        raise NodeIdentityError(
             f"Archivo de identidad inválido: incarnation debe ser un entero en {source}"
         ) from exc
 
     if incarnation < 1:
-        raise RuntimeError(
+        raise NodeIdentityError(
             f"Archivo de identidad inválido: incarnation debe ser >= 1 en {source}"
         )
     return incarnation
@@ -92,16 +93,16 @@ class NodeIdentityStore:
 
         node_id = str(node_id).strip()
         if not node_id:
-            raise ValueError("NodeIdentityStore.bump_above requiere node_id no vacío.")
+            raise NodeIdentityValueError("NodeIdentityStore.bump_above requiere node_id no vacío.")
 
         observed_incarnation = int(observed_incarnation)
         if observed_incarnation < 0:
-            raise ValueError("observed_incarnation debe ser >= 0.")
+            raise NodeIdentityValueError("observed_incarnation debe ser >= 0.")
 
         with self._lock:
             stored_node_id, stored_incarnation = self._read_unlocked()
             if stored_node_id != node_id:
-                raise RuntimeError(
+                raise NodeIdentityError(
                     "node_id persistido inconsistente: "
                     f"store={stored_node_id} runtime={node_id}"
                 )
@@ -111,11 +112,14 @@ class NodeIdentityStore:
             return next_incarnation
 
     def _read_unlocked(self) -> tuple[str, int]:
-        with open(self.file_path, "r", encoding="utf-8") as handle:
-            lines = [line.strip() for line in handle.readlines()]
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as handle:
+                lines = [line.strip() for line in handle.readlines()]
+        except OSError as exc:
+            raise NodeIdentityError(f"No se pudo leer el archivo de identidad: {self.file_path}: {exc}") from exc
 
         if len(lines) != 2:
-            raise RuntimeError(
+            raise NodeIdentityError(
                 f"Formato inválido de archivo de identidad: {self.file_path}. "
                 "Se esperaban exactamente dos líneas: node_id e incarnation."
             )
@@ -128,8 +132,8 @@ class NodeIdentityStore:
         try:
             node_id = _require_node_id(node_id, source=self.file_path)
             incarnation = _require_incarnation(incarnation, source=self.file_path)
-        except RuntimeError as exc:
-            raise ValueError(str(exc)) from exc
+        except NodeIdentityError as exc:
+            raise NodeIdentityValueError(str(exc)) from exc
 
         atomic_write_bytes(
             Path(self.file_path),

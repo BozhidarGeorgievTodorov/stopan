@@ -13,6 +13,7 @@ from typing import Any
 
 import blake3
 
+from stopan.errors import StopanDataError
 from stopan.metadata.objects.models import (
     METADATA_OBJECT_FORMAT,
     METADATA_OBJECT_VERSION,
@@ -20,7 +21,7 @@ from stopan.metadata.objects.models import (
 )
 
 
-class MetadataObjectGraphWalkError(RuntimeError):
+class MetadataObjectGraphWalkError(StopanDataError, RuntimeError):
     pass
 
 

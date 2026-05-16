@@ -15,6 +15,7 @@ from pathlib import Path
 import grpc
 
 from stopan.config.model import StopanConfig
+from stopan.errors import StopanConfigError, StopanNetworkError
 from stopan.protos import membership_pb2_grpc
 from stopan.protos import p2p_storage_pb2_grpc
 from stopan.rpc.options import grpc_server_options
@@ -71,7 +72,7 @@ def serve(config: StopanConfig) -> None:
     
     advertise_addr = config.node.advertise_addr.strip()
     if not advertise_addr:
-        raise ValueError("Falta node.advertise_addr, por ejemplo node1:50051.")
+        raise StopanConfigError("Falta node.advertise_addr, por ejemplo node1:50051.")
 
     identity_store = NodeIdentityStore(config.node.repo_store_dir)
     identity = identity_store.load_for_startup()
@@ -129,7 +130,7 @@ def serve(config: StopanConfig) -> None:
 
     bound_port = server.add_insecure_port(config.node.bind_addr)
     if bound_port == 0:
-        raise RuntimeError(f"No se pudo abrir el listener gRPC en bind_addr={config.node.bind_addr!r}")
+        raise StopanNetworkError(f"No se pudo abrir el listener gRPC en bind_addr={config.node.bind_addr!r}")
 
     shutdown_requested = threading.Event()
     previous_handlers = _install_shutdown_handlers(shutdown_requested)

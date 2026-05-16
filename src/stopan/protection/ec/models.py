@@ -15,11 +15,30 @@ from typing import Mapping
 
 import blake3
 
+from stopan.errors import (
+    StopanConfigError,
+    StopanDataError,
+    StopanDependencyError,
+    StopanNetworkError,
+)
+
 
 _HASH_ALPHABET = set("0123456789abcdef")
 
 
-class ErasureCodingError(RuntimeError):
+class ErasureCodingError(StopanDataError, RuntimeError):
+    pass
+
+
+class ErasureCodingConfigError(StopanConfigError, ErasureCodingError):
+    pass
+
+
+class ErasureCodingNetworkError(StopanNetworkError, ErasureCodingError):
+    pass
+
+
+class ErasureCodingDependencyError(StopanDependencyError, ErasureCodingError):
     pass
 
 
@@ -47,6 +66,21 @@ def require_positive_int(name: str, value: object) -> int:
     return number
 
 
+def require_config_non_negative_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ErasureCodingConfigError(f"{name} debe ser int; recibido {type(value).__name__}")
+    if value < 0:
+        raise ErasureCodingConfigError(f"{name} debe ser >= 0; recibido {value}")
+    return value
+
+
+def require_config_positive_int(name: str, value: object) -> int:
+    number = require_config_non_negative_int(name, value)
+    if number <= 0:
+        raise ErasureCodingConfigError(f"{name} debe ser > 0; recibido {number}")
+    return number
+
+
 def hash_bytes(data: bytes) -> str:
     if not isinstance(data, bytes):
         raise ErasureCodingError(f"data debe ser bytes; recibido {type(data).__name__}")
@@ -60,14 +94,14 @@ class ErasureSpec:
     codec: str = "zfec"
 
     def __post_init__(self) -> None:
-        data_shards = require_positive_int("ec.data_shards", self.data_shards)
-        parity_shards = require_non_negative_int("ec.parity_shards", self.parity_shards)
+        data_shards = require_config_positive_int("ec.data_shards", self.data_shards)
+        parity_shards = require_config_non_negative_int("ec.parity_shards", self.parity_shards)
         total_shards = data_shards + parity_shards
 
         if total_shards > 256:
-            raise ErasureCodingError("ec.total_shards debe ser <= 256 para zfec")
+            raise ErasureCodingConfigError("ec.total_shards debe ser <= 256 para zfec")
         if self.codec != "zfec":
-            raise ErasureCodingError(f"codec EC no soportado: {self.codec!r}")
+            raise ErasureCodingConfigError(f"codec EC no soportado: {self.codec!r}")
 
         object.__setattr__(self, "data_shards", data_shards)
         object.__setattr__(self, "parity_shards", parity_shards)

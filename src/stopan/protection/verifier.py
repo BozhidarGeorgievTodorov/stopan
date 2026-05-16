@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import grpc
 
 from stopan.common.batching import iter_batches
+from stopan.errors import StopanConfigRuntimeError, StopanConfigValueError
 from stopan.metadata.database import MetadataDB, VerificationCandidate
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
@@ -62,7 +63,7 @@ class ChunkProtectionVerifier:
         self.cluster_token = str(cluster_token)
         self.origin_node_id = str(origin_node_id).strip()
         if not self.origin_node_id:
-            raise ValueError("ChunkProtectionVerifier requiere origin_node_id no vacío.")
+            raise StopanConfigValueError("ChunkProtectionVerifier requiere origin_node_id no vacío.")
 
         self.self_addr = str(self_addr).strip()
         self._excluded_node_ids = frozenset({self.origin_node_id})
@@ -378,7 +379,7 @@ def verify_remote_protection(
 
         origin_node_id = cluster.self_node_id
         if not origin_node_id:
-            raise RuntimeError(
+            raise StopanConfigRuntimeError(
                 "No pude resolver origin_node_id desde membership. "
                 "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
             )

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from stopan.errors import StopanUsageError
 from stopan.metadata.database import MetadataDB
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.exchange.importer import (
@@ -82,7 +83,7 @@ class MetadataObjectGraphStoreService:
     ) -> MetadataObjectStoreInspection:
         if decrypt_latest:
             if passphrase is None:
-                raise ValueError("decrypt_latest requiere passphrase")
+                raise StopanUsageError("decrypt_latest requiere passphrase")
             store = MetadataObjectStore.open_existing(
                 object_store_dir,
                 passphrase=passphrase,

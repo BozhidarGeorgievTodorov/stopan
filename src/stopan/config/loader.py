@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import yaml
 
+from stopan.errors import StopanConfigError
 from stopan.config.model import (
     ClusterConfig,
     GcConfig,
@@ -48,20 +49,31 @@ def load_config(path: str | None = None) -> StopanConfig:
     cfg = StopanConfig()
 
     if path:
-        cfg = _apply_sections(cfg, _read_yaml(Path(path)), source=str(path))
+        try:
+            cfg = _apply_sections(cfg, _read_yaml(Path(path)), source=str(path))
+        except ValueError as exc:
+            raise StopanConfigError(str(exc)) from exc
 
     return cfg
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
-        raise FileNotFoundError(f"No existe el fichero de configuración Stopan: {path}")
+        raise StopanConfigError(f"No existe el fichero de configuración Stopan: {path}")
 
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise StopanConfigError(f"No se pudo leer el fichero de configuración Stopan {path}: {exc}") from exc
+
+    try:
+        data = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise StopanConfigError(f"YAML de configuración inválido en {path}: {exc}") from exc
     if data is None:
         return {}
     if not isinstance(data, dict):
-        raise ValueError(f"El fichero de configuración debe contener un objeto YAML: {path}")
+        raise StopanConfigError(f"El fichero de configuración debe contener un objeto YAML: {path}")
     return data
 
 
@@ -70,12 +82,12 @@ def _apply_sections(cfg: StopanConfig, raw: dict[str, Any], *, source: str) -> S
 
     for section_name, values in raw.items():
         if section_name not in _SECTION_TYPES:
-            raise ValueError(f"Sección desconocida en configuración {source}: {section_name}")
+            raise StopanConfigError(f"Sección desconocida en configuración {source}: {section_name}")
 
         if values is None:
             continue
         if not isinstance(values, dict):
-            raise ValueError(f"La sección '{section_name}' en {source} debe ser un objeto/mapa.")
+            raise StopanConfigError(f"La sección '{section_name}' en {source} debe ser un objeto/mapa.")
 
         sections[section_name] = _validate_section(
             section_name=section_name,
@@ -92,7 +104,7 @@ def _validate_section(*, section_name: str, values: dict[str, Any], source: str)
 
     unknown = sorted(set(values) - valid_fields)
     if unknown:
-        raise ValueError(f"Campos desconocidos en sección '{section_name}' de {source}: {unknown}")
+        raise StopanConfigError(f"Campos desconocidos en sección '{section_name}' de {source}: {unknown}")
 
     converted: dict[str, Any] = {}
     for field_name, value in values.items():
@@ -117,7 +129,7 @@ def _coerce_field(*, section_name: str, field_name: str, value: Any, source: str
     try:
         return converter(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
+        raise StopanConfigError(
             f"Valor inválido para {section_name}.{field_name} en {source}: {value!r}"
         ) from exc
 
@@ -129,7 +141,7 @@ def _coerce_seeds(value: Any, *, source: str) -> tuple[str, ...]:
         return tuple(seed.strip() for seed in value.split(",") if seed.strip())
     if isinstance(value, (list, tuple)):
         return tuple(str(seed).strip() for seed in value if str(seed).strip())
-    raise ValueError(f"cluster.seeds en {source} debe ser lista, tupla o string separado por comas")
+    raise StopanConfigError(f"cluster.seeds en {source} debe ser lista, tupla o string separado por comas")
 
 
 def _as_str(value: Any) -> str:

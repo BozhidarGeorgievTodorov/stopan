@@ -15,6 +15,7 @@ from collections.abc import Iterable
 import grpc
 
 from stopan.protos import membership_pb2
+from stopan.node.errors import MembershipConfigError
 from stopan.node.identity import NodeIdentityStore
 
 from .channels import ChannelCache
@@ -56,9 +57,9 @@ class MembershipManager:
         address = str(address).strip()
 
         if not is_valid_node_id(node_id):
-            raise ValueError(f"node_id inválido: {node_id!r}")
+            raise MembershipConfigError(f"node_id inválido: {node_id!r}")
         if not is_valid_address(address):
-            raise ValueError(f"advertise_addr inválido para membership: {address!r}")
+            raise MembershipConfigError(f"advertise_addr inválido para membership: {address!r}")
 
         self.settings = settings or MembershipSettings()
         self.identity_store = identity_store

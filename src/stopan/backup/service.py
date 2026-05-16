@@ -23,6 +23,7 @@ from stopan.metadata.objects.graph.auto_export import (
     export_metadata_object_graph_after_metadata_change,
 )
 from stopan.scanning.scanner import TreeWalker
+from stopan.errors import StopanStorageError, StopanUsageError
 
 
 _DEFAULT_WORKERS_FALLBACK = 4
@@ -59,7 +60,7 @@ def backup_directory(
     """
     root_path = os.path.abspath(source_path)
     if not os.path.isdir(root_path):
-        raise NotADirectoryError(f"Directorio no encontrado: {root_path}")
+        raise StopanUsageError(f"Directorio no encontrado: {root_path}")
 
     started_at = time.perf_counter()
 
@@ -227,7 +228,7 @@ def backup_directory(
             preview = "; ".join(f"{path}: {error}" for path, error in failed_files[:5])
             if len(failed_files) > 5:
                 preview += f"; ... (+{len(failed_files) - 5} más)"
-            raise RuntimeError(
+            raise StopanStorageError(
                 f"Backup incompleto: fallaron {len(failed_files)} archivo(s). {preview}"
             )
 

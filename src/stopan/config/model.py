@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from stopan.errors import StopanConfigTypeError, StopanConfigValueError
+
 from stopan.config.defaults import (
     DEFAULT_CLUSTER_SEEDS,
     DEFAULT_CLUSTER_TOKEN,
@@ -70,46 +72,46 @@ from stopan.config.defaults import (
 
 def _require_str(name: str, value: object, *, allow_empty: bool = False) -> None:
     if not isinstance(value, str):
-        raise TypeError(f"{name} debe ser string; recibido {type(value).__name__}")
+        raise StopanConfigTypeError(f"{name} debe ser string; recibido {type(value).__name__}")
     if not allow_empty and not value.strip():
-        raise ValueError(f"{name} no puede estar vacío")
+        raise StopanConfigValueError(f"{name} no puede estar vacío")
 
 
 def _require_bool(name: str, value: object) -> None:
     if not isinstance(value, bool):
-        raise TypeError(f"{name} debe ser booleano; recibido {type(value).__name__}")
+        raise StopanConfigTypeError(f"{name} debe ser booleano; recibido {type(value).__name__}")
 
 
 def _require_int(name: str, value: object, *, min_value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{name} debe ser entero; recibido {type(value).__name__}")
+        raise StopanConfigTypeError(f"{name} debe ser entero; recibido {type(value).__name__}")
     if value < min_value:
-        raise ValueError(f"{name} debe ser >= {min_value}; recibido {value}")
+        raise StopanConfigValueError(f"{name} debe ser >= {min_value}; recibido {value}")
 
 
 def _require_float(name: str, value: object, *, min_value: float, inclusive: bool = False) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{name} debe ser numérico; recibido {type(value).__name__}")
+        raise StopanConfigTypeError(f"{name} debe ser numérico; recibido {type(value).__name__}")
 
     numeric = float(value)
     if inclusive:
         if numeric < min_value:
-            raise ValueError(f"{name} debe ser >= {min_value}; recibido {value}")
+            raise StopanConfigValueError(f"{name} debe ser >= {min_value}; recibido {value}")
     elif numeric <= min_value:
-        raise ValueError(f"{name} debe ser > {min_value}; recibido {value}")
+        raise StopanConfigValueError(f"{name} debe ser > {min_value}; recibido {value}")
 
 
 def _require_str_tuple(name: str, value: object) -> None:
     if not isinstance(value, tuple):
-        raise TypeError(f"{name} debe ser una tupla de strings; recibido {type(value).__name__}")
+        raise StopanConfigTypeError(f"{name} debe ser una tupla de strings; recibido {type(value).__name__}")
     for index, item in enumerate(value):
         if not isinstance(item, str) or not item.strip():
-            raise ValueError(f"{name}[{index}] debe ser string no vacío")
+            raise StopanConfigValueError(f"{name}[{index}] debe ser string no vacío")
 
 
 def _require_hex64(name: str, value: str) -> None:
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-        raise ValueError(f"{name} debe ser hex lowercase de 64 caracteres")
+        raise StopanConfigValueError(f"{name} debe ser hex lowercase de 64 caracteres")
 
 
 @dataclass(frozen=True)
@@ -288,18 +290,18 @@ class MetadataConfig:
         )
         _require_int("metadata.scrypt_n", self.scrypt_n, min_value=2)
         if self.scrypt_n & (self.scrypt_n - 1) != 0:
-            raise ValueError("metadata.scrypt_n debe ser potencia de dos")
+            raise StopanConfigValueError("metadata.scrypt_n debe ser potencia de dos")
         _require_int("metadata.scrypt_r", self.scrypt_r, min_value=1)
         _require_int("metadata.scrypt_p", self.scrypt_p, min_value=1)
         _require_int("metadata.key_length", self.key_length, min_value=32)
 
         if self.max_distributed_pack_bytes_per_owner < self.max_distributed_pack_bytes:
-            raise ValueError(
+            raise StopanConfigValueError(
                 "metadata.max_distributed_pack_bytes_per_owner debe ser >= "
                 "metadata.max_distributed_pack_bytes"
             )
         if self.max_distributed_pack_store_bytes < self.max_distributed_pack_bytes:
-            raise ValueError(
+            raise StopanConfigValueError(
                 "metadata.max_distributed_pack_store_bytes debe ser >= "
                 "metadata.max_distributed_pack_bytes"
             )

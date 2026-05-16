@@ -13,12 +13,14 @@ from pathlib import Path
 
 import blake3
 
+from stopan.errors import StopanDataError, StopanStorageError
+
 _HASH_ALPHABET = set("0123456789abcdef")
 _TMP_SUFFIX = ".tmp"
 _SHARD_SUFFIX = ".stec"
 
 
-class DataPackShardStoreError(RuntimeError):
+class DataPackShardStoreError(StopanStorageError, RuntimeError):
     pass
 
 
@@ -46,7 +48,10 @@ class DataPackShardStore:
     def __init__(self, root_dir: str | Path, *, max_shard_size: int):
         self.root = Path(root_dir).expanduser().resolve() / "ec_shards"
         self.max_shard_size = _require_positive_int("max_shard_size", max_shard_size)
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise DataPackShardStoreError(f"No se pudo preparar el almacén EC {self.root}: {exc}") from exc
 
     def exists(self, *, pack_hash: str, shard_index: int, shard_hash: str) -> bool:
         pack_hash = _require_hash64("pack_hash", pack_hash)
@@ -84,15 +89,18 @@ class DataPackShardStore:
         if final_path.exists():
             return False
 
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = final_path.with_name(final_path.name + _TMP_SUFFIX)
-        with tmp_path.open("wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = final_path.with_name(final_path.name + _TMP_SUFFIX)
+            with tmp_path.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
 
-        os.replace(tmp_path, final_path)
-        _fsync_dir(final_path.parent)
+            os.replace(tmp_path, final_path)
+            _fsync_dir(final_path.parent)
+        except OSError as exc:
+            raise DataPackShardStoreError(f"No se pudo escribir shard EC {final_path}: {exc}") from exc
         return True
 
     def get(
@@ -111,6 +119,8 @@ class DataPackShardStore:
             data = path.read_bytes()
         except FileNotFoundError:
             raise
+        except OSError as exc:
+            raise DataPackShardStoreError(f"No se pudo leer shard EC {path}: {exc}") from exc
 
         calculated = hash_bytes(data)
         if calculated != shard_hash:
@@ -134,7 +144,7 @@ class DataPackShardStore:
         )
 
 
-class DataPackShardHashMismatchError(DataPackShardStoreError):
+class DataPackShardHashMismatchError(StopanDataError, DataPackShardStoreError):
     pass
 
 

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, load_runtime_config
 from stopan.config.defaults import DEFAULT_NODE_CONFIG
+from stopan.errors import StopanConfigError
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -22,7 +23,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_runtime_config(args)
 
     if not cfg.node.advertise_addr:
-        raise ValueError(
+        raise StopanConfigError(
             "Falta node.advertise_addr. Define advertise_addr en el fichero de configuración "
             f"usado con --config o en {DEFAULT_NODE_CONFIG}."
         )

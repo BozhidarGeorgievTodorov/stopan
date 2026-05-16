@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from stopan.errors import StopanDataError
 from stopan.common.encoding import b64decode
 from stopan.common.json import canonical_json_bytes, load_json_file
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
@@ -26,7 +27,7 @@ OBJECT_PACK_AEAD_CHACHA20_POLY1305 = "chacha20poly1305"
 OBJECT_PACK_FILE_SUFFIX = ".stopanmetapack"
 
 
-class MetadataObjectPackError(RuntimeError):
+class MetadataObjectPackError(StopanDataError, RuntimeError):
     pass
 
 

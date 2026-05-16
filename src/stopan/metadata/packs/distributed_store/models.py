@@ -7,12 +7,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from stopan.errors import StopanDataError, StopanStorageError
 
-class MetadataPackStoreError(RuntimeError):
+
+class MetadataPackStoreError(StopanStorageError, RuntimeError):
     pass
 
 
-class MetadataPackSignatureError(MetadataPackStoreError):
+class MetadataPackSignatureError(StopanDataError, MetadataPackStoreError):
     pass
 
 
@@ -20,7 +22,7 @@ class MetadataPackQuotaError(MetadataPackStoreError):
     pass
 
 
-class MetadataPackCorruptionError(MetadataPackStoreError):
+class MetadataPackCorruptionError(StopanDataError, MetadataPackStoreError):
     pass
 
 

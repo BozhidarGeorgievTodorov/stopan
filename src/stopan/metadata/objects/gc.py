@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from stopan.common.fs import fsync_dir
+from stopan.errors import StopanDataError
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.graph.walk import collect_reachable_object_hashes
 from stopan.metadata.objects.store import MetadataObjectStore, object_store_lock
@@ -26,7 +27,7 @@ _HASH64_RE = re.compile(r"^[0-9a-f]{64}$")
 _STORAGE_FILE_RE = re.compile(r"^[0-9a-f]{64}\.stobj$")
 
 
-class MetadataObjectGarbageCollectionError(RuntimeError):
+class MetadataObjectGarbageCollectionError(StopanDataError, RuntimeError):
     pass
 
 

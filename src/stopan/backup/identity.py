@@ -13,21 +13,22 @@ import uuid
 from pathlib import Path
 
 from stopan.common.fs import atomic_write_bytes
+from stopan.errors import StopanConfigError
 from stopan.placement.cluster_resolver import try_cluster_view
 
 
 def _canonical_node_id(value: str, *, node_id_file: str) -> str:
     normalized = str(value).strip().lower()
     if not normalized:
-        raise ValueError("node_id vacío")
+        raise StopanConfigError(f"node_id vacío en {node_id_file}")
 
     try:
         parsed = uuid.UUID(hex=normalized)
     except ValueError as exc:
-        raise ValueError(f"node_id inválido en {node_id_file}: {value!r}") from exc
+        raise StopanConfigError(f"node_id inválido en {node_id_file}: {value!r}") from exc
 
     if parsed.hex != normalized:
-        raise ValueError(f"node_id no canónico en {node_id_file}: {value!r}")
+        raise StopanConfigError(f"node_id no canónico en {node_id_file}: {value!r}")
 
     return normalized
 
@@ -36,8 +37,11 @@ def _read_persisted_node_id(node_id_file: str) -> str | None:
     if not os.path.exists(node_id_file):
         return None
 
-    with open(node_id_file, "r", encoding="utf-8") as handle:
-        lines = [line.strip() for line in handle.readlines() if line.strip()]
+    try:
+        with open(node_id_file, "r", encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle.readlines() if line.strip()]
+    except OSError as exc:
+        raise StopanConfigError(f"No se pudo leer la identidad local de nodo {node_id_file}: {exc}") from exc
 
     if not lines:
         return None

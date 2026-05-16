@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from stopan.common.fs import atomic_write_bytes, ensure_private_dir
+from stopan.errors import StopanUsageError
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.graph.walk import collect_reachable_object_bytes
 from stopan.metadata.objects.store import MetadataObjectStore, object_store_lock
@@ -95,7 +96,7 @@ class MetadataObjectPackService:
         pack_dir: str | Path | None = None,
     ) -> MetadataObjectPackExportResult:
         if not identity_file:
-            raise ValueError("export_latest_pack requiere identity_file")
+            raise StopanUsageError("export_latest_pack requiere identity_file")
 
         with object_store_lock(object_store_dir):
             store = MetadataObjectStore.open_existing(object_store_dir, passphrase=passphrase)
@@ -161,9 +162,9 @@ class MetadataObjectPackService:
         if not decrypt:
             return MetadataObjectPackInspection(header=header, decrypted=None)
         if passphrase is None:
-            raise ValueError("inspect_pack decrypt=True requiere passphrase")
+            raise StopanUsageError("inspect_pack decrypt=True requiere passphrase")
         if identity_file is None:
-            raise ValueError("inspect_pack decrypt=True requiere identity_file")
+            raise StopanUsageError("inspect_pack decrypt=True requiere identity_file")
 
         payload, _header, compressed_bytes, plaintext_bytes = decrypt_pack_payload(
             pack_path,

@@ -15,6 +15,7 @@ from typing import Any
 from stopan.common.encoding import b64decode, b64encode
 from stopan.common.fs import atomic_write_bytes
 from stopan.common.json import canonical_json_bytes, load_json_file
+from stopan.errors import StopanUsageError
 from stopan.metadata.identity.keys import (
     decrypt_private_key_record,
     encrypted_private_key_record,
@@ -47,7 +48,7 @@ def create_metadata_identity_file(
 ) -> MetadataIdentity:
     identity_path = Path(path).expanduser().resolve()
     if identity_path.exists() and not force:
-        raise FileExistsError(f"El archivo de identidad de metadata ya existe: {identity_path}")
+        raise StopanUsageError(f"El archivo de identidad de metadata ya existe: {identity_path}")
 
     crypto = require_cryptography()
     x25519 = require_x25519()

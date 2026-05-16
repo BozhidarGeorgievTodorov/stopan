@@ -15,7 +15,7 @@ from stopan.common.encoding import b64decode, b64encode
 from stopan.common.json import load_json_file
 from stopan.metadata.identity.models import AEAD_CHACHA20_POLY1305, KDF_SCRYPT
 from stopan.metadata.identity.passphrase import ScryptCost
-from stopan.metadata.objects.store.errors import MetadataObjectStoreError
+from stopan.metadata.objects.store.errors import MetadataObjectStoreError, MetadataObjectStoreMissingError
 
 
 OBJECT_STORE_FORMAT = "stopan.metadata_object_store"
@@ -106,7 +106,7 @@ def inspect_object_store_header(root_dir: str | Path) -> ObjectStoreHeader:
     root = Path(root_dir).expanduser().resolve()
     header_path = root / "store.json"
     if not header_path.exists():
-        raise FileNotFoundError(f"No existe object store en {root}: falta store.json")
+        raise MetadataObjectStoreMissingError(f"No existe object store en {root}: falta store.json")
     salt, cost = parse_header(root, load_json_file(header_path))
     return ObjectStoreHeader(
         root_dir=root,

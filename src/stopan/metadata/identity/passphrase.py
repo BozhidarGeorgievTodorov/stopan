@@ -26,15 +26,15 @@ class ScryptCost:
 
     def __post_init__(self) -> None:
         if type(self.n) is not int or self.n < 2:
-            raise ValueError(f"scrypt.n debe ser un entero >= 2. Recibido {self.n!r}")
+            raise MetadataPassphraseError(f"scrypt.n debe ser un entero >= 2. Recibido {self.n!r}")
         if self.n & (self.n - 1) != 0:
-            raise ValueError(f"scrypt.n debe ser potencia de 2. Recibido {self.n!r}")
+            raise MetadataPassphraseError(f"scrypt.n debe ser potencia de 2. Recibido {self.n!r}")
         if type(self.r) is not int or self.r < 1:
-            raise ValueError(f"scrypt.r debe ser un entero >= 1. Recibido {self.r!r}")
+            raise MetadataPassphraseError(f"scrypt.r debe ser un entero >= 1. Recibido {self.r!r}")
         if type(self.p) is not int or self.p < 1:
-            raise ValueError(f"scrypt.p debe ser un entero >= 1. Recibido {self.p!r}")
+            raise MetadataPassphraseError(f"scrypt.p debe ser un entero >= 1. Recibido {self.p!r}")
         if type(self.key_length) is not int or self.key_length < 32:
-            raise ValueError(
+            raise MetadataPassphraseError(
                 f"scrypt.key_length debe ser un entero >= 32. "
                 f"Recibido {self.key_length!r}"
             )

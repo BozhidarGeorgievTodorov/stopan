@@ -15,6 +15,7 @@ from collections.abc import Iterable
 import blake3
 import grpc
 
+from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.signatures import sign_metadata_pack_hash
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
@@ -24,7 +25,7 @@ from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
 from stopan.rpc.options import grpc_channel_options
 
 
-class MetadataPackPushError(RuntimeError):
+class MetadataPackPushError(StopanNetworkError, RuntimeError):
     pass
 
 

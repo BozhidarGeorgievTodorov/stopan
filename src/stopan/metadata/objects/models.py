@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from stopan.errors import StopanDataError
+
 
 METADATA_OBJECT_FORMAT = "stopan.metadata_object"
 METADATA_OBJECT_VERSION = 1
@@ -28,7 +30,7 @@ _VALID_PROTECTION_STATES = frozenset(
 )
 
 
-class MetadataObjectError(ValueError):
+class MetadataObjectError(StopanDataError, ValueError):
     pass
 
 

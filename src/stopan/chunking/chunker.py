@@ -16,6 +16,7 @@ from typing import BinaryIO
 import blake3
 
 from stopan.chunking import fast_rabin
+from stopan.errors import StopanConfigValueError
 
 
 _AVG_CHUNK_SIZE = 65536
@@ -53,15 +54,15 @@ class FileChunker:
         max_chunk_size = int(max_chunk_size)
 
         if avg_chunk_size <= 0:
-            raise ValueError("avg_chunk_size debe ser > 0")
+            raise StopanConfigValueError("avg_chunk_size debe ser > 0")
         if avg_chunk_size & (avg_chunk_size - 1) != 0:
-            raise ValueError("avg_chunk_size debe ser potencia de 2")
+            raise StopanConfigValueError("avg_chunk_size debe ser potencia de 2")
         if min_chunk_size <= 0:
-            raise ValueError("min_chunk_size debe ser > 0")
+            raise StopanConfigValueError("min_chunk_size debe ser > 0")
         if avg_chunk_size < min_chunk_size:
-            raise ValueError("avg_chunk_size debe ser >= min_chunk_size")
+            raise StopanConfigValueError("avg_chunk_size debe ser >= min_chunk_size")
         if max_chunk_size < avg_chunk_size:
-            raise ValueError("max_chunk_size debe ser >= avg_chunk_size")
+            raise StopanConfigValueError("max_chunk_size debe ser >= avg_chunk_size")
 
         self.avg_chunk_size = avg_chunk_size
         self.min_chunk_size = min_chunk_size

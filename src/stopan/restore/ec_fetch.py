@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from stopan.restore.cluster import LazyClusterResolver
+from stopan.restore.errors import ChunkUnavailableError, RestoreDataError
 from stopan.cas.repository import CASRepository
 from stopan.metadata.database import MetadataDB, ErasureDataPackShardRecord
 from stopan.protection.ec.manifest import DataPackManifest
@@ -81,7 +82,7 @@ class ErasureChunkRecoveryService:
                     recovered = future.result()
                 except Exception as exc:
                     for chunk_hash in job.wanted_hashes:
-                        result_map[chunk_hash] = FileNotFoundError(
+                        result_map[chunk_hash] = ChunkUnavailableError(
                             f"No se pudo reconstruir data pack EC {job.pack_hash[:8]} "
                             f"para chunk {chunk_hash[:8]}: {exc}"
                         )
@@ -90,7 +91,7 @@ class ErasureChunkRecoveryService:
                 for chunk_hash in job.wanted_hashes:
                     value = recovered.get(chunk_hash)
                     if value is None:
-                        result_map[chunk_hash] = FileNotFoundError(
+                        result_map[chunk_hash] = ChunkUnavailableError(
                             f"Data pack EC {job.pack_hash[:8]} no devolvió chunk {chunk_hash[:8]}"
                         )
                         continue
@@ -116,7 +117,7 @@ class ErasureChunkRecoveryService:
         for chunk_hash in ordered_hashes:
             location = locations.get(chunk_hash)
             if location is None:
-                result_map[chunk_hash] = FileNotFoundError(
+                result_map[chunk_hash] = ChunkUnavailableError(
                     f"El chunk {chunk_hash[:8]} no pertenece a ningún data pack EC"
                 )
                 continue
@@ -136,7 +137,7 @@ class ErasureChunkRecoveryService:
                 jobs.append(self._build_recovery_job(pack_hash, wanted_hashes))
             except Exception as exc:
                 for chunk_hash in wanted_hashes:
-                    result_map[chunk_hash] = FileNotFoundError(
+                    result_map[chunk_hash] = ChunkUnavailableError(
                         f"No se pudo preparar metadata EC del pack {pack_hash[:8]} "
                         f"para chunk {chunk_hash[:8]}: {exc}"
                     )
@@ -150,14 +151,14 @@ class ErasureChunkRecoveryService:
     ) -> _ErasurePackRecoveryJob:
         pack = self.db.get_erasure_data_pack(pack_hash)
         if pack is None:
-            raise FileNotFoundError(f"metadata de data pack EC no encontrada: {pack_hash[:8]}")
+            raise RestoreDataError(f"metadata de data pack EC no encontrada: {pack_hash[:8]}")
 
         pack_chunks = self.db.get_erasure_pack_chunks(pack_hash)
         pack_shards = self.db.get_erasure_pack_shards(pack_hash)
         if not pack_chunks:
-            raise FileNotFoundError(f"data pack EC sin chunks: {pack_hash[:8]}")
+            raise RestoreDataError(f"data pack EC sin chunks: {pack_hash[:8]}")
         if len(pack_shards) < pack.data_shards:
-            raise FileNotFoundError(
+            raise RestoreDataError(
                 f"data pack EC sin suficientes shards registrados: "
                 f"{len(pack_shards)}/{pack.data_shards}"
             )
@@ -234,7 +235,7 @@ class ErasureChunkRecoveryService:
             )
 
         if len(refs_by_addr) < required:
-            raise FileNotFoundError(
+            raise ChunkUnavailableError(
                 f"data pack EC {pack_hash[:8]}: nodos online insuficientes para K shards "
                 f"({len(refs_by_addr)}/{required}). " + " | ".join(errors)
             )
@@ -278,7 +279,7 @@ class ErasureChunkRecoveryService:
 
         found.sort(key=lambda item: item.shard_index)
         if len(found) < required:
-            raise FileNotFoundError(
+            raise ChunkUnavailableError(
                 f"data pack EC {pack_hash[:8]} no tiene K shards recuperables: "
                 f"{len(found)}/{required}. " + " | ".join(errors)
             )

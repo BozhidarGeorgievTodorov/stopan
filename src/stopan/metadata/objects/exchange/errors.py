@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from stopan.errors import StopanDataError
 
-class MetadataObjectExchangeError(RuntimeError):
+
+class MetadataObjectExchangeError(StopanDataError, RuntimeError):
     pass
 
 

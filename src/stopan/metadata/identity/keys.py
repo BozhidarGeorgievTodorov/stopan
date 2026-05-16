@@ -14,6 +14,7 @@ from typing import Any
 import blake3
 
 from stopan.common.encoding import b64decode, b64encode
+from stopan.errors import StopanDependencyError
 from stopan.common.json import canonical_json_bytes
 from stopan.common.secrets import passphrase_bytes
 from stopan.metadata.identity.models import (
@@ -63,7 +64,7 @@ def require_cryptography() -> CryptographyPrimitives:
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
         from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
     except ImportError as exc:
-        raise RuntimeError("Falta la dependencia 'cryptography' para usar identidad de metadata.") from exc
+        raise StopanDependencyError("Falta la dependencia 'cryptography' para usar identidad de metadata.") from exc
 
     return CryptographyPrimitives(
         Ed25519PrivateKey=Ed25519PrivateKey,
@@ -82,7 +83,7 @@ def require_x25519() -> X25519Primitives:
     try:
         from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
     except ImportError as exc:
-        raise RuntimeError("La dependencia 'cryptography' no tiene soporte X25519 para identidad de metadata.") from exc
+        raise StopanDependencyError("La dependencia 'cryptography' no tiene soporte X25519 para identidad de metadata.") from exc
     return X25519Primitives(
         X25519PrivateKey=X25519PrivateKey,
         X25519PublicKey=X25519PublicKey,
@@ -91,10 +92,10 @@ def require_x25519() -> X25519Primitives:
 
 def validate_hex64_lower(value: str, *, name: str) -> str:
     if not isinstance(value, str):
-        raise TypeError(f"{name} debe ser string")
+        raise MetadataIdentityError(f"{name} debe ser string")
     text = value.strip()
     if len(text) != 64 or any(char not in _HEX64_ALPHABET for char in text):
-        raise ValueError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
+        raise MetadataIdentityError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
     return text
 
 
@@ -133,7 +134,7 @@ def derive_subkey(master_key: bytes, *, info: bytes) -> bytes:
 def require_private_key_role(key_role: str) -> str:
     key_role = str(key_role)
     if key_role not in _PRIVATE_KEY_ROLES:
-        raise ValueError(f"Rol de clave privada de metadata inválido: {key_role!r}")
+        raise MetadataIdentityError(f"Rol de clave privada de metadata inválido: {key_role!r}")
     return key_role
 
 
@@ -168,7 +169,7 @@ def subkey_info_for_role(key_role: str) -> bytes:
 
 def owner_id_from_public_key(public_key_raw: bytes) -> str:
     if not isinstance(public_key_raw, bytes) or len(public_key_raw) != 32:
-        raise ValueError("public_key_raw debe contener 32 bytes raw de clave pública Ed25519")
+        raise MetadataIdentityError("public_key_raw debe contener 32 bytes raw de clave pública Ed25519")
     return blake3.blake3(public_key_raw).hexdigest()
 
 

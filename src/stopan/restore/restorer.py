@@ -15,6 +15,8 @@ from stopan.metadata.database import MetadataDB
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.paths import RestorePaths, safe_restore_path
 from stopan.restore.prefetcher import OrderedBatchChunkPrefetcher
+from stopan.errors import StopanStorageError
+from stopan.restore.errors import RestoreDataError
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +80,7 @@ class SnapshotRestorer:
 
         snapshot_uuid = self.db.get_snapshot_uuid(snapshot_id)
         if not snapshot_uuid:
-            raise RuntimeError("Snapshot sin UUID")
+            raise RestoreDataError("Snapshot sin UUID")
 
         paths = RestorePaths.for_snapshot(self.base_output_dir, snapshot_uuid)
 
@@ -103,7 +105,11 @@ class SnapshotRestorer:
                 error=message,
             )
 
-        os.makedirs(paths.incomplete_dir, exist_ok=True)
+        try:
+            os.makedirs(paths.incomplete_dir, exist_ok=True)
+        except OSError as exc:
+            raise StopanStorageError(f"No se pudo preparar el directorio de restore {paths.incomplete_dir}: {exc}") from exc
+
         print(f"Restaurando Snapshot {snapshot_id} en '{paths.incomplete_dir}/'...")
         print(
             "Lectura por lotes: "

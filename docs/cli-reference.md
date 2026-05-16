@@ -68,6 +68,18 @@ También se rechazan combinaciones que dejarían flags ignorados:
 
 Se mantienen tres precedencias explícitas: `backup --safe` desactiva fast-path aunque se pase `--fast` o `--fast-remote`; `metadata push --pack-copies 0` puede combinarse con `--membership-seed` aunque no envíe el pack; y `metadata list-object-packs --pack-dir` tiene prioridad sobre `--object-store`.
 
+Los errores controlados del CLI se muestran sin traceback por defecto y usan prefijos estables según categoría:
+
+- `Error de uso de Stopan`: flags, combinaciones inválidas o configuración efectiva incompatible con el comando.
+- `Error de configuración de Stopan`: fichero YAML ausente, inválido o insuficiente.
+- `Error de datos de Stopan`: metadata, packs, hashes o estado persistido inconsistente.
+- `Error de almacenamiento de Stopan`: rutas, repositorios o stores locales no accesibles.
+- `Error de red de Stopan`: membership, RPC, peers o streams remotos no completados correctamente.
+- `Error de dependencias de Stopan`: dependencias opcionales necesarias para el flujo solicitado.
+- `Error de Stopan`: fallo interno no clasificado como error controlado de usuario.
+
+Para depuración, `STOPAN_DEBUG=1` conserva el traceback original.
+
 ## 4. Opciones avanzadas de Red y Protección
 
 **Fast-path remoto durante el backup:**

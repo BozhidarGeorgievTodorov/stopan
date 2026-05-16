@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from stopan.errors import StopanDataError
 
-class JsonFileError(RuntimeError):
+
+class JsonFileError(StopanDataError, RuntimeError):
     pass
 
 

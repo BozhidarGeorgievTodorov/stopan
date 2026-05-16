@@ -14,6 +14,7 @@ from typing import Any
 
 import grpc
 
+from stopan.errors import StopanNetworkError, StopanStorageError
 from stopan.common.fs import atomic_write_bytes, ensure_private_dir
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.passphrase import ScryptCost
@@ -26,7 +27,7 @@ from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
 from stopan.rpc.options import grpc_channel_options
 
 
-class MetadataPackRecoverError(RuntimeError):
+class MetadataPackRecoverError(StopanNetworkError, RuntimeError):
     pass
 
 
@@ -442,7 +443,10 @@ def recover_metadata_from_network(
         )[0]
 
         if pack_out is not None and best.pack_path != selected_pack_path_base:
-            data = best.pack_path.read_bytes()
+            try:
+                data = best.pack_path.read_bytes()
+            except OSError as exc:
+                raise StopanStorageError(f"No se pudo leer el metadata pack recuperado {best.pack_path}: {exc}") from exc
             atomic_write_bytes(selected_pack_path_base, data, mode=0o600)
             best_path = selected_pack_path_base
         else:

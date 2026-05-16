@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from .models import DataPackShard, ErasureCodingError, ErasureSpec, hash_bytes
+from .models import (
+    DataPackShard,
+    ErasureCodingDependencyError,
+    ErasureCodingError,
+    ErasureSpec,
+    hash_bytes,
+)
 
 
 class ZfecErasureCodec:
@@ -131,7 +137,7 @@ def _import_zfec():
     try:
         import zfec
     except ImportError as exc:
-        raise ErasureCodingError(
+        raise ErasureCodingDependencyError(
             "zfec no está instalado; añade zfec a requirements.txt para usar erasure coding"
         ) from exc
     return zfec

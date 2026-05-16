@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from stopan.cli.config_utils import choose, first_seed, load_runtime_config
+from stopan.errors import StopanDataError, StopanStorageError, StopanUsageError
 from stopan.cli.metadata_helpers import (
     distributed_pack_store_from_args,
     dir_status,
@@ -149,10 +150,14 @@ def cmd_local_store_pack(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     owner_id = owner_id_from_args(args, cfg)
     identity_file = identity_file_from_args(args, cfg)
-    pack_data = Path(args.path).expanduser().resolve().read_bytes()
+    pack_path = Path(args.path).expanduser().resolve()
+    try:
+        pack_data = pack_path.read_bytes()
+    except OSError as exc:
+        raise StopanStorageError(f"No se pudo leer el metadata pack {pack_path}: {exc}") from exc
     calculated_pack_hash = validate_pack_hash(calculate_pack_hash(pack_data))
     if args.expected_pack_hash is not None and validate_pack_hash(args.expected_pack_hash) != calculated_pack_hash:
-        raise RuntimeError(
+        raise StopanDataError(
             f"pack_hash esperado no coincide con fichero: "
             f"esperado={args.expected_pack_hash} calculado={calculated_pack_hash}"
         )
@@ -213,10 +218,13 @@ def cmd_local_retrieve_pack(args: argparse.Namespace) -> int:
         pack_hash=pack_hash,
         out_path=args.out,
     )
-    size = out_path.stat().st_size
-    calculated = calculate_pack_hash(out_path.read_bytes())
+    try:
+        size = out_path.stat().st_size
+        calculated = calculate_pack_hash(out_path.read_bytes())
+    except OSError as exc:
+        raise StopanStorageError(f"No se pudo verificar el metadata pack recuperado {out_path}: {exc}") from exc
     if calculated != pack_hash:
-        raise RuntimeError(f"pack_hash recuperado no coincide: esperado={pack_hash} calculado={calculated}")
+        raise StopanDataError(f"pack_hash recuperado no coincide: esperado={pack_hash} calculado={calculated}")
 
     print("Metadata pack recuperado del pack store local")
     print(f"   owner_id: {owner_id}")
@@ -360,9 +368,9 @@ def cmd_list_object_packs(args: argparse.Namespace) -> int:
         pack_dir = (Path(cfg.metadata.object_store_dir).expanduser() / "packs").resolve()
 
     if not pack_dir.exists():
-        raise FileNotFoundError(f"Directorio de metadata object packs no existe: {pack_dir}")
+        raise StopanUsageError(f"Directorio de metadata object packs no existe: {pack_dir}")
     if not pack_dir.is_dir():
-        raise NotADirectoryError(f"No es un directorio de metadata object packs: {pack_dir}")
+        raise StopanUsageError(f"No es un directorio de metadata object packs: {pack_dir}")
 
     service = object_pack_service_from_config_defaults(cfg)
     paths = sorted(pack_dir.glob("*.stopanmetapack"), key=lambda item: item.name)
@@ -397,7 +405,7 @@ def cmd_list_object_packs(args: argparse.Namespace) -> int:
 
 def cmd_gc_object_store(args: argparse.Namespace) -> int:
     if args.objects_only and args.packs_only:
-        raise ValueError("'--objects-only' y '--packs-only' son incompatibles.")
+        raise StopanUsageError("'--objects-only' y '--packs-only' son incompatibles.")
 
     cfg = load_runtime_config(args)
     object_store_dir = object_store_dir_from_args(args, cfg)
@@ -514,7 +522,7 @@ def find_reusable_latest_object_pack(
         return None
 
     if not resolved_pack_dir.is_dir():
-        raise NotADirectoryError(f"No es un directorio de metadata packs: {resolved_pack_dir}")
+        raise StopanUsageError(f"No es un directorio de metadata packs: {resolved_pack_dir}")
 
     graph_service = object_graph_service_from_config_defaults(cfg)
     store_inspection = graph_service.inspect_store(
@@ -524,7 +532,7 @@ def find_reusable_latest_object_pack(
     )
     latest = store_inspection.latest
     if latest is None:
-        raise RuntimeError(f"El metadata object store no tiene latest: {object_store_dir}")
+        raise StopanDataError(f"El metadata object store no tiene latest: {object_store_dir}")
 
     candidates = []
 
@@ -605,21 +613,21 @@ def cmd_push(args: argparse.Namespace) -> int:
 
     if args.pack_in:
         if args.object_store:
-            raise ValueError("'--pack-in' y '--object-store' son incompatibles.")
+            raise StopanUsageError("'--pack-in' y '--object-store' son incompatibles.")
         if args.pack_out:
-            raise ValueError("'--pack-in' y '--pack-out' son incompatibles.")
+            raise StopanUsageError("'--pack-in' y '--pack-out' son incompatibles.")
         if args.pack_dir:
-            raise ValueError("'--pack-in' y '--pack-dir' son incompatibles.")
+            raise StopanUsageError("'--pack-in' y '--pack-dir' son incompatibles.")
 
         result = push_pack_result_from_path(args, cfg, pack_path=args.pack_in)
         return print_metadata_pack_push_result(result)
 
     if args.pack_out and args.pack_dir:
-        raise ValueError("'--pack-out' y '--pack-dir' son incompatibles.")
+        raise StopanUsageError("'--pack-out' y '--pack-dir' son incompatibles.")
 
     object_store_dir = args.object_store or cfg.metadata.object_store_dir
     if not object_store_dir:
-        raise ValueError("Se requiere --object-store o metadata.object_store_dir.")
+        raise StopanUsageError("Se requiere --object-store o metadata.object_store_dir.")
 
     passphrase = passphrase_for_decrypt(args)
     identity_file = identity_file_from_args(args, cfg)
@@ -679,7 +687,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     owner_id = owner_id_from_args(args, cfg)
     object_store_dir = args.object_store or cfg.metadata.object_store_dir
     if not object_store_dir:
-        raise ValueError("Se requiere --object-store o metadata.object_store_dir.")
+        raise StopanUsageError("Se requiere --object-store o metadata.object_store_dir.")
 
     passphrase = passphrase_for_decrypt(args)
 

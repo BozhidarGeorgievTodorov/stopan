@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from stopan.errors import StopanConfigTypeError, StopanConfigValueError
+
 
 def passphrase_bytes(passphrase: str | bytes) -> bytes:
     if isinstance(passphrase, str):
@@ -7,9 +9,9 @@ def passphrase_bytes(passphrase: str | bytes) -> bytes:
     elif isinstance(passphrase, bytes):
         data = passphrase
     else:
-        raise TypeError(
+        raise StopanConfigTypeError(
             f"passphrase debe ser str o bytes; recibido {type(passphrase).__name__}"
         )
     if not data:
-        raise ValueError("passphrase no puede estar vacía")
+        raise StopanConfigValueError("passphrase no puede estar vacía")
     return data

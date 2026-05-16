@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from stopan.cli.config_utils import choose
+from stopan.errors import StopanUsageError
 from stopan.metadata.identity import resolve_owner_id
 from stopan.metadata.identity.passphrase import ScryptCost, read_passphrase_file
 from stopan.metadata.objects.service import MetadataObjectGraphStoreService
@@ -20,16 +21,16 @@ def prompt_new_passphrase() -> str:
     first = getpass.getpass("Metadata vault passphrase: ")
     second = getpass.getpass("Repeat passphrase: ")
     if first != second:
-        raise ValueError("Las passphrases no coinciden.")
+        raise StopanUsageError("Las passphrases no coinciden.")
     if not first:
-        raise ValueError("La passphrase no puede estar vacía.")
+        raise StopanUsageError("La passphrase no puede estar vacía.")
     return first
 
 
 def prompt_existing_passphrase() -> str:
     value = getpass.getpass("Metadata vault passphrase: ")
     if not value:
-        raise ValueError("La passphrase no puede estar vacía.")
+        raise StopanUsageError("La passphrase no puede estar vacía.")
     return value
 
 
@@ -58,7 +59,7 @@ def passphrase_for_object_store_export(args: Namespace, *, object_store_dir: str
 def object_store_dir_from_args(args: Namespace, cfg: Any) -> str:
     object_store_dir = getattr(args, "object_store", None) or cfg.metadata.object_store_dir
     if not object_store_dir:
-        raise ValueError("Se requiere --object-store o metadata.object_store_dir.")
+        raise StopanUsageError("Se requiere --object-store o metadata.object_store_dir.")
     return str(object_store_dir)
 
 
@@ -158,7 +159,7 @@ def dir_status(path_text: str) -> str:
 def identity_file_from_args(args: Namespace, cfg: Any) -> str:
     identity_file = getattr(args, "identity_file", None) or cfg.metadata.identity_file
     if not identity_file:
-        raise ValueError("Se requiere --identity-file o metadata.identity_file.")
+        raise StopanUsageError("Se requiere --identity-file o metadata.identity_file.")
     return str(identity_file)
 
 

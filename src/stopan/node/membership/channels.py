@@ -12,6 +12,7 @@ import threading
 import grpc
 
 from stopan.protos import membership_pb2_grpc
+from stopan.node.errors import MembershipConfigError
 from stopan.rpc.options import grpc_channel_options
 
 from .validation import is_valid_address
@@ -41,7 +42,7 @@ class ChannelCache:
         """Devuelve un stub Membership reutilizable para address."""
         address = str(address).strip()
         if not is_valid_address(address):
-            raise ValueError(f"Dirección de membership inválida: {address!r}")
+            raise MembershipConfigError(f"Dirección de membership inválida: {address!r}")
 
         with self._lock:
             if address not in self._map:

@@ -17,14 +17,19 @@ import blake3
 import zstandard as zstd
 
 from stopan.config.defaults import DEFAULT_NODE_LOCAL_SHARD_DIR
+from stopan.errors import StopanDataError, StopanStorageError
 
 
-class CASRepositoryError(Exception):
+class CASRepositoryError(StopanStorageError):
     """Error base del repositorio CAS."""
 
 
-class CASCorruptionError(CASRepositoryError):
+class CASCorruptionError(StopanDataError, CASRepositoryError):
     """El chunk almacenado está corrupto o no coincide con su hash de contenido."""
+
+
+class CASMissingChunkError(CASRepositoryError, FileNotFoundError):
+    """Chunk ausente en el CAS local, compatible con FileNotFoundError."""
 
 
 class CASRepository:
@@ -46,7 +51,10 @@ class CASRepository:
 
     def __init__(self, data_folder: str = DEFAULT_NODE_LOCAL_SHARD_DIR):
         self.data_folder = os.path.abspath(data_folder)
-        os.makedirs(self.data_folder, exist_ok=True)
+        try:
+            os.makedirs(self.data_folder, exist_ok=True)
+        except OSError as exc:
+            raise CASRepositoryError(f"No se pudo preparar el directorio CAS {self.data_folder}: {exc}") from exc
 
         # Los contextos Zstd subyacentes en C no son thread-safe. Se usa un
         # compresor/descompresor por hilo para permitir concurrencia segura.
@@ -91,10 +99,15 @@ class CASRepository:
         """Devuelve el blob comprimido tal como está almacenado."""
         path = self._chunk_path(chunk_hash)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Chunk no encontrado en CAS: {chunk_hash}")
+            raise CASMissingChunkError(f"Chunk no encontrado en CAS: {chunk_hash}")
 
-        with open(path, "rb") as handle:
-            return handle.read()
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        except FileNotFoundError as exc:
+            raise CASMissingChunkError(f"Chunk no encontrado en CAS: {chunk_hash}") from exc
+        except OSError as exc:
+            raise CASRepositoryError(f"No se pudo leer el chunk {chunk_hash} en CAS: {exc}") from exc
 
     def _write_once(self, path: str, data: bytes) -> bool:
         """
@@ -115,8 +128,11 @@ class CASRepository:
             written = False
 
             try:
-                with open(temp_path, "wb") as handle:
-                    handle.write(data)
+                try:
+                    with open(temp_path, "wb") as handle:
+                        handle.write(data)
+                except OSError as exc:
+                    raise CASRepositoryError(f"No se pudo escribir archivo temporal CAS {temp_path}: {exc}") from exc
 
                 try:
                     os.replace(temp_path, path)
@@ -128,19 +144,19 @@ class CASRepository:
                     if attempt == 0:
                         self._forget_parent_dir(path)
                         continue
-                    raise
+                    raise CASRepositoryError(f"No se pudo publicar chunk CAS {path}: {exc}") from exc
 
-                except OSError:
+                except OSError as exc:
                     if os.path.exists(path):
                         return False
-                    raise
+                    raise CASRepositoryError(f"No se pudo publicar chunk CAS {path}: {exc}") from exc
 
             except FileNotFoundError as exc:
                 last_error = exc
                 if attempt == 0:
                     self._forget_parent_dir(path)
                     continue
-                raise
+                raise CASRepositoryError(f"No se pudo escribir chunk CAS {path}: {exc}") from exc
 
             finally:
                 if not written:
@@ -150,7 +166,7 @@ class CASRepository:
                         pass
 
         if last_error is not None:
-            raise last_error
+            raise CASRepositoryError(f"No se pudo escribir chunk CAS {path}: {last_error}") from last_error
 
         return False
 
@@ -167,7 +183,10 @@ class CASRepository:
         with self._dir_lock:
             if parent in self._ensured_dirs:
                 return
-            os.makedirs(parent, exist_ok=True)
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as exc:
+                raise CASRepositoryError(f"No se pudo crear directorio CAS {parent}: {exc}") from exc
             self._ensured_dirs.add(parent)
 
     def _forget_parent_dir(self, path: str) -> None:

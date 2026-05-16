@@ -11,7 +11,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from stopan.errors import (
+    StopanConfigTypeError,
+    StopanConfigValueError,
+    StopanDataError,
+)
 from stopan.metadata.identity.passphrase import ScryptCost
+
+
+class MetadataAutoExportError(StopanDataError, RuntimeError):
+    """Fallo al materializar el metadata object graph o el pack tras una mutación."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,13 +36,17 @@ class MetadataObjectGraphAutoExport:
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
-            raise TypeError("metadata auto-export enabled debe ser bool")
+            raise StopanConfigTypeError("metadata auto-export enabled debe ser bool")
         if not isinstance(self.include_protection, bool):
-            raise TypeError("metadata auto-export include_protection debe ser bool")
+            raise StopanConfigTypeError(
+                "metadata auto-export include_protection debe ser bool"
+            )
         if not isinstance(self.auto_pack, bool):
-            raise TypeError("metadata auto-export auto_pack debe ser bool")
+            raise StopanConfigTypeError("metadata auto-export auto_pack debe ser bool")
         if not isinstance(self.scrypt_cost, ScryptCost):
-            raise TypeError("metadata auto-export scrypt_cost debe ser ScryptCost")
+            raise StopanConfigTypeError(
+                "metadata auto-export scrypt_cost debe ser ScryptCost"
+            )
 
         if not self.enabled:
             return
@@ -42,23 +55,25 @@ class MetadataObjectGraphAutoExport:
             not isinstance(self.object_store_dir, str)
             or not self.object_store_dir.strip()
         ):
-            raise ValueError(
+            raise StopanConfigValueError(
                 "metadata auto-export requiere object_store_dir cuando está activado"
             )
         if (
             not isinstance(self.passphrase_file, str)
             or not self.passphrase_file.strip()
         ):
-            raise ValueError(
+            raise StopanConfigValueError(
                 "metadata auto-export requiere passphrase_file cuando está activado"
             )
         if self.pack_dir is not None and not isinstance(self.pack_dir, str):
-            raise TypeError("metadata auto-export pack_dir debe ser str o None")
+            raise StopanConfigTypeError(
+                "metadata auto-export pack_dir debe ser str o None"
+            )
         if self.auto_pack and (
             not isinstance(self.identity_file, str)
             or not self.identity_file.strip()
         ):
-            raise ValueError("metadata auto-pack requiere identity_file")
+            raise StopanConfigValueError("metadata auto-pack requiere identity_file")
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +116,7 @@ def export_metadata_object_graph_after_metadata_change(
             include_protection=settings.include_protection,
         )
     except Exception as exc:
-        raise RuntimeError(
+        raise MetadataAutoExportError(
             f"{context_label} completado, pero falló el export del metadata "
             f"object graph cifrado: {exc}"
         ) from exc
@@ -137,7 +152,7 @@ def export_metadata_object_graph_after_metadata_change(
             pack_hash = pack_result.pack_hash
             objects_packed = pack_result.objects_packed
         except Exception as exc:
-            raise RuntimeError(
+            raise MetadataAutoExportError(
                 f"{context_label} completado y object graph actualizado, "
                 f"pero falló metadata auto-pack: {exc}"
             ) from exc

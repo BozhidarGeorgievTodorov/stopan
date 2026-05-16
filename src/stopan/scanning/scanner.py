@@ -4,6 +4,8 @@ import os
 import stat as statmod
 from collections.abc import Iterator
 
+from stopan.errors import StopanUsageError
+
 
 class TreeWalker:
     """
@@ -27,10 +29,10 @@ class TreeWalker:
         try:
             root_stat = os.stat(root_path, follow_symlinks=False)
         except FileNotFoundError:
-            raise FileNotFoundError(root_path) from None
+            raise StopanUsageError(f"Directorio no encontrado: {root_path}") from None
 
         if not statmod.S_ISDIR(root_stat.st_mode):
-            raise NotADirectoryError(root_path)
+            raise StopanUsageError(f"No es un directorio: {root_path}")
 
         self.root_path = root_path
         self.deterministic = bool(deterministic)

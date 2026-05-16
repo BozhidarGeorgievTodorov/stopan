@@ -8,8 +8,17 @@ from dataclasses import dataclass
 from collections.abc import Iterable
 
 from stopan.config.defaults import DEFAULT_NODE_DB_FILE
+from stopan.errors import StopanDataError
 from stopan.protection.policy import ProtectionRecord, ProtectionState, is_record_sufficient
 
+
+
+class MetadataDatabaseError(StopanDataError, RuntimeError):
+    """Inconsistencia en metadata persistida o filas derivadas de la base SQLite."""
+
+
+class MetadataDatabaseValueError(StopanDataError, ValueError):
+    """Valor inválido de metadata persistida, preservando compatibilidad con ValueError."""
 
 
 @dataclass(frozen=True)
@@ -425,10 +434,10 @@ class MetadataDB:
         """, (item_id,)).fetchone()
 
         if row is None:
-            raise ValueError(f"Snapshot item does not exist: {item_id}")
+            raise MetadataDatabaseValueError(f"Snapshot item does not exist: {item_id}")
 
         if row["recipe_id"] is None:
-            raise ValueError(f"Snapshot item has no associated recipe: {item_id}")
+            raise MetadataDatabaseValueError(f"Snapshot item has no associated recipe: {item_id}")
 
         cursor = self.conn.execute("""
             SELECT chunk_hash
@@ -459,14 +468,14 @@ class MetadataDB:
 
         for expected_order, (chunk_order, chunk_hash, chunk_size) in enumerate(chunks):
             if chunk_order != expected_order:
-                raise RuntimeError(
+                raise MetadataDatabaseError(
                     "recipe chunks must be contiguous from 0: "
                     f"expected={expected_order} got={chunk_order}"
                 )
             if not isinstance(chunk_hash, str) or len(chunk_hash) != 64 or any(c not in "0123456789abcdef" for c in chunk_hash):
-                raise RuntimeError(f"invalid chunk hash in recipe {recipe_hash}: {chunk_hash!r}")
+                raise MetadataDatabaseError(f"invalid chunk hash in recipe {recipe_hash}: {chunk_hash!r}")
             if chunk_size < 1:
-                raise RuntimeError(f"invalid chunk size in recipe {recipe_hash}: {chunk_size}")
+                raise MetadataDatabaseError(f"invalid chunk size in recipe {recipe_hash}: {chunk_size}")
 
         with self.conn:
             self.conn.execute("""
@@ -481,10 +490,10 @@ class MetadataDB:
                 LIMIT 1
             """, (recipe_hash,)).fetchone()
             if row is None:
-                raise RuntimeError(f"Could not resolve recipe_id for {recipe_hash}")
+                raise MetadataDatabaseError(f"Could not resolve recipe_id for {recipe_hash}")
 
             if row["chunk_count"] != chunk_count or row["total_size"] != total_size:
-                raise RuntimeError(
+                raise MetadataDatabaseError(
                     "Inconsistent recipe_hash: "
                     f"{recipe_hash} already maps to chunk_count={row['chunk_count']} "
                     f"total_size={row['total_size']}, attempted chunk_count={chunk_count} "
@@ -506,7 +515,7 @@ class MetadataDB:
             ]
             if existing_chunks:
                 if existing_chunks != chunks:
-                    raise RuntimeError(f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}")
+                    raise MetadataDatabaseError(f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}")
             elif chunk_count > 0:
                 self.conn.executemany("""
                     INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
@@ -645,9 +654,9 @@ class MetadataDB:
         total_shards = data_shards + parity_shards
 
         if padded_size != shard_size * data_shards:
-            raise RuntimeError("padded_size debe coincidir con shard_size * data_shards")
+            raise MetadataDatabaseError("padded_size debe coincidir con shard_size * data_shards")
         if payload_size > padded_size:
-            raise RuntimeError("payload_size no puede ser mayor que padded_size")
+            raise MetadataDatabaseError("payload_size no puede ser mayor que padded_size")
 
         chunk_rows = _normalize_erasure_chunk_rows(chunks, payload_size)
         shard_rows = _normalize_erasure_shard_rows(shards, total_shards)
@@ -996,7 +1005,7 @@ class MetadataDB:
                 int(existing["shard_size"]),
             )
             if current != expected:
-                raise RuntimeError(f"erasure data pack inconsistente: {pack_hash}")
+                raise MetadataDatabaseError(f"erasure data pack inconsistente: {pack_hash}")
             return
 
         self.conn.execute("""
@@ -1039,7 +1048,7 @@ class MetadataDB:
                     int(existing["chunk_ordinal"]),
                 )
                 if current != (pack_hash, offset, length, ordinal):
-                    raise RuntimeError(f"chunk EC ya asignado a otro pack: {chunk_hash}")
+                    raise MetadataDatabaseError(f"chunk EC ya asignado a otro pack: {chunk_hash}")
                 continue
 
             self.conn.execute("""
@@ -1069,7 +1078,7 @@ class MetadataDB:
                     int(existing["size"]),
                 )
                 if current != (shard_hash, node_id, size):
-                    raise RuntimeError(
+                    raise MetadataDatabaseError(
                         f"shard EC inconsistente: pack={pack_hash} index={shard_index}"
                     )
                 continue
@@ -1430,40 +1439,40 @@ _HASH64_ALPHABET = set("0123456789abcdef")
 
 def _require_hash64(name: str, value: object) -> str:
     if not isinstance(value, str):
-        raise RuntimeError(f"{name} debe ser str; recibido {type(value).__name__}")
+        raise MetadataDatabaseError(f"{name} debe ser str; recibido {type(value).__name__}")
     text = value.strip()
     if len(text) != 64 or any(char not in _HASH64_ALPHABET for char in text):
-        raise RuntimeError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
+        raise MetadataDatabaseError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
     return text
 
 
 def _require_non_empty_text(name: str, value: object) -> str:
     if not isinstance(value, str):
-        raise RuntimeError(f"{name} debe ser str; recibido {type(value).__name__}")
+        raise MetadataDatabaseError(f"{name} debe ser str; recibido {type(value).__name__}")
     text = value.strip()
     if not text:
-        raise RuntimeError(f"{name} no puede estar vacío")
+        raise MetadataDatabaseError(f"{name} no puede estar vacío")
     return text
 
 
 def _require_non_negative_int(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise RuntimeError(f"{name} debe ser int; recibido {type(value).__name__}")
+        raise MetadataDatabaseError(f"{name} debe ser int; recibido {type(value).__name__}")
     if value < 0:
-        raise RuntimeError(f"{name} debe ser >= 0; recibido {value}")
+        raise MetadataDatabaseError(f"{name} debe ser >= 0; recibido {value}")
     return value
 
 
 def _require_positive_int(name: str, value: object) -> int:
     number = _require_non_negative_int(name, value)
     if number <= 0:
-        raise RuntimeError(f"{name} debe ser > 0; recibido {number}")
+        raise MetadataDatabaseError(f"{name} debe ser > 0; recibido {number}")
     return number
 
 
 def _protection_state_value(value: ProtectionState) -> str:
     if not isinstance(value, ProtectionState):
-        raise RuntimeError("protection_state debe ser ProtectionState")
+        raise MetadataDatabaseError("protection_state debe ser ProtectionState")
     return value.value
 
 
@@ -1481,19 +1490,19 @@ def _normalize_erasure_chunk_rows(
         for chunk_hash, offset, length, ordinal in chunks
     ]
     if not rows:
-        raise RuntimeError("un data pack EC debe contener al menos un chunk")
+        raise MetadataDatabaseError("un data pack EC debe contener al menos un chunk")
 
     rows.sort(key=lambda item: item[3])
     previous_end = 0
     for expected_ordinal, (_chunk_hash, offset, length, ordinal) in enumerate(rows):
         if ordinal != expected_ordinal:
-            raise RuntimeError("los chunks EC deben tener ordinales consecutivos desde 0")
+            raise MetadataDatabaseError("los chunks EC deben tener ordinales consecutivos desde 0")
         if offset != previous_end:
-            raise RuntimeError("los chunks EC deben cubrir el payload de forma contigua")
+            raise MetadataDatabaseError("los chunks EC deben cubrir el payload de forma contigua")
         previous_end = offset + length
 
     if previous_end != payload_size:
-        raise RuntimeError("los chunks EC no cubren exactamente payload_size")
+        raise MetadataDatabaseError("los chunks EC no cubren exactamente payload_size")
 
     return rows
 
@@ -1515,11 +1524,11 @@ def _normalize_erasure_shard_rows(
 
     indexes = [row[0] for row in rows]
     if indexes != list(range(total_shards)):
-        raise RuntimeError("los shards EC deben cubrir todos los índices esperados")
+        raise MetadataDatabaseError("los shards EC deben cubrir todos los índices esperados")
 
     node_ids = [row[2] for row in rows]
     if len(node_ids) != len(set(node_ids)):
-        raise RuntimeError("los shards EC de un pack deben ir a nodos distintos")
+        raise MetadataDatabaseError("los shards EC de un pack deben ir a nodos distintos")
 
     return rows
 

@@ -21,6 +21,7 @@ from stopan.config.defaults import (
     DEFAULT_REPLICATION_STREAM_TIMEOUT_S,
     DEFAULT_REPLICATION_TARGET_PARALLELISM,
 )
+from stopan.errors import StopanConfigValueError
 from stopan.protos import p2p_storage_pb2
 from stopan.replication.outcomes import (
     ChunkAccumulator,
@@ -58,13 +59,13 @@ class StreamingReplicationCoordinator:
     ):
         origin_node_id = str(origin_node_id).strip()
         if not origin_node_id:
-            raise ValueError("StreamingReplicationCoordinator requiere origin_node_id no vacío.")
+            raise StopanConfigValueError("StreamingReplicationCoordinator requiere origin_node_id no vacío.")
 
         self.repo = repo
         self.cluster = cluster
         self.rf = int(rf)
         if self.rf < 1:
-            raise ValueError("StreamingReplicationCoordinator requiere rf >= 1.")
+            raise StopanConfigValueError("StreamingReplicationCoordinator requiere rf >= 1.")
         self.cluster_token = str(cluster_token or "")
         self.origin_node_id = origin_node_id
         self.probe_timeout_s = float(probe_timeout_s)

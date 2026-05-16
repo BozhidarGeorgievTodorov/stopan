@@ -23,6 +23,7 @@ from stopan.config.defaults import (
     DEFAULT_MEMBERSHIP_SUSPECT_TIMEOUT_S,
 )
 from stopan.protos import membership_pb2
+from stopan.node.errors import MembershipConfigError
 
 
 STATE_ORDER = {
@@ -61,27 +62,27 @@ class MembershipSettings:
     def __post_init__(self) -> None:
         """Valida que los parámetros de membership sean utilizables."""
         if float(self.protocol_period_s) <= 0:
-            raise ValueError("membership.protocol_period_s debe ser > 0")
+            raise MembershipConfigError("membership.protocol_period_s debe ser > 0")
         if float(self.ping_timeout_s) <= 0:
-            raise ValueError("membership.ping_timeout_s debe ser > 0")
+            raise MembershipConfigError("membership.ping_timeout_s debe ser > 0")
         if float(self.rpc_timeout_s) <= 0:
-            raise ValueError("membership.rpc_timeout_s debe ser > 0")
+            raise MembershipConfigError("membership.rpc_timeout_s debe ser > 0")
         if float(self.suspect_timeout_s) <= 0:
-            raise ValueError("membership.suspect_timeout_s debe ser > 0")
+            raise MembershipConfigError("membership.suspect_timeout_s debe ser > 0")
         if int(self.indirect_ping_fanout) < 0:
-            raise ValueError("membership.indirect_ping_fanout debe ser >= 0")
+            raise MembershipConfigError("membership.indirect_ping_fanout debe ser >= 0")
         if int(self.max_gossip_events) < 0:
-            raise ValueError("membership.max_gossip_events debe ser >= 0")
+            raise MembershipConfigError("membership.max_gossip_events debe ser >= 0")
         if float(self.gossip_ttl_s) <= 0:
-            raise ValueError("membership.gossip_ttl_s debe ser > 0")
+            raise MembershipConfigError("membership.gossip_ttl_s debe ser > 0")
         if int(self.grpc_max_message_bytes) <= 0:
-            raise ValueError("grpc.max_message_bytes debe ser > 0")
+            raise MembershipConfigError("grpc.max_message_bytes debe ser > 0")
         if int(self.grpc_keepalive_time_ms) <= 0:
-            raise ValueError("grpc.keepalive_time_ms debe ser > 0")
+            raise MembershipConfigError("grpc.keepalive_time_ms debe ser > 0")
         if int(self.grpc_keepalive_timeout_ms) <= 0:
-            raise ValueError("grpc.keepalive_timeout_ms debe ser > 0")
+            raise MembershipConfigError("grpc.keepalive_timeout_ms debe ser > 0")
         if not isinstance(self.grpc_keepalive_permit_without_calls, bool):
-            raise ValueError("grpc.keepalive_permit_without_calls debe ser booleano")
+            raise MembershipConfigError("grpc.keepalive_permit_without_calls debe ser booleano")
 
 
 @dataclass

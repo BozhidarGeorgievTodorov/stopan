@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from stopan.errors import StopanStorageOSError
+
 
 def fsync_dir(path: Path) -> None:
     try:
@@ -16,7 +18,11 @@ def fsync_dir(path: Path) -> None:
 
 
 def ensure_private_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise StopanStorageOSError(f"No se pudo crear el directorio {path}: {exc}") from exc
+
     try:
         os.chmod(path, 0o700)
     except OSError:
@@ -30,16 +36,29 @@ def atomic_write_bytes(
     mode: int = 0o600,
     sync_parent_dir: bool = True,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise StopanStorageOSError(f"No se pudo crear el directorio padre de {path}: {exc}") from exc
+
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp")
     written = False
     try:
-        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except OSError as exc:
+            raise StopanStorageOSError(f"No se pudo crear el archivo temporal {temp_path}: {exc}") from exc
         try:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
+        except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise StopanStorageOSError(f"No se pudo escribir {temp_path}: {exc}") from exc
         except Exception:
             try:
                 os.close(fd)
@@ -47,8 +66,15 @@ def atomic_write_bytes(
                 pass
             raise
 
-        os.replace(temp_path, path)
-        os.chmod(path, mode)
+        try:
+            os.replace(temp_path, path)
+        except OSError as exc:
+            raise StopanStorageOSError(f"No se pudo reemplazar {path} con {temp_path}: {exc}") from exc
+
+        try:
+            os.chmod(path, mode)
+        except OSError as exc:
+            raise StopanStorageOSError(f"No se pudieron ajustar permisos de {path}: {exc}") from exc
         written = True
         if sync_parent_dir:
             fsync_dir(path.parent)

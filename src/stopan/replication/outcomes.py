@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from stopan.errors import StopanNetworkError
 from stopan.protos import p2p_storage_pb2
 
 
@@ -47,7 +48,7 @@ class TargetExecutionResult:
     transport_error: str | None = None
 
 
-class StreamingReplicationError(RuntimeError):
+class StreamingReplicationError(StopanNetworkError, RuntimeError):
     """Error de stream que conserva los ACKs recibidos antes del fallo."""
 
     def __init__(self, message: str, *, acks: dict[str, TargetAck]):

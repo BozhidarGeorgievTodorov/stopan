@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 
+from stopan.errors import StopanDataError
 
-class EncodingError(RuntimeError):
+
+class EncodingError(StopanDataError, RuntimeError):
     pass
 
 

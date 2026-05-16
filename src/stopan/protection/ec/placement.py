@@ -12,7 +12,13 @@ from dataclasses import dataclass
 
 from stopan.placement.cluster_view import ClusterMember, ClusterView
 
-from .models import ErasureCodingError, ErasureSpec, require_hash64
+from .models import (
+    ErasureCodingConfigError,
+    ErasureCodingError,
+    ErasureCodingNetworkError,
+    ErasureSpec,
+    require_hash64,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,9 +35,9 @@ class DataPackShardPlacement:
         address = str(self.address or "").strip()
 
         if not node_id:
-            raise ErasureCodingError("node_id no puede estar vacío")
+            raise ErasureCodingNetworkError("node_id no puede estar vacío")
         if not address:
-            raise ErasureCodingError("address no puede estar vacío")
+            raise ErasureCodingNetworkError("address no puede estar vacío")
 
         object.__setattr__(self, "pack_hash", pack_hash)
         object.__setattr__(self, "shard_index", shard_index)
@@ -55,9 +61,9 @@ def plan_data_pack_shard_placement(
 
     origin_node_id = str(origin_node_id or "").strip()
     if not origin_node_id:
-        raise ErasureCodingError("origin_node_id no puede estar vacío")
+        raise ErasureCodingConfigError("origin_node_id no puede estar vacío")
     if origin_node_id not in cluster.node_ids:
-        raise ErasureCodingError(
+        raise ErasureCodingConfigError(
             "origin_node_id no pertenece a la vista de membership; "
             "usa el node_id canónico de ClusterView.self_node_id al colocar shards EC"
         )
@@ -69,7 +75,7 @@ def plan_data_pack_shard_placement(
         excluded_node_ids={origin_node_id},
     )
     if len(members) < spec.total_shards:
-        raise ErasureCodingError(
+        raise ErasureCodingNetworkError(
             "no hay suficientes nodos remotos para colocar shards EC: "
             f"necesarios={spec.total_shards} disponibles={len(members)}"
         )

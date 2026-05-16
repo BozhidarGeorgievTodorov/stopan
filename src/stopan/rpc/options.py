@@ -7,6 +7,7 @@ usen una configuración coherente.
 
 from __future__ import annotations
 
+from stopan.errors import StopanConfigValueError
 from stopan.config.defaults import (
     DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS,
     DEFAULT_GRPC_KEEPALIVE_TIME_MS,
@@ -43,7 +44,7 @@ def _message_size_options(max_message_bytes: int) -> list[tuple[str, int]]:
     """Valida y devuelve límites comunes de envío/recepción."""
     value = int(max_message_bytes)
     if value <= 0:
-        raise ValueError("grpc.max_message_bytes debe ser > 0")
+        raise StopanConfigValueError("grpc.max_message_bytes debe ser > 0")
 
     return [
         ("grpc.max_send_message_length", value),

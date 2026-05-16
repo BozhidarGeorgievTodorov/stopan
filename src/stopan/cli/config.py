@@ -7,6 +7,7 @@ from pathlib import Path
 
 from stopan.config.example import EXAMPLE_CONFIG
 from stopan.config.loader import load_config
+from stopan.errors import StopanStorageError
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -32,8 +33,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.action == "example":
         if args.out:
             path = Path(args.out)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(EXAMPLE_CONFIG, encoding="utf-8")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(EXAMPLE_CONFIG, encoding="utf-8")
+            except OSError as exc:
+                raise StopanStorageError(f"No se pudo escribir la configuración de ejemplo en {path}: {exc}") from exc
             print(f"Configuración de ejemplo escrita en: {path}")
         else:
             print(EXAMPLE_CONFIG)

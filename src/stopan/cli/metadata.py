@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args
+from stopan.errors import StopanUsageError
 from stopan.cli.validation import (
     Flag,
     FloatRange,
@@ -745,5 +746,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         handler = COMMAND_HANDLERS[args.command]
     except KeyError as exc:
-        raise ValueError(f"Comando metadata desconocido: {args.command!r}") from exc
+        raise StopanUsageError(f"Comando metadata desconocido: {args.command!r}") from exc
     return handler(args)

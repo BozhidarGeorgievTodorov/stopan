@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from stopan.errors import StopanNetworkError, StopanUsageError
 from stopan.placement.cluster_view import ClusterMembershipClient, ClusterView
 
 
@@ -37,7 +38,7 @@ def require_cluster_view(
     """
     seed = str(membership_seed or "").strip()
     if not seed:
-        raise ValueError(
+        raise StopanUsageError(
             missing_seed_message
             or "Falta membership seed. Usa '--membership-seed' o define cluster.seeds."
         )
@@ -51,7 +52,7 @@ def require_cluster_view(
     ).get_cluster_view()
 
     if not cluster.members:
-        raise RuntimeError(empty_cluster_message or f"No se pudo obtener miembros elegibles desde seed={seed}")
+        raise StopanNetworkError(empty_cluster_message or f"No se pudo obtener miembros elegibles desde seed={seed}")
 
     return ClusterViewResolution(seed=seed, cluster=cluster)
 

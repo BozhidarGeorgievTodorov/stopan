@@ -18,6 +18,7 @@ from stopan.protos import membership_pb2_grpc
 from .hrw import hrw_top_k_node_ids
 from stopan.placement.epoch import compute_placement_epoch
 from stopan.rpc.errors import format_rpc_error
+from stopan.errors import StopanNetworkError, StopanUsageError
 from stopan.rpc.options import grpc_channel_options
 
 
@@ -143,7 +144,7 @@ class ClusterMembershipClient:
     ):
         seed_addr = seed_addr.strip()
         if not seed_addr:
-            raise ValueError("ClusterMembershipClient requiere un seed_addr no vacío")
+            raise StopanUsageError("ClusterMembershipClient requiere un seed_addr no vacío")
 
         self.seed_addr = seed_addr
         self.self_addr = str(self_addr or "").strip()
@@ -164,7 +165,7 @@ class ClusterMembershipClient:
                     timeout=self.timeout_s,
                 )
         except grpc.RpcError as exc:
-            raise RuntimeError(
+            raise StopanNetworkError(
                 f"No se pudo obtener la vista del clúster desde seed={self.seed_addr}: "
                 f"{format_rpc_error(exc)}"
             ) from exc

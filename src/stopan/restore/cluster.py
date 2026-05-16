@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 
+from stopan.errors import StopanConfigValueError
 from stopan.placement.cluster_resolver import require_cluster_view
 from stopan.protection.policy import normalize_remote_rf
 
@@ -51,7 +52,7 @@ class LazyClusterResolver:
 
         self.origin_node_id = str(origin_node_id).strip()
         if not self.origin_node_id:
-            raise ValueError("LazyClusterResolver requiere origin_node_id no vacío.")
+            raise StopanConfigValueError("LazyClusterResolver requiere origin_node_id no vacío.")
 
         self._cluster = None
         self._announced = False

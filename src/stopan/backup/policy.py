@@ -9,6 +9,7 @@ safe_mode desactiva ambos caminos rápidos.
 from __future__ import annotations
 
 from stopan.backup.models import BackupPolicy
+from stopan.errors import StopanConfigValueError
 from stopan.placement.cluster_resolver import try_cluster_view
 from stopan.protection.policy import normalize_remote_rf
 
@@ -31,7 +32,7 @@ def resolve_remote_placement_epoch(
     """
     origin_node_id = str(origin_node_id or "").strip()
     if not origin_node_id:
-        raise ValueError("resolve_remote_placement_epoch requiere un origin_node_id.")
+        raise StopanConfigValueError("resolve_remote_placement_epoch requiere un origin_node_id.")
 
     resolved = try_cluster_view(
         membership_seed=membership_seed,
@@ -75,7 +76,7 @@ def build_backup_fast_path_policy(
     origin_node_id = str(origin_node_id or "").strip()
 
     if not origin_node_id:
-        raise ValueError("La política de fast-path de backup requiere un origin_node_id no vacío.")
+        raise StopanConfigValueError("La política de fast-path de backup requiere un origin_node_id no vacío.")
 
     if safe_mode:
         return BackupPolicy(

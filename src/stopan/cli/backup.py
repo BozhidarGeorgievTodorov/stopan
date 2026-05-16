@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
 from stopan.cli.validation import IntRange, validate_int_ranges
+from stopan.errors import StopanUsageError
 from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
@@ -82,6 +83,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_runtime_config(args)
 
+    source_path = os.path.abspath(args.source_path)
+    if not os.path.isdir(source_path):
+        raise StopanUsageError(f"Directorio no encontrado: {source_path}")
+
     fast_local_enabled = bool(args.fast_local)
     fast_remote_enabled = bool(args.fast_remote)
 
@@ -105,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from stopan.backup.service import backup_directory
 
     result = backup_directory(
-        args.source_path,
+        source_path,
         num_threads=workers,
         fast_local_enabled=fast_local_enabled,
         fast_remote_enabled=fast_remote_enabled,

@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from stopan.common.fs import atomic_write_bytes, ensure_private_dir, fsync_dir
+from stopan.errors import StopanConfigValueError
 from stopan.metadata.identity import validate_owner_id, verify_metadata_pack_signature
 from stopan.metadata.packs.format import OBJECT_PACK_FILE_SUFFIX
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
@@ -74,9 +75,9 @@ class MetadataPackStore:
         self.max_age_days = _require_int("max_age_days", max_age_days, min_value=0)
 
         if self.max_total_bytes_per_owner < self.max_pack_bytes:
-            raise ValueError("max_total_bytes_per_owner debe ser >= max_pack_bytes")
+            raise StopanConfigValueError("max_total_bytes_per_owner debe ser >= max_pack_bytes")
         if self.max_total_store_bytes < self.max_pack_bytes:
-            raise ValueError("max_total_store_bytes debe ser >= max_pack_bytes")
+            raise StopanConfigValueError("max_total_store_bytes debe ser >= max_pack_bytes")
 
         self.root_dir = Path(root_dir).expanduser().resolve()
         self._lock = threading.RLock()
@@ -574,7 +575,7 @@ class MetadataPackStore:
 
 def _require_int(name: str, value: object, *, min_value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} debe ser un entero >= {min_value}; recibido {value!r}")
+        raise StopanConfigValueError(f"{name} debe ser un entero >= {min_value}; recibido {value!r}")
     if value < min_value:
-        raise ValueError(f"{name} debe ser >= {min_value}; recibido {value!r}")
+        raise StopanConfigValueError(f"{name} debe ser >= {min_value}; recibido {value!r}")
     return value

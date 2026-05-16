@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import sys
 
 from stopan.cas.repository import CASRepository
+from stopan.errors import StopanConfigRuntimeError
 from stopan.metadata.database import MetadataDB
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
@@ -67,7 +68,7 @@ def push_erasure_data_packs_to_network(
     cluster_token = str(cluster_token or "")
 
     if not self_addr:
-        raise RuntimeError(
+        raise StopanConfigRuntimeError(
             "Falta node.advertise_addr. Push EC necesita identificar el nodo origen."
         )
 
@@ -90,7 +91,7 @@ def push_erasure_data_packs_to_network(
         cluster = resolved.cluster
         origin_node_id = cluster.self_node_id
         if not origin_node_id:
-            raise RuntimeError(
+            raise StopanConfigRuntimeError(
                 "No pude resolver origin_node_id desde membership. "
                 "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
             )

@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from stopan.errors import StopanConfigError
+
 
 METADATA_IDENTITY_FORMAT = "stopan.metadata_identity"
 METADATA_IDENTITY_VERSION = 1
@@ -22,7 +24,7 @@ PRIVATE_KEY_ROLE_SIGNING = "signing"
 PRIVATE_KEY_ROLE_ENCRYPTION = "encryption"
 
 
-class MetadataIdentityError(RuntimeError):
+class MetadataIdentityError(StopanConfigError, RuntimeError):
     pass
 
 

@@ -34,6 +34,7 @@ from stopan.metadata.objects.store.crypto import (
 from stopan.metadata.objects.store.errors import (
     MetadataObjectStoreAuthenticationError,
     MetadataObjectStoreError,
+    MetadataObjectStoreMissingError,
 )
 from stopan.metadata.objects.store.format import (
     ENCRYPTED_OBJECT_FORMAT,
@@ -159,7 +160,7 @@ class MetadataObjectStore:
         root = Path(root_dir).expanduser().resolve()
         header_path = root / "store.json"
         if not header_path.exists():
-            raise FileNotFoundError(f"No existe object store en {root}: falta store.json")
+            raise MetadataObjectStoreMissingError(f"No existe object store en {root}: falta store.json")
         salt, cost = parse_header(root, load_json_file(header_path))
         master_key = derive_master_key(passphrase, salt=salt, cost=cost)
         return cls(root_dir=root, salt=salt, cost=cost, master_key=master_key)
@@ -288,7 +289,7 @@ class MetadataObjectStore:
         storage_id_value = self.object_storage_id(object_hash)
         path = self.root_dir / "objects" / storage_id_value[:2] / f"{storage_id_value}.stobj"
         if not path.exists():
-            raise FileNotFoundError(f"metadata object no encontrado: {object_hash}")
+            raise MetadataObjectStoreMissingError(f"metadata object no encontrado: {object_hash}")
 
         raw = load_json_file(path)
         if raw.get("format") != ENCRYPTED_OBJECT_FORMAT:
@@ -392,7 +393,7 @@ class MetadataObjectStore:
     def read_latest_pointer(self) -> LatestMetadataPointer:
         path = self.root_dir / "latest.json"
         if not path.exists():
-            raise FileNotFoundError(f"metadata object store sin latest pointer: {self.root_dir}")
+            raise MetadataObjectStoreMissingError(f"metadata object store sin latest pointer: {self.root_dir}")
 
         raw = load_json_file(path)
         if raw.get("format") != f"{LATEST_POINTER_FORMAT}.encrypted":

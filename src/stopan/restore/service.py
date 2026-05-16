@@ -15,6 +15,7 @@ from stopan.restore.ec_fetch import ErasureChunkRecoveryService
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.remote_client import RemoteStorageClientPool
 from stopan.restore.restorer import RestoreResult, SnapshotRestorer
+from stopan.restore.errors import RestoreDataError
 from stopan.protection.policy import normalize_remote_rf
 
 
@@ -60,7 +61,7 @@ def restore_snapshot(
     try:
         origin_node_id = db.get_snapshot_origin_node_id(snapshot_id)
         if not origin_node_id:
-            raise RuntimeError(
+            raise RestoreDataError(
                 f"Snapshot {snapshot_id} no tiene origin_node_id; "
                 "el snapshot no cumple el formato distribuido esperado."
             )
@@ -129,7 +130,7 @@ def restore_snapshot(
 def _normalize_remote_recovery(value: str) -> str:
     mode = value.strip().lower()
     if mode not in _REMOTE_RECOVERY_MODES:
-        raise ValueError(
+        raise RestoreDataError(
             "remote_recovery debe ser one of: " + ", ".join(sorted(_REMOTE_RECOVERY_MODES))
         )
     return mode

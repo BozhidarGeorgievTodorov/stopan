@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from stopan.errors import StopanConfigValueError
+
 
 class ProtectionState(StrEnum):
     """
@@ -64,7 +66,7 @@ def normalize_remote_rf(value: int, *, field_name: str = "rf") -> int:
     """
     remote_rf = int(value)
     if remote_rf < 0:
-        raise ValueError(f"{field_name} debe ser >= 0")
+        raise StopanConfigValueError(f"{field_name} debe ser >= 0")
     return remote_rf
 
 

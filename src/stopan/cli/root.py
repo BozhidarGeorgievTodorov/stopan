@@ -7,6 +7,8 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from stopan.errors import StopanError
+
 
 CommandMain = Callable[[Sequence[str] | None], int]
 
@@ -55,15 +57,6 @@ COMMANDS: dict[str, CommandSpec] = {
         description="Limpia el distributed metadata pack store",
     ),
 }
-
-_USER_ERROR_TYPES = (
-    ValueError,
-    FileExistsError,
-    FileNotFoundError,
-    NotADirectoryError,
-    PermissionError,
-)
-
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -143,11 +136,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nInterrumpido por el usuario.", file=sys.stderr)
         return 130
-    except _USER_ERROR_TYPES as exc:
+    except StopanError as exc:
         if _debug_tracebacks_enabled():
             raise
-        _print_error("Error de configuración/uso de Stopan", exc)
-        return 2
+        _print_error(exc.prefix, exc)
+        return int(exc.exit_code)
     except Exception as exc:
         if _debug_tracebacks_enabled():
             raise

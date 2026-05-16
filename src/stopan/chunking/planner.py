@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Literal
 
+from stopan.errors import StopanConfigValueError
+
 
 ChunkDecision = Literal["process", "skip_local", "skip_synced"]
 
@@ -67,7 +69,7 @@ class ChunkPlanner:
         self.allow_remote_protected_skip = bool(allow_remote_protected_skip)
         self.desired_rf = int(desired_rf)
         if self.desired_rf < 0:
-            raise ValueError("desired_rf debe >= 0")
+            raise StopanConfigValueError("desired_rf debe >= 0")
         self.placement_epoch = placement_epoch
 
     def decide(self, chunk_hash: str) -> ChunkDecision:

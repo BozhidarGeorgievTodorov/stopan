@@ -176,8 +176,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
         "token": _as_str,
     },
     "protection": {
-        "rf": _as_int,
-        "strict_rf": _as_bool,
+        "remote_copies": _as_int,
+        "strict_remote_copies": _as_bool,
     },
     "grpc": {
         "max_message_bytes": _as_int,
@@ -228,6 +228,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
         "object_graph_auto_pack": _as_bool,
         "object_pack_dir": _as_str,
         "distributed_pack_store_dir": _as_str,
+        "pack_copies": _as_int,
+        "strict_pack_copies": _as_bool,
         "max_distributed_pack_bytes": _as_int,
         "max_distributed_packs_per_owner": _as_int,
         "max_distributed_pack_bytes_per_owner": _as_int,

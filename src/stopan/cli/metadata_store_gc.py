@@ -32,13 +32,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "0 desactiva borrado por edad."
         ),
     )
-    parser.add_argument(
+    apply_group = parser.add_mutually_exclusive_group()
+    apply_group.add_argument(
         "--dry-run",
         action="store_true",
         default=True,
         help="Muestra qué se podaría sin borrar nada. Es el default.",
     )
-    parser.add_argument(
+    apply_group.add_argument(
         "--apply",
         dest="dry_run",
         action="store_false",

@@ -71,11 +71,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_SYSTEM_DB_FILE,
         help=f"Ruta de metadata local. Por defecto: {DEFAULT_SYSTEM_DB_FILE}.",
     )
-    node.add_argument("--rf", type=int, default=3, help="Factor de replicación. Por defecto: 3.")
+    node.add_argument("--remote-copies", type=int, default=3, help="Copias remotas completas por chunk. Por defecto: 3.")
     node.add_argument(
-        "--strict-rf",
+        "--strict-remote-copies",
         action="store_true",
-        help="Falla si no se puede alcanzar RF completo al proteger chunks.",
+        help="Falla si no se pueden alcanzar todas las copias remotas al proteger chunks.",
     )
     node.add_argument(
         "--force",
@@ -111,8 +111,8 @@ def _build_node_config(args: argparse.Namespace) -> StopanConfig:
             "seeds": seeds,
         },
         protection={
-            "rf": args.rf,
-            "strict_rf": args.strict_rf,
+            "remote_copies": args.remote_copies,
+            "strict_remote_copies": args.strict_remote_copies,
         },
     )
 

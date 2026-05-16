@@ -244,7 +244,7 @@ class ChunkFetchService:
             for chunk_hash in missing_hashes:
                 result_map[chunk_hash] = FileNotFoundError(
                     f"El chunk {chunk_hash[:8]} no está localmente y la recuperación "
-                    "remota por chunks no está disponible o rf=0. "
+                    "remota por chunks no está disponible o no hay targets de replicación. "
                     + " | ".join(error_map[chunk_hash])
                 )
             return result_map

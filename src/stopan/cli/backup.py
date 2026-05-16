@@ -51,10 +51,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Recorrido determinista del árbol.",
     )
     parser.add_argument(
-        "--rf",
+        "--desired-remote-copies",
         type=int,
         default=None,
-        help="RF deseado para la política de protección remota del chunk.",
+        help="Copias remotas deseadas que se guardan en metadata; backup no envía chunks a la red.",
     )
     parser.add_argument(
         "--membership-seed",
@@ -62,7 +62,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Seed de membership para validar el epoch del fast-path remoto.",
     )
     add_metadata_auto_export_args(parser, context="backup")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.desired_remote_copies is not None and args.desired_remote_copies < 0:
+        parser.error("--desired-remote-copies debe ser >= 0")
+
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -98,7 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fast_remote_enabled=fast_remote_enabled,
         safe_mode=bool(args.safe_mode),
         deterministic=bool(args.deterministic),
-        desired_rf=int(choose(args.rf, cfg.protection.rf)),
+        desired_rf=int(choose(args.desired_remote_copies, cfg.protection.remote_copies)),
         membership_seed=args.membership_seed or first_seed(cfg),
         self_addr=cfg.node.advertise_addr,
         cluster_token=cfg.cluster.token,

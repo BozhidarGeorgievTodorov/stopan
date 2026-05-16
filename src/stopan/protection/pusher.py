@@ -59,7 +59,7 @@ def push_to_network(
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
 ) -> PushStats:
     """
-    Replica chunks pendientes en nodos remotos según la política RF.
+    Replica chunks pendientes en nodos remotos según las copias requeridas.
 
     En Stopan, rf representa copias remotas requeridas. RF=0 es un no-op
     remoto; el nodo origen se excluye del placement y la copia local del CAS no
@@ -118,8 +118,8 @@ def push_to_network(
         remote_candidate_count = len(remote_candidate_node_ids)
 
         if strict_rf and remote_candidate_count < required_remote_copies:
-            print("RF estricto: no hay suficientes targets remotos elegibles.")
-            print(f"   desired_rf={desired_rf} required_remote_copies={required_remote_copies} remote_candidates={remote_candidate_count}")
+            print("Copias remotas estrictas: no hay suficientes targets remotos elegibles.")
+            print(f"   remote_copies={desired_rf} required_remote_copies={required_remote_copies} remote_candidates={remote_candidate_count}")
             print(f"   candidates={[node_id[:8] for node_id in remote_candidate_node_ids]}")
             print("   No se modifica chunk_protection; reintenta cuando el cluster recupere capacidad.")
             return PushStats(
@@ -163,9 +163,9 @@ def push_to_network(
         print(f"Eligible members: {[f'{member.node_id[:8]}@{member.address}' for member in cluster.members]}")
         print(f"Self: {origin_node_id[:8]}@{self_addr}")
         print(f"Remote candidates: {remote_candidate_count}")
-        print(f"RF remoto requerido: {desired_rf}")
+        print(f"Copias remotas deseadas: {desired_rf}")
         print(f"Copias remotas requeridas: {required_remote_copies}")
-        print(f"RF estricto: {bool(strict_rf)}")
+        print(f"Copias remotas estrictas: {bool(strict_rf)}")
         print(f"placement_epoch={current_epoch[:12] if current_epoch else '-'}")
         print(
             f"Pipeline: target_parallelism={target_parallelism} "

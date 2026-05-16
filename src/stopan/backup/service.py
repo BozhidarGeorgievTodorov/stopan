@@ -91,7 +91,7 @@ def backup_directory(
     print(f"Iniciando backup de: {root_path}")
     print(f"Nodo origen: {origin_node_id[:8]}")
     print(f"Workers: {workers}")
-    print(f"RF remoto requerido: {policy.desired_rf}")
+    print(f"Copias remotas deseadas: {policy.desired_rf}")
 
     if placement_epoch and policy.fast_remote_enabled:
         print(f"Fast-path: local + chunks protegidos en remoto ({placement_epoch[:12]})")

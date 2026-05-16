@@ -21,8 +21,8 @@ cluster:
     - "192.168.1.44:50051"
 
 protection:
-  rf: 3
-  strict_rf: true
+  remote_copies: 3
+  strict_remote_copies: true
 
 grpc:
   max_message_bytes: 8388608
@@ -77,6 +77,8 @@ metadata:
 
   # Local storage for encrypted metadata packs received from / prepared for P2P.
   distributed_pack_store_dir: "/var/lib/stopan/metadata_distributed_packs"
+  pack_copies: 3
+  strict_pack_copies: false
   max_distributed_pack_bytes: 67108864
   max_distributed_packs_per_owner: 8
   max_distributed_pack_bytes_per_owner: 536870912

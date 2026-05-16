@@ -8,6 +8,7 @@ from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
 )
+from stopan.config.defaults import DEFAULT_EC_PACK_SIZE_BYTES
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -22,9 +23,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--protection-mode",
         choices=("replication", "ec"),
         default="replication",
-        help="Modo de protección remota: replication mantiene RF por chunk; ec usa data packs con erasure coding.",
+        help="Modo de protección remota: replication mantiene copias completas por chunk; ec usa data packs con erasure coding.",
     )
-    parser.add_argument("--rf", type=int, default=None, help="RF deseado para la protección remota por replicación.")
+    parser.add_argument("--remote-copies", type=int, default=None, help="Copias remotas completas requeridas por chunk en modo replication. La copia local no cuenta.")
     parser.add_argument("--ec-k", type=int, default=None, help="Número de data shards por data pack EC.")
     parser.add_argument("--ec-m", type=int, default=None, help="Número de parity shards por data pack EC.")
     parser.add_argument("--ec-pack-size-bytes", type=int, default=None, help="Tamaño objetivo máximo del payload de cada data pack EC.")
@@ -37,11 +38,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-message-bytes", type=int, default=None, help="Límite de mensaje gRPC.")
     parser.add_argument("--commit-every", type=int, default=None, help="Persistir progreso cada N resultados.")
     parser.add_argument(
-        "--strict-rf",
+        "--strict-remote-copies",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Exige al menos RF targets remotos elegibles antes de empezar. "
+            "Exige suficientes targets remotos elegibles antes de empezar. "
             "Si no hay capacidad remota suficiente, aborta con rc=2 sin marcar chunks."
         ),
     )
@@ -50,10 +51,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     if args.protection_mode == "ec":
-        if args.rf is not None:
-            parser.error("--rf solo aplica a --protection-mode replication")
-        if args.strict_rf is not None:
-            parser.error("--strict-rf/--no-strict-rf solo aplica a --protection-mode replication")
+        if args.remote_copies is not None:
+            parser.error("--remote-copies solo aplica a --protection-mode replication")
+        if args.strict_remote_copies is not None:
+            parser.error("--strict-remote-copies/--no-strict-remote-copies solo aplica a --protection-mode replication")
         if args.target_parallelism is not None:
             parser.error("--target-parallelism solo aplica a --protection-mode replication")
         if args.probe_batch_hashes is not None:
@@ -63,11 +64,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         if args.probe_timeout_s is not None:
             parser.error("--probe-timeout-s solo aplica a --protection-mode replication")
             
-        args.ec_k = 2 if args.ec_k is None else args.ec_k
-        args.ec_m = 1 if args.ec_m is None else args.ec_m
-        args.ec_pack_size_bytes = (8 * 1024 * 1024) if args.ec_pack_size_bytes is None else args.ec_pack_size_bytes
+        if args.ec_k is None:
+            parser.error("--ec-k es obligatorio en --protection-mode ec")
+        if args.ec_m is None:
+            parser.error("--ec-m es obligatorio en --protection-mode ec")
+        if args.ec_k < 1:
+            parser.error("--ec-k debe ser >= 1")
+        if args.ec_m < 0:
+            parser.error("--ec-m debe ser >= 0")
+        args.ec_pack_size_bytes = DEFAULT_EC_PACK_SIZE_BYTES if args.ec_pack_size_bytes is None else args.ec_pack_size_bytes
+        if args.ec_pack_size_bytes < 1:
+            parser.error("--ec-pack-size-bytes debe ser >= 1")
 
     else:
+        if args.remote_copies is not None and args.remote_copies < 1:
+            parser.error("--remote-copies debe ser >= 1 en --protection-mode replication")
         if args.ec_k is not None:
             parser.error("--ec-k solo aplica a --protection-mode ec")
         if args.ec_m is not None:
@@ -130,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stats = push_to_network(
         membership_seed=args.membership_seed or first_seed(cfg),
-        rf=int(choose(args.rf, cfg.protection.rf)),
+        rf=int(choose(args.remote_copies, cfg.protection.remote_copies)),
         limit=args.limit,
         target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
         probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.replication.probe_batch_hashes)),
@@ -139,7 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
         max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
         commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
-        strict_rf=bool(choose(args.strict_rf, cfg.protection.strict_rf)),
+        strict_rf=bool(choose(args.strict_remote_copies, cfg.protection.strict_remote_copies)),
         db_file=cfg.node.db_file,
         local_shard_dir=cfg.node.local_shard_dir,
         self_addr=cfg.node.advertise_addr,
@@ -161,8 +172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if getattr(stats, "insufficient_remote_targets", False):
         print(
-            "Push no iniciado por strict-rf. "
-            f"desired_rf={stats.desired_rf} remote_candidates={stats.remote_candidates}"
+            "Push no iniciado por strict-remote-copies. "
+            f"remote_copies={stats.desired_rf} remote_candidates={stats.remote_candidates}"
         )
         return 2
 

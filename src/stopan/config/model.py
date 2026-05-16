@@ -36,8 +36,10 @@ from stopan.config.defaults import (
     DEFAULT_METADATA_OBJECT_PACK_DIR,
     DEFAULT_METADATA_OBJECT_STORE_DIR,
     DEFAULT_METADATA_OWNER_ID,
+    DEFAULT_METADATA_PACK_COPIES,
     DEFAULT_METADATA_PASSPHRASE_FILE,
     DEFAULT_METADATA_SCRYPT_N,
+    DEFAULT_METADATA_STRICT_PACK_COPIES,
     DEFAULT_METADATA_SCRYPT_P,
     DEFAULT_METADATA_SCRYPT_R,
     DEFAULT_NODE_ADVERTISE_ADDR,
@@ -45,8 +47,8 @@ from stopan.config.defaults import (
     DEFAULT_NODE_DB_FILE,
     DEFAULT_NODE_LOCAL_SHARD_DIR,
     DEFAULT_NODE_REPO_STORE_DIR,
-    DEFAULT_PROTECTION_RF,
-    DEFAULT_PROTECTION_STRICT_RF,
+    DEFAULT_PROTECTION_REMOTE_COPIES,
+    DEFAULT_PROTECTION_STRICT_REMOTE_COPIES,
     DEFAULT_REPLICATION_COMMIT_EVERY,
     DEFAULT_REPLICATION_PROBE_BATCH_HASHES,
     DEFAULT_REPLICATION_PROBE_TIMEOUT_S,
@@ -138,12 +140,12 @@ class ClusterConfig:
 
 @dataclass(frozen=True)
 class ProtectionConfig:
-    rf: int = DEFAULT_PROTECTION_RF
-    strict_rf: bool = DEFAULT_PROTECTION_STRICT_RF
+    remote_copies: int = DEFAULT_PROTECTION_REMOTE_COPIES
+    strict_remote_copies: bool = DEFAULT_PROTECTION_STRICT_REMOTE_COPIES
 
     def __post_init__(self) -> None:
-        _require_int("protection.rf", self.rf, min_value=0)
-        _require_bool("protection.strict_rf", self.strict_rf)
+        _require_int("protection.remote_copies", self.remote_copies, min_value=0)
+        _require_bool("protection.strict_remote_copies", self.strict_remote_copies)
 
 
 @dataclass(frozen=True)
@@ -247,6 +249,8 @@ class MetadataConfig:
     object_graph_auto_pack: bool = DEFAULT_METADATA_OBJECT_GRAPH_AUTO_PACK
     object_pack_dir: str = DEFAULT_METADATA_OBJECT_PACK_DIR
     distributed_pack_store_dir: str = DEFAULT_METADATA_DISTRIBUTED_PACK_STORE_DIR
+    pack_copies: int = DEFAULT_METADATA_PACK_COPIES
+    strict_pack_copies: bool = DEFAULT_METADATA_STRICT_PACK_COPIES
     max_distributed_pack_bytes: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACK_BYTES
     max_distributed_packs_per_owner: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACKS_PER_OWNER
     max_distributed_pack_bytes_per_owner: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACK_BYTES_PER_OWNER
@@ -268,6 +272,8 @@ class MetadataConfig:
         _require_bool("metadata.object_graph_auto_pack", self.object_graph_auto_pack)
         _require_str("metadata.object_pack_dir", self.object_pack_dir, allow_empty=True)
         _require_str("metadata.distributed_pack_store_dir", self.distributed_pack_store_dir)
+        _require_int("metadata.pack_copies", self.pack_copies, min_value=0)
+        _require_bool("metadata.strict_pack_copies", self.strict_pack_copies)
         _require_int("metadata.max_distributed_pack_bytes", self.max_distributed_pack_bytes, min_value=1)
         _require_int("metadata.max_distributed_packs_per_owner", self.max_distributed_packs_per_owner, min_value=1)
         _require_int(

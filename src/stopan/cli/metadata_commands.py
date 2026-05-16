@@ -67,6 +67,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"   identity_file_status: {file_status(cfg.metadata.identity_file)}")
     print(f"   distributed_pack_store_dir: {cfg.metadata.distributed_pack_store_dir}")
     print(f"   distributed_pack_store_status: {dir_status(cfg.metadata.distributed_pack_store_dir)}")
+    print(f"   pack_copies: {int(cfg.metadata.pack_copies)}")
+    print(f"   strict_pack_copies: {bool(cfg.metadata.strict_pack_copies)}")
     print(f"   max_distributed_pack_bytes: {format_bytes(int(cfg.metadata.max_distributed_pack_bytes))}")
     print(f"   max_distributed_packs_per_owner: {int(cfg.metadata.max_distributed_packs_per_owner)}")
     print(f"   max_distributed_pack_bytes_per_owner: {format_bytes(int(cfg.metadata.max_distributed_pack_bytes_per_owner))}")
@@ -319,7 +321,11 @@ def cmd_import_object_graph(args: argparse.Namespace) -> int:
         object_store_dir=object_store_dir,
         passphrase=passphrase_for_decrypt(args),
         include_protection=not bool(args.no_protection),
-        default_desired_rf=int(args.default_rf if args.default_rf is not None else cfg.protection.rf),
+        default_desired_rf=int(
+            args.default_desired_remote_copies
+            if args.default_desired_remote_copies is not None
+            else cfg.protection.remote_copies
+        ),
     )
 
     print("Metadata object graph importado")
@@ -462,7 +468,7 @@ def print_metadata_pack_push_result(result) -> int:
     print(f"   pack_hash: {result.pack_hash}")
     print(f"   pack_path: {result.pack_path}")
     print(f"   pack_size: {format_bytes(result.pack_size_bytes)}")
-    print(f"   desired_rf: {result.desired_rf}")
+    print(f"   pack_copies: {result.desired_rf}")
     print(f"   remote_candidates: {result.remote_candidates}")
     print(f"   attempted_targets: {result.attempted_targets}")
     print(f"   successful_targets: {result.successful_targets}")
@@ -580,8 +586,8 @@ def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str 
         identity_file=identity_file,
         identity_passphrase=identity_passphrase,
         membership_seed=args.membership_seed or first_seed(cfg),
-        rf=int(choose(args.rf, cfg.protection.rf)),
-        strict_rf=bool(choose(args.strict_rf, cfg.protection.strict_rf)),
+        rf=int(choose(args.pack_copies, cfg.metadata.pack_copies)),
+        strict_rf=bool(choose(args.strict_pack_copies, cfg.metadata.strict_pack_copies)),
         target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
         rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
         membership_timeout_s=float(cfg.membership.rpc_timeout_s),
@@ -597,16 +603,19 @@ def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str 
 def cmd_push(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
 
-    if args.pack:
+    if args.pack_in:
         if args.object_store:
-            raise ValueError("'--pack' y '--object-store' son incompatibles.")
+            raise ValueError("'--pack-in' y '--object-store' son incompatibles.")
         if args.pack_out:
-            raise ValueError("'--pack' y '--pack-out' son incompatibles.")
+            raise ValueError("'--pack-in' y '--pack-out' son incompatibles.")
         if args.pack_dir:
-            raise ValueError("'--pack' y '--pack-dir' son incompatibles.")
+            raise ValueError("'--pack-in' y '--pack-dir' son incompatibles.")
 
-        result = push_pack_result_from_path(args, cfg, pack_path=args.pack)
+        result = push_pack_result_from_path(args, cfg, pack_path=args.pack_in)
         return print_metadata_pack_push_result(result)
+
+    if args.pack_out and args.pack_dir:
+        raise ValueError("'--pack-out' y '--pack-dir' son incompatibles.")
 
     object_store_dir = args.object_store or cfg.metadata.object_store_dir
     if not object_store_dir:
@@ -695,7 +704,11 @@ def cmd_recover(args: argparse.Namespace) -> int:
         db_file=cfg.node.db_file,
         import_db=bool(args.import_db),
         include_protection=not bool(args.no_protection),
-        default_desired_rf=int(args.default_rf if args.default_rf is not None else cfg.protection.rf),
+        default_desired_rf=int(
+            args.default_desired_remote_copies
+            if args.default_desired_remote_copies is not None
+            else cfg.protection.remote_copies
+        ),
         download_dir=args.download_dir,
         pack_out=args.pack_out,
         max_candidates=int(args.max_candidates),

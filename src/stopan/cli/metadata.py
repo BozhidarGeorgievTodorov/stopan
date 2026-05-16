@@ -30,6 +30,7 @@ _DEFAULT_RECOVER_MAX_CANDIDATES = 20
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan metadata",
+        allow_abbrev=False,
         description="Gestiona el metadata vault cifrado local.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -164,10 +165,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="No importar chunk_protection del graph; crea filas PENDING para chunks conocidos.",
     )
     import_graph_parser.add_argument(
-        "--default-rf",
+        "--default-desired-remote-copies",
         type=int,
         default=None,
-        help="RF remoto para filas PENDING si se usa --no-protection o no hay protection_index. Puede ser 0. Default: protection.rf.",
+        help=(
+            "Copias remotas deseadas para filas PENDING si se usa --no-protection "
+            "o no hay protection_index. Puede ser 0. Default: protection.remote_copies."
+        ),
     )
 
     pack_graph_parser = subparsers.add_parser(
@@ -326,6 +330,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     push_parser = subparsers.add_parser(
         "push",
+        allow_abbrev=False,
         help=(
             "Distribuye metadata a nodos remotos. Por defecto crea un pack del latest object graph; "
             "con --pack distribuye un .stopanmetapack existente."
@@ -333,14 +338,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_config_args(push_parser)
     push_parser.add_argument(
-        "--pack",
+        "--pack-in",
         default=None,
         help="Ruta de un .stopanmetapack existente a distribuir. Si se omite, se crea desde el latest object graph.",
     )
     push_parser.add_argument(
         "--object-store",
         default=None,
-        help="Directorio del metadata object store origen cuando no se usa --pack. Default: metadata.object_store_dir.",
+        help="Directorio del metadata object store origen cuando no se usa --pack-in. Default: metadata.object_store_dir.",
     )
     push_parser.add_argument(
         "--passphrase-file",
@@ -353,13 +358,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     push_parser.add_argument(
         "--pack-out",
         default=None,
-        help="Ruta exacta de salida .stopanmetapack antes de distribuirlo cuando no se usa --pack.",
+        help="Ruta exacta de salida .stopanmetapack antes de distribuirlo cuando no se usa --pack-in.",
     )
     push_parser.add_argument(
         "--pack-dir",
         default=None,
         help=(
-            "Directorio de salida del pack si se omite --pack-out y no se usa --pack. "
+            "Directorio de salida del pack si se omite --pack-out y no se usa --pack-in. "
             "Default: metadata.object_pack_dir o <object-store>/packs."
         ),
     )
@@ -453,10 +458,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Al reconstruir DB, no importar chunk_protection del graph; crea filas PENDING.",
     )
     recover_parser.add_argument(
-        "--default-rf",
+        "--default-desired-remote-copies",
         type=int,
         default=None,
-        help="RF remoto para filas PENDING si se usa --no-protection o no hay protection_index. Puede ser 0. Default: protection.rf.",
+        help=(
+            "Copias remotas deseadas para filas PENDING si se usa --no-protection "
+            "o no hay protection_index. Puede ser 0. Default: protection.remote_copies."
+        ),
     )
     _add_scrypt_override_args(recover_parser)
 
@@ -521,13 +529,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Default: gc.metadata_object_pack_grace_hours."
         ),
     )
-    gc_parser.add_argument(
+    gc_apply_group = gc_parser.add_mutually_exclusive_group()
+    gc_apply_group.add_argument(
         "--dry-run",
         action="store_true",
         default=True,
         help="Muestra lo que se borraría sin borrar nada. Es el default.",
     )
-    gc_parser.add_argument(
+    gc_apply_group.add_argument(
         "--apply",
         dest="dry_run",
         action="store_false",
@@ -549,7 +558,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Directorio de packs a limpiar. Default: <object-store>/packs.",
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    _validate_args(parser, args)
+    return args
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.command == "push":
+        if args.pack_in and args.object_store:
+            parser.error("'--pack-in' y '--object-store' son incompatibles")
+        if args.pack_in and args.pack_out:
+            parser.error("'--pack-in' y '--pack-out' son incompatibles")
+        if args.pack_in and args.pack_dir:
+            parser.error("'--pack-in' y '--pack-dir' son incompatibles")
+        if args.pack_out and args.pack_dir:
+            parser.error("'--pack-out' y '--pack-dir' son incompatibles")
+        if args.pack_copies is not None and args.pack_copies < 0:
+            parser.error("--pack-copies debe ser >= 0")
+
+    if args.command in {"import-graph", "recover"}:
+        value = getattr(args, "default_desired_remote_copies", None)
+        if value is not None and value < 0:
+            parser.error("--default-desired-remote-copies debe ser >= 0")
+
+    if args.command == "gc" and args.objects_only and args.packs_only:
+        parser.error("'--objects-only' y '--packs-only' son incompatibles")
 
 
 def _add_scrypt_override_args(parser: argparse.ArgumentParser) -> None:
@@ -566,16 +599,19 @@ def _add_metadata_pack_push_args(parser: argparse.ArgumentParser) -> None:
         help="Seed de membership para obtener la vista del cluster elegible.",
     )
     parser.add_argument(
-        "--rf",
+        "--pack-copies",
         type=int,
         default=None,
-        help="Copias remotas requeridas para distribuir el metadata pack. Usa 0 para no enviarlo. Default: protection.rf.",
+        help="Copias remotas requeridas para distribuir el metadata pack. Usa 0 para no enviarlo. Default: metadata.pack_copies.",
     )
     parser.add_argument(
-        "--strict-rf",
+        "--strict-pack-copies",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Exige RF targets remotos elegibles antes de enviar. Con rf=0 no se envía nada. Default: protection.strict_rf.",
+        help=(
+            "Exige suficientes targets remotos elegibles antes de enviar. "
+            "Con --pack-copies=0 no se envía nada. Default: metadata.strict_pack_copies."
+        ),
     )
     parser.add_argument(
         "--target-parallelism",

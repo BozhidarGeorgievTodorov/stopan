@@ -38,6 +38,10 @@ COMMANDS: dict[str, CommandSpec] = {
         module_name="stopan.cli.node",
         description="Start a storage/membership node",
     ),
+    "init": CommandSpec(
+        module_name="stopan.cli.init",
+        description="Initialize Stopan configuration and directories",
+    ),
     "config": CommandSpec(
         module_name="stopan.cli.config",
         description="Generate or validate Stopan configuration files",

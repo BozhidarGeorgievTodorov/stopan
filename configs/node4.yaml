@@ -14,8 +14,8 @@ cluster:
     - "node4:50051"
 
 protection:
-  rf: 3
-  strict_rf: false
+  remote_copies: 3
+  strict_remote_copies: false
 
 grpc:
   max_message_bytes: 8388608
@@ -39,6 +39,8 @@ replication:
 
 metadata:
   distributed_pack_store_dir: "/app/node_store/metadata_packs"
+  pack_copies: 3
+  strict_pack_copies: false
   max_distributed_pack_bytes: 8388608
   max_distributed_packs_per_owner: 32
   max_distributed_pack_bytes_per_owner: 268435456

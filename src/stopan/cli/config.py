@@ -44,7 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"   advertise_addr={cfg.node.advertise_addr or '<empty>'}")
         print(f"   db_file={cfg.node.db_file}")
         print(f"   repo_store_dir={cfg.node.repo_store_dir}")
-        print(f"   rf={cfg.protection.rf}")
+        print(f"   remote_copies={cfg.protection.remote_copies}")
         print(f"   seeds={list(cfg.cluster.seeds)}")
         return 0
 

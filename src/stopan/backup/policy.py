@@ -104,7 +104,7 @@ def build_backup_fast_path_policy(
         )
 
     if required_remote_copies <= 0:
-        print("RF remoto requerido: 0. Usando solo fast-path local.")
+        print("Copias remotas deseadas: 0. Usando solo fast-path local.")
         return BackupPolicy(
             desired_rf=desired_rf,
             fast_local_enabled=True,

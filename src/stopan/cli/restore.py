@@ -18,7 +18,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--remote-recovery",
         choices=("none", "replication", "ec", "auto"),
-        default="replication",
+        default="none",
         help=(
             "Modo de recuperación remota: none solo usa stores locales. "
             "replication recupera chunks completos; ec reconstruye desde data packs EC. "
@@ -26,10 +26,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--rf", 
-        type=int, 
-        default=None, 
-        help="Replication factor HRW para recuperación por chunks completos."
+        "--replication-targets",
+        type=int,
+        default=None,
+        help=(
+            "Número máximo de targets HRW consultados por chunk ausente en "
+            "--remote-recovery replication|auto. No es un factor de protección."
+        ),
     )
     parser.add_argument(
         "--membership-seed", 
@@ -46,8 +49,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     if args.remote_recovery in {"none", "ec"}:
-        if args.rf is not None:
-            parser.error("--rf solo aplica a --remote-recovery replication|auto")
+        if args.replication_targets is not None:
+            parser.error("--replication-targets solo aplica a --remote-recovery replication|auto")
+    elif args.replication_targets is not None and args.replication_targets < 1:
+        parser.error("--replication-targets debe ser >= 1")
+
+    if args.remote_recovery == "none" and args.membership_seed:
+        parser.error("--membership-seed solo aplica cuando --remote-recovery usa la red")
 
     return args
 
@@ -65,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.snapshot_id,
         membership_seed=(args.membership_seed or first_seed(cfg)) if uses_network else None,
         base_output_dir=args.out,
-        rf=int(choose(args.rf, cfg.protection.rf)) if uses_replication else 0,
+        rf=int(choose(args.replication_targets, cfg.protection.remote_copies)) if uses_replication else 0,
         batch_target_parallelism=int(choose(args.batch_target_parallelism, cfg.restore.batch_target_parallelism)),
         prefetch_window=int(choose(args.prefetch_window, cfg.restore.prefetch_window)),
         db_file=cfg.node.db_file,

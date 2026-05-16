@@ -18,7 +18,7 @@ También puede exportar la metadata del snapshot como un grafo de objetos cifrad
 ## Arquitectura y flujo general
 
 1. **Backup local:** Troceado de archivos mediante *Content-Defined Chunking*, deduplicación y guardado en CAS local.
-2. **Protección P2P (`push`):** Cálculo de nodos destino mediante HRW / Rendezvous Hashing. El modo por defecto replica chunks completos; `--rf` indica las copias remotas requeridas, la copia local no cuenta como copia remota y el nodo origen se excluye. Como alternativa, `--protection-mode ec` agrupa chunks deduplicados en data packs, los codifica con `ec_k` data shards y `ec_m` parity shards, y coloca cada shard en un nodo remoto distinto.
+2. **Protección P2P (`push`):** Cálculo de nodos destino mediante HRW / Rendezvous Hashing. El modo por defecto replica chunks completos; `--remote-copies` indica las copias remotas requeridas, la copia local no cuenta como copia remota y el nodo origen se excluye. Como alternativa, `--protection-mode ec` agrupa chunks deduplicados en data packs, los codifica con `--ec-k` data shards y `--ec-m` parity shards, y coloca cada shard en un nodo remoto distinto.
 3. **Verificación (`verify`):** Auditoría remota sin descarga de blobs. En modo replicación comprueba chunks completos; en modo EC comprueba la presencia de shards registrados por data pack y marca los packs como `VERIFIED`, `DEGRADED` o `FAILED`.
 4. **Restauración (`restore`):** Reconstrucción priorizada y explícita. Busca cada chunk en el CAS local y en el store P2P local del nodo. La recuperación remota se selecciona con `--remote-recovery`: por chunks completos (`replication`), por data packs EC (`ec`), ambas rutas (`auto`) o ninguna (`none`).
 5. **Metadata distribuida:** La metadata SQLite local puede exportarse a un grafo de objetos, empaquetarse, firmarse y cifrarse para permitir la recuperación de snapshots ante la pérdida total del nodo de origen.
@@ -97,7 +97,7 @@ python -m stopan restore 1 --out restore_out --remote-recovery none
 Con los nodos levantados, proteger los chunks pendientes en 1 nodo remoto:
 
 ```bash
-python -m stopan push --membership-seed localhost:50051 --rf 1
+python -m stopan push --membership-seed localhost:50051 --remote-copies 1
 ```
 
 Auditar la protección remota registrada:
@@ -113,7 +113,7 @@ python -m stopan restore 1 \
   --out restored_from_network \
   --remote-recovery replication \
   --membership-seed localhost:50051 \
-  --rf 1
+  --replication-targets 1
 ```
 
 ### Protección por erasure coding
@@ -142,7 +142,7 @@ python -m stopan restore 1 \
 También existe un modo combinado que primero intenta recuperar chunks completos por replicación y después usa EC solo para los chunks que sigan faltando:
 
 ```bash
-python -m stopan restore 1 --out restored_auto --remote-recovery auto --membership-seed localhost:50051 --rf 1
+python -m stopan restore 1 --out restored_auto --remote-recovery auto --membership-seed localhost:50051 --replication-targets 1
 ```
 
 `ec_m=0` está permitido y significa striping sin redundancia: se generan `ec_k` shards, se necesitan todos para reconstruir el pack y cualquier shard perdido hace que el pack pase a `FAILED`.
@@ -178,10 +178,10 @@ python -m stopan metadata import-graph --object-store imported_store --passphras
 
 ### Metadata conectada a la red
 
-Distribuir el último pack de metadata a la red P2P (1 copia remota):
+Distribuir el último pack de metadata a la red P2P (1 copia remota del pack):
 
 ```bash
-python -m stopan metadata push --object-store meta_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --rf 1
+python -m stopan metadata push --object-store meta_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --pack-copies 1
 ```
 
 Recuperar metadata desde packs remotos y reconstruir un object store local en un nodo nuevo:

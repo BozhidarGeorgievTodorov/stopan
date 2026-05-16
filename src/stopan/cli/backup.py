@@ -5,7 +5,7 @@ import os
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
-from stopan.cli.validation import require_int_at_least
+from stopan.cli.validation import IntRange, validate_int_ranges
 from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
@@ -66,12 +66,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_metadata_auto_export_args(parser, context="backup")
     args = parser.parse_args(argv)
 
-    require_int_at_least(parser, args.workers, flag="workers", min_value=1)
-    require_int_at_least(
+    validate_int_ranges(
         parser,
-        args.desired_remote_copies,
-        flag="--desired-remote-copies",
-        min_value=0,
+        args,
+        (
+            IntRange("workers", "workers", 1),
+            IntRange("desired_remote_copies", "--desired-remote-copies", 0),
+        ),
     )
 
     return args

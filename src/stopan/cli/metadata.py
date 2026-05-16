@@ -5,8 +5,13 @@ from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args
 from stopan.cli.validation import (
-    require_float_at_least,
-    require_int_at_least,
+    Flag,
+    FloatRange,
+    IntRange,
+    reject_together,
+    require_dependency,
+    validate_float_ranges,
+    validate_int_ranges,
     validate_scrypt_overrides,
 )
 from stopan.cli.metadata_commands import (
@@ -587,79 +592,84 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     validate_scrypt_overrides(parser, args)
 
     if args.command == "object-store-status":
-        if args.passphrase_file and not args.decrypt_latest:
-            parser.error("--passphrase-file requiere --decrypt-latest")
+        require_dependency(
+            parser,
+            args,
+            Flag("passphrase_file", "--passphrase-file"),
+            Flag("decrypt_latest", "--decrypt-latest"),
+        )
 
     if args.command == "export-graph":
-        if args.pack_out and not args.pack:
-            parser.error("--pack-out requiere --pack")
-        if args.pack_dir and not args.pack:
-            parser.error("--pack-dir requiere --pack")
-        if args.pack_out and args.pack_dir:
-            parser.error("'--pack-out' y '--pack-dir' son incompatibles")
-        if args.identity_file and not args.pack:
-            parser.error("--identity-file requiere --pack")
+        require_dependency(parser, args, Flag("pack_out", "--pack-out"), Flag("pack", "--pack"))
+        require_dependency(parser, args, Flag("pack_dir", "--pack-dir"), Flag("pack", "--pack"))
+        require_dependency(parser, args, Flag("identity_file", "--identity-file"), Flag("pack", "--pack"))
+        reject_together(parser, args, Flag("pack_out", "--pack-out"), Flag("pack_dir", "--pack-dir"))
 
-    if args.command == "pack-graph" and args.out and args.pack_dir:
-        parser.error("'--out' y '--pack-dir' son incompatibles")
+    if args.command == "pack-graph":
+        reject_together(parser, args, Flag("out", "--out"), Flag("pack_dir", "--pack-dir"))
 
     if args.command == "inspect-pack":
-        if args.passphrase_file and not args.decrypt:
-            parser.error("--passphrase-file requiere --decrypt")
-        if args.identity_file and not args.decrypt:
-            parser.error("--identity-file requiere --decrypt")
+        require_dependency(parser, args, Flag("passphrase_file", "--passphrase-file"), Flag("decrypt", "--decrypt"))
+        require_dependency(parser, args, Flag("identity_file", "--identity-file"), Flag("decrypt", "--decrypt"))
 
     if args.command == "push":
-        if args.pack_in and args.object_store:
-            parser.error("'--pack-in' y '--object-store' son incompatibles")
-        if args.pack_in and args.pack_out:
-            parser.error("'--pack-in' y '--pack-out' son incompatibles")
-        if args.pack_in and args.pack_dir:
-            parser.error("'--pack-in' y '--pack-dir' son incompatibles")
-        if args.pack_out and args.pack_dir:
-            parser.error("'--pack-out' y '--pack-dir' son incompatibles")
-        require_int_at_least(parser, args.pack_copies, flag="--pack-copies", min_value=0)
-        require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
-        require_float_at_least(parser, args.rpc_timeout_s, flag="--rpc-timeout-s", min_value=0.0, inclusive=False)
-        require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
+        reject_together(parser, args, Flag("pack_in", "--pack-in"), Flag("object_store", "--object-store"))
+        reject_together(parser, args, Flag("pack_in", "--pack-in"), Flag("pack_out", "--pack-out"))
+        reject_together(parser, args, Flag("pack_in", "--pack-in"), Flag("pack_dir", "--pack-dir"))
+        reject_together(parser, args, Flag("pack_out", "--pack-out"), Flag("pack_dir", "--pack-dir"))
+        validate_int_ranges(
+            parser,
+            args,
+            (
+                IntRange("pack_copies", "--pack-copies", 0),
+                IntRange("target_parallelism", "--target-parallelism", 1),
+                IntRange("max_message_bytes", "--max-message-bytes", 1),
+            ),
+        )
+        validate_float_ranges(
+            parser,
+            args,
+            (FloatRange("rpc_timeout_s", "--rpc-timeout-s", 0.0, inclusive=False),),
+        )
 
     if args.command in {"import-graph", "recover"}:
-        require_int_at_least(
+        validate_int_ranges(
             parser,
-            getattr(args, "default_desired_remote_copies", None),
-            flag="--default-desired-remote-copies",
-            min_value=0,
+            args,
+            (IntRange("default_desired_remote_copies", "--default-desired-remote-copies", 0),),
         )
 
     if args.command == "recover":
-        require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
-        require_float_at_least(parser, args.rpc_timeout_s, flag="--rpc-timeout-s", min_value=0.0, inclusive=False)
-        require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
-        require_int_at_least(parser, args.max_candidates, flag="--max-candidates", min_value=1)
-        if args.pack_out and args.download_dir:
-            parser.error("'--pack-out' y '--download-dir' son incompatibles")
+        validate_int_ranges(
+            parser,
+            args,
+            (
+                IntRange("target_parallelism", "--target-parallelism", 1),
+                IntRange("max_message_bytes", "--max-message-bytes", 1),
+                IntRange("max_candidates", "--max-candidates", 1),
+            ),
+        )
+        validate_float_ranges(
+            parser,
+            args,
+            (FloatRange("rpc_timeout_s", "--rpc-timeout-s", 0.0, inclusive=False),),
+        )
+        reject_together(parser, args, Flag("pack_out", "--pack-out"), Flag("download_dir", "--download-dir"))
         if not args.import_db and args.no_protection:
             parser.error("'--no-import-db' y '--no-protection' son incompatibles")
         if not args.import_db and args.default_desired_remote_copies is not None:
             parser.error("--default-desired-remote-copies requiere importar la DB")
 
     if args.command == "gc":
-        require_float_at_least(
+        validate_float_ranges(
             parser,
-            args.object_grace_hours,
-            flag="--object-grace-hours",
-            min_value=0.0,
-            inclusive=True,
+            args,
+            (
+                FloatRange("object_grace_hours", "--object-grace-hours", 0.0),
+                FloatRange("pack_grace_hours", "--pack-grace-hours", 0.0),
+            ),
         )
-        require_float_at_least(
-            parser,
-            args.pack_grace_hours,
-            flag="--pack-grace-hours",
-            min_value=0.0,
-            inclusive=True,
-        )
-        if args.objects_only and args.packs_only:
-            parser.error("'--objects-only' y '--packs-only' son incompatibles")
+        reject_together(parser, args, Flag("objects_only", "--objects-only"), Flag("packs_only", "--packs-only"))
 
 
 def _add_scrypt_override_args(parser: argparse.ArgumentParser) -> None:

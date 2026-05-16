@@ -4,7 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
-from stopan.cli.validation import require_float_at_least, require_int_at_least
+from stopan.cli.validation import FloatRange, IntRange, validate_float_ranges, validate_int_ranges
 from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
@@ -36,14 +36,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     
     args = parser.parse_args(argv)
 
-    require_float_at_least(parser, args.probe_timeout_s, flag="--probe-timeout-s", min_value=0.0, inclusive=False)
-    require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
-    require_int_at_least(parser, args.limit, flag="--limit", min_value=1)
-    require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
+    validate_float_ranges(
+        parser,
+        args,
+        (FloatRange("probe_timeout_s", "--probe-timeout-s", 0.0, inclusive=False),),
+    )
+    validate_int_ranges(
+        parser,
+        args,
+        (
+            IntRange("target_parallelism", "--target-parallelism", 1),
+            IntRange("limit", "--limit", 1),
+            IntRange("max_message_bytes", "--max-message-bytes", 1),
+            IntRange("probe_batch_hashes", "--probe-batch-hashes", 1),
+        ),
+    )
 
     if args.protection_mode == "ec" and args.probe_batch_hashes is not None:
         parser.error("--probe-batch-hashes solo aplica a --protection-mode replication")
-    require_int_at_least(parser, args.probe_batch_hashes, flag="--probe-batch-hashes", min_value=1)
 
     return args
 

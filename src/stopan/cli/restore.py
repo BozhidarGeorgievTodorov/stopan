@@ -4,7 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
-from stopan.cli.validation import require_int_at_least
+from stopan.cli.validation import CLIUsageError, IntRange, validate_int_ranges
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -50,20 +50,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
-    require_int_at_least(parser, args.snapshot_id, flag="snapshot_id", min_value=1)
-    require_int_at_least(parser, args.prefetch_window, flag="--prefetch-window", min_value=1)
-    require_int_at_least(
+    validate_int_ranges(
         parser,
-        args.batch_target_parallelism,
-        flag="--batch-target-parallelism",
-        min_value=1,
+        args,
+        (
+            IntRange("snapshot_id", "snapshot_id", 1),
+            IntRange("prefetch_window", "--prefetch-window", 1),
+            IntRange("batch_target_parallelism", "--batch-target-parallelism", 1),
+        ),
     )
 
     if args.remote_recovery in {"none", "ec"}:
         if args.replication_targets is not None:
             parser.error("--replication-targets solo aplica a --remote-recovery replication|auto")
     else:
-        require_int_at_least(parser, args.replication_targets, flag="--replication-targets", min_value=1)
+        validate_int_ranges(
+            parser,
+            args,
+            (IntRange("replication_targets", "--replication-targets", 1),),
+        )
 
     if args.remote_recovery == "none" and args.membership_seed:
         parser.error("--membership-seed solo aplica cuando --remote-recovery usa la red")
@@ -75,16 +80,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_runtime_config(args)
 
-    from stopan.restore.service import restore_snapshot
-
     uses_replication = args.remote_recovery in {"replication", "auto"}
     uses_network = args.remote_recovery != "none"
     replication_targets = int(choose(args.replication_targets, cfg.protection.remote_copies)) if uses_replication else 0
     if uses_replication and replication_targets < 1:
-        raise ValueError(
+        raise CLIUsageError(
             "restore con recuperación replication|auto requiere targets >= 1; "
             "ajusta --replication-targets o protection.remote_copies."
         )
+
+    from stopan.restore.service import restore_snapshot
 
     result = restore_snapshot(
         args.snapshot_id,

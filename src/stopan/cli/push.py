@@ -8,7 +8,16 @@ from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
 )
-from stopan.cli.validation import require_float_at_least, require_int_at_least
+from stopan.cli.validation import (
+    CLIUsageError,
+    Flag,
+    FloatRange,
+    IntRange,
+    reject_present,
+    require_present,
+    validate_float_ranges,
+    validate_int_ranges,
+)
 from stopan.config.defaults import DEFAULT_EC_PACK_SIZE_BYTES
 
 
@@ -52,46 +61,79 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     
     args = parser.parse_args(argv)
 
-    require_int_at_least(parser, args.limit, flag="--limit", min_value=1)
-    require_float_at_least(parser, args.stream_timeout_s, flag="--stream-timeout-s", min_value=0.0, inclusive=False)
-    require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
-    require_int_at_least(parser, args.commit_every, flag="--commit-every", min_value=1)
+    validate_int_ranges(
+        parser,
+        args,
+        (
+            IntRange("limit", "--limit", 1),
+            IntRange("max_message_bytes", "--max-message-bytes", 1),
+            IntRange("commit_every", "--commit-every", 1),
+        ),
+    )
+    validate_float_ranges(
+        parser,
+        args,
+        (FloatRange("stream_timeout_s", "--stream-timeout-s", 0.0, inclusive=False),),
+    )
 
     if args.protection_mode == "ec":
-        if args.remote_copies is not None:
-            parser.error("--remote-copies solo aplica a --protection-mode replication")
-        if args.strict_remote_copies is not None:
-            parser.error("--strict-remote-copies/--no-strict-remote-copies solo aplica a --protection-mode replication")
-        if args.target_parallelism is not None:
-            parser.error("--target-parallelism solo aplica a --protection-mode replication")
-        if args.probe_batch_hashes is not None:
-            parser.error("--probe-batch-hashes solo aplica a --protection-mode replication")
-        if args.stream_inflight is not None:
-            parser.error("--stream-inflight solo aplica a --protection-mode replication")
-        if args.probe_timeout_s is not None:
-            parser.error("--probe-timeout-s solo aplica a --protection-mode replication")
-
-        if args.ec_k is None:
-            parser.error("--ec-k es obligatorio en --protection-mode ec")
-        if args.ec_m is None:
-            parser.error("--ec-m es obligatorio en --protection-mode ec")
-        require_int_at_least(parser, args.ec_k, flag="--ec-k", min_value=1)
-        require_int_at_least(parser, args.ec_m, flag="--ec-m", min_value=0)
+        reject_present(
+            parser,
+            args,
+            (
+                Flag("remote_copies", "--remote-copies"),
+                Flag("target_parallelism", "--target-parallelism"),
+                Flag("probe_batch_hashes", "--probe-batch-hashes"),
+                Flag("stream_inflight", "--stream-inflight"),
+                Flag("probe_timeout_s", "--probe-timeout-s"),
+            ),
+            "{flag} solo aplica a --protection-mode replication",
+        )
+        reject_present(
+            parser,
+            args,
+            (Flag("strict_remote_copies", "--strict-remote-copies/--no-strict-remote-copies"),),
+            "{flag} solo aplica a --protection-mode replication",
+        )
+        require_present(parser, args, Flag("ec_k", "--ec-k"), "--ec-k es obligatorio en --protection-mode ec")
+        require_present(parser, args, Flag("ec_m", "--ec-m"), "--ec-m es obligatorio en --protection-mode ec")
         args.ec_pack_size_bytes = DEFAULT_EC_PACK_SIZE_BYTES if args.ec_pack_size_bytes is None else args.ec_pack_size_bytes
-        require_int_at_least(parser, args.ec_pack_size_bytes, flag="--ec-pack-size-bytes", min_value=1)
+        validate_int_ranges(
+            parser,
+            args,
+            (
+                IntRange("ec_k", "--ec-k", 1),
+                IntRange("ec_m", "--ec-m", 0),
+                IntRange("ec_pack_size_bytes", "--ec-pack-size-bytes", 1),
+            ),
+        )
 
     else:
-        require_int_at_least(parser, args.remote_copies, flag="--remote-copies", min_value=1)
-        require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
-        require_int_at_least(parser, args.probe_batch_hashes, flag="--probe-batch-hashes", min_value=1)
-        require_int_at_least(parser, args.stream_inflight, flag="--stream-inflight", min_value=1)
-        require_float_at_least(parser, args.probe_timeout_s, flag="--probe-timeout-s", min_value=0.0, inclusive=False)
-        if args.ec_k is not None:
-            parser.error("--ec-k solo aplica a --protection-mode ec")
-        if args.ec_m is not None:
-            parser.error("--ec-m solo aplica a --protection-mode ec")
-        if args.ec_pack_size_bytes is not None:
-            parser.error("--ec-pack-size-bytes solo aplica a --protection-mode ec")
+        validate_int_ranges(
+            parser,
+            args,
+            (
+                IntRange("remote_copies", "--remote-copies", 1),
+                IntRange("target_parallelism", "--target-parallelism", 1),
+                IntRange("probe_batch_hashes", "--probe-batch-hashes", 1),
+                IntRange("stream_inflight", "--stream-inflight", 1),
+            ),
+        )
+        validate_float_ranges(
+            parser,
+            args,
+            (FloatRange("probe_timeout_s", "--probe-timeout-s", 0.0, inclusive=False),),
+        )
+        reject_present(
+            parser,
+            args,
+            (
+                Flag("ec_k", "--ec-k"),
+                Flag("ec_m", "--ec-m"),
+                Flag("ec_pack_size_bytes", "--ec-pack-size-bytes"),
+            ),
+            "{flag} solo aplica a --protection-mode ec",
+        )
 
     return args
 
@@ -144,14 +186,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return 0 if int(stats.failed_packs) == 0 and int(stats.degraded_packs) == 0 else 2
 
-    from stopan.protection.pusher import push_to_network
-
     remote_copies = int(choose(args.remote_copies, cfg.protection.remote_copies))
     if remote_copies < 1:
-        raise ValueError(
+        raise CLIUsageError(
             "push replication requiere copias remotas >= 1; "
             "ajusta --remote-copies o protection.remote_copies."
         )
+
+    from stopan.protection.pusher import push_to_network
 
     stats = push_to_network(
         membership_seed=args.membership_seed or first_seed(cfg),

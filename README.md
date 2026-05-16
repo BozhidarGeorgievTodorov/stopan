@@ -149,6 +149,12 @@ python -m stopan restore 1 --out restored_auto --remote-recovery auto --membersh
 
 > **Nota:** Para probar recuperación desde red, después de hacer `push` se puede apartar o borrar el repositorio local `_data_chunks` y ejecutar `restore` de nuevo. En modo EC se necesitan al menos `ec_k + ec_m` nodos remotos elegibles, porque el nodo origen no almacena sus propios shards.
 
+## Contrato CLI
+
+Stopan no acepta abreviaturas implícitas de flags largos. Por ejemplo, `--remote-copies` debe escribirse completo; prefijos como `--rem` se rechazan para evitar aliases accidentales.
+
+Los flags numéricos se validan de forma temprana en CLI: paralelismos, límites, timeouts, tamaños de mensaje, copias y ventanas de restore deben respetar sus rangos antes de iniciar trabajo real. Las combinaciones que dejarían flags ignorados, como salidas de pack incompatibles o secretos de descifrado sin modo de descifrado, fallan con errores explícitos.
+
 ## Metadata
 
 Stopan permite separar la operativa de metadatos en flujos estrictamente locales o distribuidos.
@@ -170,7 +176,7 @@ python -m stopan backup test_data --metadata-passphrase-file pass.txt --metadata
 Alternativamente, el flujo manual permite exportar el grafo, empaquetarlo e importarlo paso a paso:
 
 ```bash
-python -m stopan metadata export-graph --object-store meta_store --passphrase-file pass.txt --identity-file id.json
+python -m stopan metadata export-graph --object-store meta_store --passphrase-file pass.txt
 python -m stopan metadata pack-graph --object-store meta_store --passphrase-file pass.txt --identity-file id.json --out latest.stopanmetapack
 python -m stopan metadata import-pack latest.stopanmetapack --object-store imported_store --passphrase-file pass.txt --identity-file id.json
 python -m stopan metadata import-graph --object-store imported_store --passphrase-file pass.txt

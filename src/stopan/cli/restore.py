@@ -4,11 +4,13 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.validation import require_int_at_least
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan restore",
+        allow_abbrev=False,
         description="Restaura snapshots desde CAS local y red bajo demanda.",
     )
     add_config_args(parser)
@@ -48,11 +50,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
+    require_int_at_least(parser, args.snapshot_id, flag="snapshot_id", min_value=1)
+    require_int_at_least(parser, args.prefetch_window, flag="--prefetch-window", min_value=1)
+    require_int_at_least(
+        parser,
+        args.batch_target_parallelism,
+        flag="--batch-target-parallelism",
+        min_value=1,
+    )
+
     if args.remote_recovery in {"none", "ec"}:
         if args.replication_targets is not None:
             parser.error("--replication-targets solo aplica a --remote-recovery replication|auto")
-    elif args.replication_targets is not None and args.replication_targets < 1:
-        parser.error("--replication-targets debe ser >= 1")
+    else:
+        require_int_at_least(parser, args.replication_targets, flag="--replication-targets", min_value=1)
 
     if args.remote_recovery == "none" and args.membership_seed:
         parser.error("--membership-seed solo aplica cuando --remote-recovery usa la red")
@@ -68,12 +79,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     uses_replication = args.remote_recovery in {"replication", "auto"}
     uses_network = args.remote_recovery != "none"
+    replication_targets = int(choose(args.replication_targets, cfg.protection.remote_copies)) if uses_replication else 0
+    if uses_replication and replication_targets < 1:
+        raise ValueError(
+            "restore con recuperación replication|auto requiere targets >= 1; "
+            "ajusta --replication-targets o protection.remote_copies."
+        )
 
     result = restore_snapshot(
         args.snapshot_id,
         membership_seed=(args.membership_seed or first_seed(cfg)) if uses_network else None,
         base_output_dir=args.out,
-        rf=int(choose(args.replication_targets, cfg.protection.remote_copies)) if uses_replication else 0,
+        rf=replication_targets,
         batch_target_parallelism=int(choose(args.batch_target_parallelism, cfg.restore.batch_target_parallelism)),
         prefetch_window=int(choose(args.prefetch_window, cfg.restore.prefetch_window)),
         db_file=cfg.node.db_file,

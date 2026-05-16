@@ -8,12 +8,14 @@ from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
 )
+from stopan.cli.validation import require_float_at_least, require_int_at_least
 from stopan.config.defaults import DEFAULT_EC_PACK_SIZE_BYTES
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan push",
+        allow_abbrev=False,
         description="Protección remota de chunks mediante HRW + inventario remoto + streaming.",
     )
     add_config_args(parser)
@@ -50,6 +52,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     
     args = parser.parse_args(argv)
 
+    require_int_at_least(parser, args.limit, flag="--limit", min_value=1)
+    require_float_at_least(parser, args.stream_timeout_s, flag="--stream-timeout-s", min_value=0.0, inclusive=False)
+    require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
+    require_int_at_least(parser, args.commit_every, flag="--commit-every", min_value=1)
+
     if args.protection_mode == "ec":
         if args.remote_copies is not None:
             parser.error("--remote-copies solo aplica a --protection-mode replication")
@@ -63,22 +70,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("--stream-inflight solo aplica a --protection-mode replication")
         if args.probe_timeout_s is not None:
             parser.error("--probe-timeout-s solo aplica a --protection-mode replication")
-            
+
         if args.ec_k is None:
             parser.error("--ec-k es obligatorio en --protection-mode ec")
         if args.ec_m is None:
             parser.error("--ec-m es obligatorio en --protection-mode ec")
-        if args.ec_k < 1:
-            parser.error("--ec-k debe ser >= 1")
-        if args.ec_m < 0:
-            parser.error("--ec-m debe ser >= 0")
+        require_int_at_least(parser, args.ec_k, flag="--ec-k", min_value=1)
+        require_int_at_least(parser, args.ec_m, flag="--ec-m", min_value=0)
         args.ec_pack_size_bytes = DEFAULT_EC_PACK_SIZE_BYTES if args.ec_pack_size_bytes is None else args.ec_pack_size_bytes
-        if args.ec_pack_size_bytes < 1:
-            parser.error("--ec-pack-size-bytes debe ser >= 1")
+        require_int_at_least(parser, args.ec_pack_size_bytes, flag="--ec-pack-size-bytes", min_value=1)
 
     else:
-        if args.remote_copies is not None and args.remote_copies < 1:
-            parser.error("--remote-copies debe ser >= 1 en --protection-mode replication")
+        require_int_at_least(parser, args.remote_copies, flag="--remote-copies", min_value=1)
+        require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
+        require_int_at_least(parser, args.probe_batch_hashes, flag="--probe-batch-hashes", min_value=1)
+        require_int_at_least(parser, args.stream_inflight, flag="--stream-inflight", min_value=1)
+        require_float_at_least(parser, args.probe_timeout_s, flag="--probe-timeout-s", min_value=0.0, inclusive=False)
         if args.ec_k is not None:
             parser.error("--ec-k solo aplica a --protection-mode ec")
         if args.ec_m is not None:
@@ -139,9 +146,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from stopan.protection.pusher import push_to_network
 
+    remote_copies = int(choose(args.remote_copies, cfg.protection.remote_copies))
+    if remote_copies < 1:
+        raise ValueError(
+            "push replication requiere copias remotas >= 1; "
+            "ajusta --remote-copies o protection.remote_copies."
+        )
+
     stats = push_to_network(
         membership_seed=args.membership_seed or first_seed(cfg),
-        rf=int(choose(args.remote_copies, cfg.protection.remote_copies)),
+        rf=remote_copies,
         limit=args.limit,
         target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
         probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.replication.probe_batch_hashes)),

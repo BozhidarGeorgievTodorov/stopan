@@ -12,14 +12,15 @@ from stopan.config.loader import load_config
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan config",
+        allow_abbrev=False,
         description="Herramientas de configuración de Stopan.",
     )
     sub = parser.add_subparsers(dest="action", required=True)
 
-    example = sub.add_parser("example", help="Imprime o escribe un node.yaml de ejemplo.")
+    example = sub.add_parser("example", allow_abbrev=False, help="Imprime o escribe un node.yaml de ejemplo.")
     example.add_argument("--out", default=None, help="Ruta donde escribir el ejemplo. Si se omite, imprime stdout.")
 
-    validate = sub.add_parser("validate", help="Valida un fichero de configuración.")
+    validate = sub.add_parser("validate", allow_abbrev=False, help="Valida un fichero de configuración.")
     validate.add_argument("config_path", help="Ruta del YAML de configuración a validar.")
 
     return parser.parse_args(argv)

@@ -20,39 +20,39 @@ class CommandSpec:
 COMMANDS: dict[str, CommandSpec] = {
     "backup": CommandSpec(
         module_name="stopan.cli.backup",
-        description="Create a local snapshot from a directory",
+        description="Crea un snapshot local desde una carpeta",
     ),
     "push": CommandSpec(
         module_name="stopan.cli.push",
-        description="Replicate pending chunks to remote nodes",
+        description="Protege chunks pendientes en nodos remotos",
     ),
     "restore": CommandSpec(
         module_name="stopan.cli.restore",
-        description="Restore a snapshot from local CAS and/or network",
+        description="Restaura un snapshot desde CAS local y/o red",
     ),
     "verify": CommandSpec(
         module_name="stopan.cli.verify",
-        description="Verify remote protection with ProbeMissingChunks",
+        description="Verifica la protección remota",
     ),
     "node": CommandSpec(
         module_name="stopan.cli.node",
-        description="Start a storage/membership node",
+        description="Arranca un nodo de almacenamiento y membership",
     ),
     "init": CommandSpec(
         module_name="stopan.cli.init",
-        description="Initialize Stopan configuration and directories",
+        description="Inicializa configuración y directorios de Stopan",
     ),
     "config": CommandSpec(
         module_name="stopan.cli.config",
-        description="Generate or validate Stopan configuration files",
+        description="Genera o valida ficheros de configuración Stopan",
     ),
     "metadata": CommandSpec(
         module_name="stopan.cli.metadata",
-        description="Manage encrypted local metadata",
+        description="Gestiona metadata cifrada local",
     ),
     "metadata-store-gc": CommandSpec(
         module_name="stopan.cli.metadata_store_gc",
-        description="Prune the distributed metadata pack store",
+        description="Limpia el distributed metadata pack store",
     ),
 }
 
@@ -68,7 +68,8 @@ _USER_ERROR_TYPES = (
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stopan",
-        description="Stopan - distributed content-addressed backup",
+        allow_abbrev=False,
+        description="Stopan - backup distribuido content-addressed",
     )
     subparsers = parser.add_subparsers(
         dest="command",
@@ -79,6 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     for name, spec in COMMANDS.items():
         subparsers.add_parser(
             name,
+            allow_abbrev=False,
             help=spec.description,
             description=spec.description,
             add_help=False,
@@ -139,17 +141,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _main(argv)
     except KeyboardInterrupt:
-        print("\nInterrupted by user.", file=sys.stderr)
+        print("\nInterrumpido por el usuario.", file=sys.stderr)
         return 130
     except _USER_ERROR_TYPES as exc:
         if _debug_tracebacks_enabled():
             raise
-        _print_error("Stopan configuration/usage error", exc)
+        _print_error("Error de configuración/uso de Stopan", exc)
         return 2
     except Exception as exc:
         if _debug_tracebacks_enabled():
             raise
-        _print_error("Stopan error", exc)
+        _print_error("Error de Stopan", exc)
         return 1
 
 

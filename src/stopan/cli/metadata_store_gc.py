@@ -6,12 +6,14 @@ from datetime import datetime
 
 from stopan.cli.config_utils import add_config_args, choose, load_runtime_config
 from stopan.cli.metadata_helpers import format_bytes
+from stopan.cli.validation import require_int_at_least
 from stopan.metadata.packs.distributed_store import MetadataPackStore
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan metadata-store-gc",
+        allow_abbrev=False,
         description=(
             "Mantenimiento local del distributed metadata pack store. "
             "Pensado para ejecución manual o systemd timer."
@@ -45,7 +47,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Ejecuta el borrado real.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    require_int_at_least(parser, args.max_age_days, flag="--max-age-days", min_value=0)
+
+    return args
 
 
 def _format_time(ts: float | None) -> str:

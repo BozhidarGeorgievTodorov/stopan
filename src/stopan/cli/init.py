@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from stopan.cli.validation import require_int_at_least
 from stopan.config.defaults import (
     DEFAULT_NODE_CONFIG,
     DEFAULT_SYSTEM_DB_FILE,
@@ -24,12 +25,17 @@ from stopan.config.model import StopanConfig
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan init",
+        allow_abbrev=False,
         description="Inicializa configuración y directorios de Stopan.",
     )
 
     sub = parser.add_subparsers(dest="target", required=True)
 
-    node = sub.add_parser("node", help="Inicializa la configuración de un nodo P2P")
+    node = sub.add_parser(
+        "node",
+        allow_abbrev=False,
+        help="Inicializa la configuración de un nodo P2P",
+    )
     node.add_argument(
         "--config",
         default=DEFAULT_NODE_CONFIG,
@@ -83,7 +89,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Sobrescribe el YAML si ya existe.",
     )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.target == "node":
+        require_int_at_least(parser, args.remote_copies, flag="--remote-copies", min_value=0)
+
+    return args
 
 
 def _plain_data(value: Any) -> Any:

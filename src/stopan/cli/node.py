@@ -10,6 +10,7 @@ from stopan.config.defaults import DEFAULT_NODE_CONFIG
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="stopan node",
+        allow_abbrev=False,
         description="Arranca un nodo Stopan de almacenamiento P2P + membership.",
     )
     add_config_args(parser, default_config=DEFAULT_NODE_CONFIG)
@@ -21,7 +22,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_runtime_config(args)
 
     if not cfg.node.advertise_addr:
-        raise RuntimeError(
+        raise ValueError(
             "Falta node.advertise_addr. Define advertise_addr en el fichero de configuración "
             f"usado con --config o en {DEFAULT_NODE_CONFIG}."
         )

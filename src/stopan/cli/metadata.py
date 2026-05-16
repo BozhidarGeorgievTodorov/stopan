@@ -4,6 +4,11 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args
+from stopan.cli.validation import (
+    require_float_at_least,
+    require_int_at_least,
+    validate_scrypt_overrides,
+)
 from stopan.cli.metadata_commands import (
     cmd_export_object_graph,
     cmd_gc_object_store,
@@ -37,12 +42,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     status_parser = subparsers.add_parser(
         "status",
+        allow_abbrev=False,
         help="Muestra configuración efectiva y estado operativo del metadata vault.",
     )
     add_config_args(status_parser)
 
     identity_create_parser = subparsers.add_parser(
         "identity-create",
+        allow_abbrev=False,
         help="Crea una identidad criptográfica local Ed25519+X25519 para metadata distribuida.",
     )
     add_config_args(identity_create_parser)
@@ -67,6 +74,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     identity_show_parser = subparsers.add_parser(
         "identity-show",
+        allow_abbrev=False,
         help="Muestra el owner_id efectivo desde CLI/config/identity file.",
     )
     add_config_args(identity_show_parser)
@@ -83,6 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     object_status_parser = subparsers.add_parser(
         "object-store-status",
+        allow_abbrev=False,
         help="[avanzado] Muestra estado del metadata object store incremental cifrado.",
     )
     add_config_args(object_status_parser)
@@ -104,6 +113,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     export_graph_parser = subparsers.add_parser(
         "export-graph",
+        allow_abbrev=False,
         help="Exporta el estado actual de _metadata.db a un object store incremental cifrado.",
     )
     add_config_args(export_graph_parser)
@@ -146,6 +156,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     import_graph_parser = subparsers.add_parser(
         "import-graph",
+        allow_abbrev=False,
         help="Reconstruye una _metadata.db vacía desde el latest del object store cifrado.",
     )
     add_config_args(import_graph_parser)
@@ -176,6 +187,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     pack_graph_parser = subparsers.add_parser(
         "pack-graph",
+        allow_abbrev=False,
         help="Crea un pack cifrado transportable con el latest del metadata object store.",
     )
     add_config_args(pack_graph_parser)
@@ -208,6 +220,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     inspect_pack_parser = subparsers.add_parser(
         "inspect-pack",
+        allow_abbrev=False,
         help="[avanzado] Inspecciona un metadata object pack cifrado.",
     )
     add_config_args(inspect_pack_parser)
@@ -230,6 +243,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     list_packs_parser = subparsers.add_parser(
         "list-object-packs",
+        allow_abbrev=False,
         help="[avanzado] Lista metadata object packs locales sin descifrarlos.",
     )
     add_config_args(list_packs_parser)
@@ -246,6 +260,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     local_store_pack_parser = subparsers.add_parser(
         "local-store-pack",
+        allow_abbrev=False,
         help="[avanzado] Guarda un metadata object pack cifrado en el pack store local por owner_id.",
     )
     add_config_args(local_store_pack_parser)
@@ -278,6 +293,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     local_list_packs_parser = subparsers.add_parser(
         "local-list-packs",
+        allow_abbrev=False,
         help="[avanzado] Lista metadata packs guardados en el pack store local para un owner_id.",
     )
     add_config_args(local_list_packs_parser)
@@ -299,6 +315,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     local_retrieve_pack_parser = subparsers.add_parser(
         "local-retrieve-pack",
+        allow_abbrev=False,
         help="[avanzado] Extrae un metadata pack del pack store local a una ruta de salida.",
     )
     add_config_args(local_retrieve_pack_parser)
@@ -333,7 +350,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         allow_abbrev=False,
         help=(
             "Distribuye metadata a nodos remotos. Por defecto crea un pack del latest object graph; "
-            "con --pack distribuye un .stopanmetapack existente."
+            "con --pack-in distribuye un .stopanmetapack existente."
         ),
     )
     add_config_args(push_parser)
@@ -383,6 +400,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     recover_parser = subparsers.add_parser(
         "recover",
+        allow_abbrev=False,
         help="Recupera metadata desde packs distribuidos remotos, importa el pack y reconstruye la DB local.",
     )
     add_config_args(recover_parser)
@@ -470,6 +488,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     import_pack_parser = subparsers.add_parser(
         "import-pack",
+        allow_abbrev=False,
         help="Importa un metadata object pack cifrado a un object store local.",
     )
     add_config_args(import_pack_parser)
@@ -493,6 +512,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     gc_parser = subparsers.add_parser(
         "gc",
+        allow_abbrev=False,
         help="[avanzado] Ejecuta Mark & Sweep sobre el metadata object store cifrado.",
     )
     add_config_args(gc_parser)
@@ -564,6 +584,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    validate_scrypt_overrides(parser, args)
+
+    if args.command == "object-store-status":
+        if args.passphrase_file and not args.decrypt_latest:
+            parser.error("--passphrase-file requiere --decrypt-latest")
+
+    if args.command == "export-graph":
+        if args.pack_out and not args.pack:
+            parser.error("--pack-out requiere --pack")
+        if args.pack_dir and not args.pack:
+            parser.error("--pack-dir requiere --pack")
+        if args.pack_out and args.pack_dir:
+            parser.error("'--pack-out' y '--pack-dir' son incompatibles")
+        if args.identity_file and not args.pack:
+            parser.error("--identity-file requiere --pack")
+
+    if args.command == "pack-graph" and args.out and args.pack_dir:
+        parser.error("'--out' y '--pack-dir' son incompatibles")
+
+    if args.command == "inspect-pack":
+        if args.passphrase_file and not args.decrypt:
+            parser.error("--passphrase-file requiere --decrypt")
+        if args.identity_file and not args.decrypt:
+            parser.error("--identity-file requiere --decrypt")
+
     if args.command == "push":
         if args.pack_in and args.object_store:
             parser.error("'--pack-in' y '--object-store' son incompatibles")
@@ -573,16 +618,48 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error("'--pack-in' y '--pack-dir' son incompatibles")
         if args.pack_out and args.pack_dir:
             parser.error("'--pack-out' y '--pack-dir' son incompatibles")
-        if args.pack_copies is not None and args.pack_copies < 0:
-            parser.error("--pack-copies debe ser >= 0")
+        require_int_at_least(parser, args.pack_copies, flag="--pack-copies", min_value=0)
+        require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
+        require_float_at_least(parser, args.rpc_timeout_s, flag="--rpc-timeout-s", min_value=0.0, inclusive=False)
+        require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
 
     if args.command in {"import-graph", "recover"}:
-        value = getattr(args, "default_desired_remote_copies", None)
-        if value is not None and value < 0:
-            parser.error("--default-desired-remote-copies debe ser >= 0")
+        require_int_at_least(
+            parser,
+            getattr(args, "default_desired_remote_copies", None),
+            flag="--default-desired-remote-copies",
+            min_value=0,
+        )
 
-    if args.command == "gc" and args.objects_only and args.packs_only:
-        parser.error("'--objects-only' y '--packs-only' son incompatibles")
+    if args.command == "recover":
+        require_int_at_least(parser, args.target_parallelism, flag="--target-parallelism", min_value=1)
+        require_float_at_least(parser, args.rpc_timeout_s, flag="--rpc-timeout-s", min_value=0.0, inclusive=False)
+        require_int_at_least(parser, args.max_message_bytes, flag="--max-message-bytes", min_value=1)
+        require_int_at_least(parser, args.max_candidates, flag="--max-candidates", min_value=1)
+        if args.pack_out and args.download_dir:
+            parser.error("'--pack-out' y '--download-dir' son incompatibles")
+        if not args.import_db and args.no_protection:
+            parser.error("'--no-import-db' y '--no-protection' son incompatibles")
+        if not args.import_db and args.default_desired_remote_copies is not None:
+            parser.error("--default-desired-remote-copies requiere importar la DB")
+
+    if args.command == "gc":
+        require_float_at_least(
+            parser,
+            args.object_grace_hours,
+            flag="--object-grace-hours",
+            min_value=0.0,
+            inclusive=True,
+        )
+        require_float_at_least(
+            parser,
+            args.pack_grace_hours,
+            flag="--pack-grace-hours",
+            min_value=0.0,
+            inclusive=True,
+        )
+        if args.objects_only and args.packs_only:
+            parser.error("'--objects-only' y '--packs-only' son incompatibles")
 
 
 def _add_scrypt_override_args(parser: argparse.ArgumentParser) -> None:

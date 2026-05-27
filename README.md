@@ -17,8 +17,10 @@ También puede exportar la metadata del snapshot como un grafo de objetos cifrad
 
 ## Arquitectura y flujo general
 
+Para el mapa interno completo de capas, responsabilidades de carpetas y fronteras RPC, consultar `docs/architecture.md`.
+
 1. **Backup local:** Troceado de archivos mediante *Content-Defined Chunking*, deduplicación y guardado en CAS local.
-2. **Protección P2P (`push`):** Cálculo de nodos destino mediante HRW / Rendezvous Hashing. El modo por defecto replica chunks completos; `--remote-copies` indica las copias remotas requeridas, la copia local no cuenta como copia remota y el nodo origen se excluye. Como alternativa, `--protection-mode ec` agrupa chunks deduplicados en data packs, los codifica con `--ec-k` data shards y `--ec-m` parity shards, y coloca cada shard en un nodo remoto distinto.
+2. **Protección P2P (`push`):** Cálculo de nodos destino mediante HRW / Rendezvous Hashing. El modo por defecto replica chunks completos; `--remote-copies` indica las copias remotas requeridas, la copia local no cuenta como copia remota y el nodo origen se excluye. Como alternativa, `--protection-mode ec` agrupa chunks deduplicados en data packs, los codifica con `--ec-k` data shards y `--ec-m` parity shards, y coloca cada shard en un nodo remoto distinto. `push` usa por defecto el scope `pending`, pero puede acotarse con `--scope snapshot --snapshot-id ID`, `--scope all-reachable` o `--scope all-known-chunks`.
 3. **Verificación (`verify`):** Auditoría remota sin descarga de blobs. En modo replicación comprueba chunks completos; en modo EC comprueba la presencia de shards registrados por data pack y marca los packs como `VERIFIED`, `DEGRADED` o `FAILED`.
 4. **Restauración (`restore`):** Reconstrucción priorizada y explícita. Busca cada chunk en el CAS local y en el store P2P local del nodo. La recuperación remota se selecciona con `--remote-recovery`: por chunks completos (`replication`), por data packs EC (`ec`), ambas rutas (`auto`) o ninguna (`none`).
 5. **Metadata distribuida:** La metadata SQLite local puede exportarse a un grafo de objetos, empaquetarse, firmarse y cifrarse para permitir la recuperación de snapshots ante la pérdida total del nodo de origen.
@@ -27,21 +29,21 @@ También puede exportar la metadata del snapshot como un grafo de objetos cifrad
 
 ```text
 src/stopan/
-├── backup/       # creación de snapshots y workers de backup
-├── cas/          # repositorio de chunks direccionado por hash
-├── chunking/     # CDC, recetas y planificación de chunks
-├── cli/          # interfaz de línea de comandos
-├── common/       # utilidades compartidas
-├── config/       # modelo, defaults y carga de configuración
-├── metadata/     # SQLite, identidad, object graph y packs distribuidos
-├── node/         # nodo P2P, membership, storage RPC, shards EC y metadata RPC
-├── placement/    # HRW, cluster view y placement_epoch
-├── protection/   # política, replicación, erasure coding, push y verify
-├── protos/       # definiciones protobuf
-├── replication/  # coordinación y streaming de ReplicateChunks
-├── restore/      # recuperación local/P2P/red y escritura segura
-├── rpc/          # opciones y pools gRPC comunes
-└── scanning/     # recorrido de árboles de ficheros
+├── backup/      # creación de snapshots y workers de backup
+├── cas/         # repositorio local de chunks direccionado por hash
+├── chunking/    # CDC, recetas y planificación de chunks
+├── cli/         # interfaz de línea de comandos
+├── cluster/     # vista read-only del cluster para flujos cliente
+├── common/      # utilidades puras compartidas
+├── config/      # modelo, defaults y carga de configuración
+├── metadata/    # SQLite, identidad, object graph y packs distribuidos
+├── node/        # runtime servidor, servicios RPC, storage local y membership
+├── placement/   # HRW y placement_epoch
+├── protection/  # política, replicación, erasure coding, push y verify
+├── protos/      # definiciones protobuf
+├── restore/     # recuperación local/P2P/red/EC y escritura segura
+├── rpc/         # mecánica gRPC común
+└── scanning/    # recorrido de árboles de ficheros
 ```
 
 ## Requisitos y compilación
@@ -98,12 +100,20 @@ Con los nodos levantados, proteger los chunks pendientes en 1 nodo remoto:
 
 ```bash
 python -m stopan push --membership-seed localhost:50051 --remote-copies 1
+python -m stopan push --membership-seed localhost:50051 --remote-copies 1 --scope snapshot --snapshot-id 1
 ```
 
 Auditar la protección remota registrada:
 
 ```bash
 python -m stopan verify --membership-seed localhost:50051
+```
+
+La auditoría puede acotarse por snapshot completo o por scope de chunks conocidos/alcanzables:
+
+```bash
+python -m stopan verify --membership-seed localhost:50051 --snapshot-id 1
+python -m stopan verify --membership-seed localhost:50051 --scope all-reachable
 ```
 
 Restaurar permitiendo recuperación remota desde nodos P2P:
@@ -128,6 +138,12 @@ Auditar los shards EC registrados sin descargar blobs:
 
 ```bash
 python -m stopan verify --protection-mode ec
+```
+
+También se puede auditar un data pack EC concreto:
+
+```bash
+python -m stopan verify --protection-mode ec --pack-hash HASH
 ```
 
 Si se pierde el CAS local, `restore` puede reconstruir chunks desde los data packs EC siempre que queden al menos `ec_k` shards recuperables por pack. Esta ruta debe pedirse de forma explícita:
@@ -176,10 +192,10 @@ python -m stopan backup test_data --metadata-passphrase-file pass.txt --metadata
 Alternativamente, el flujo manual permite exportar el grafo, empaquetarlo e importarlo paso a paso:
 
 ```bash
-python -m stopan metadata export-graph --object-store meta_store --passphrase-file pass.txt
-python -m stopan metadata pack-graph --object-store meta_store --passphrase-file pass.txt --identity-file id.json --out latest.stopanmetapack
-python -m stopan metadata import-pack latest.stopanmetapack --object-store imported_store --passphrase-file pass.txt --identity-file id.json
-python -m stopan metadata import-graph --object-store imported_store --passphrase-file pass.txt
+python -m stopan metadata graph export --object-store meta_store --passphrase-file pass.txt
+python -m stopan metadata pack create --object-store meta_store --passphrase-file pass.txt --identity-file id.json --out latest.stopanmetapack
+python -m stopan metadata pack import latest.stopanmetapack --object-store imported_store --passphrase-file pass.txt --identity-file id.json
+python -m stopan metadata graph import --object-store imported_store --passphrase-file pass.txt
 ```
 
 ### Metadata conectada a la red
@@ -187,13 +203,23 @@ python -m stopan metadata import-graph --object-store imported_store --passphras
 Distribuir el último pack de metadata a la red P2P (1 copia remota del pack):
 
 ```bash
-python -m stopan metadata push --object-store meta_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --pack-copies 1
+python -m stopan metadata pack push --object-store meta_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --pack-copies 1
 ```
 
-Recuperar metadata desde packs remotos y reconstruir un object store local en un nodo nuevo:
+Descubrir y verificar packs distribuidos del owner:
 
 ```bash
-python -m stopan metadata recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051
+python -m stopan metadata pack discover --identity-file id.json --membership-seed localhost:50051
+python -m stopan metadata pack verify --identity-file id.json --membership-seed localhost:50051 --all
+```
+
+`metadata pack verify` comprueba presencia remota sin descargar todos los packs. Los packs son tamper-evident por hash, firma y cifrado; `metadata pack recover` descarga el pack elegido y valida su integridad antes de importarlo.
+
+Recuperar metadata desde packs remotos y reconstruir un object store local en un nodo nuevo. Si se omite `--target-hash`, se elige el latest válido descubierto. Si ya has elegido un pack con `discover`, puedes fijarlo explícitamente:
+
+```bash
+python -m stopan metadata pack recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051
+python -m stopan metadata pack recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --target-hash PACK_HASH
 ```
 
 ## GC de metadata
@@ -203,7 +229,7 @@ Stopan incluye comandos de garbage collection para limpiar objetos y packs de me
 Limpieza local del object store (detecta objetos o packs que no forman parte del estado vivo):
 
 ```bash
-python -m stopan metadata gc --object-store meta_store --passphrase-file pass.txt --identity-file id.json --dry-run
+python -m stopan metadata graph gc --object-store meta_store --passphrase-file pass.txt --identity-file id.json --dry-run
 ```
 
 Limpieza del store distribuido de packs (se ejecuta en el nodo que mantiene el store remoto):

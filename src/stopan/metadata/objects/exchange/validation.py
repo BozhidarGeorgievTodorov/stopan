@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .errors import MetadataObjectImportError
+from stopan.common.validators import require_strict_int
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.protection.policy import ProtectionState
 
@@ -16,13 +17,13 @@ def require_str(name: str, value: object, *, allow_empty: bool = False) -> str:
 
 
 def require_int(name: str, value: object, *, min_value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise MetadataObjectImportError(
-            f"{name} debe ser entero; recibido {type(value).__name__}"
-        )
-    if value < min_value:
-        raise MetadataObjectImportError(f"{name} debe ser >= {min_value}; recibido {value}")
-    return value
+    return require_strict_int(
+        name,
+        value,
+        min_value=min_value,
+        error_factory=MetadataObjectImportError,
+        type_label="entero",
+    )
 
 
 def require_number(name: str, value: object, *, min_value: float | None = None) -> float:

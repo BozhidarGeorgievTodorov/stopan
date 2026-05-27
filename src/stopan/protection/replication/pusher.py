@@ -9,18 +9,28 @@ streaming y actualiza chunk_protection con el resultado.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sys
 
 from stopan.cas.repository import CASRepository
-from stopan.errors import StopanConfigRuntimeError, StopanConfigValueError
+from stopan.errors import StopanConfigValueError
 from stopan.metadata.database import MetadataDB
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
-    export_metadata_object_graph_after_metadata_change,
+    export_after_successful_metadata_change,
 )
-from stopan.placement.cluster_resolver import require_cluster_view
-from stopan.protection.policy import normalize_remote_rf
-from stopan.replication.coordinator import StreamingReplicationCoordinator
+from stopan.protection.policy import ProtectionState
+from stopan.protection.remote_context import (
+    DEFAULT_REMOTE_PROTECTION_MISSING_SEED_MESSAGE,
+    resolve_remote_protection_context,
+)
+from stopan.protection.scope import (
+    DEFAULT_PROTECTION_SCOPE,
+    describe_protection_scope,
+    scoped_replication_push_chunks,
+)
+
+from .push_execution import push_chunk_replicas
+from .remote_client import RemoteChunkClientPool
+from .states import replication_push_state
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,8 @@ def push_to_network(
     cluster_token: str,
     membership_timeout_s: float,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
+    scope: str | None = None,
+    snapshot_id: int | None = None,
 ) -> PushStats:
     """
     Replica chunks pendientes en nodos remotos según las copias requeridas.
@@ -75,48 +87,32 @@ def push_to_network(
     self_addr = str(self_addr or "").strip()
     cluster_token = str(cluster_token or "")
 
-    if not self_addr:
-        raise StopanConfigRuntimeError(
-            "Falta node.advertise_addr. Push necesita identificar el nodo origen en membership."
-        )
-
     repo = CASRepository(local_shard_dir)
     db = MetadataDB(db_file)
-    coordinator: StreamingReplicationCoordinator | None = None
+    remote_client: RemoteChunkClientPool | None = None
     metadata_changed = False
 
     try:
-        resolved = require_cluster_view(
+        remote_context = resolve_remote_protection_context(
             membership_seed=membership_seed,
             self_addr=self_addr,
             cluster_token=cluster_token,
             timeout_s=membership_timeout_s,
             max_message_bytes=max_message_bytes,
-            missing_seed_message=(
-                "Falta membership seed. Usa '--membership-seed' o define cluster.seeds en node.yaml."
+            missing_seed_message=DEFAULT_REMOTE_PROTECTION_MISSING_SEED_MESSAGE,
+            missing_origin_message=(
+                "Falta node.advertise_addr. Push necesita identificar el nodo origen en membership."
             ),
         )
-        resolved_seed = resolved.seed
-        cluster = resolved.cluster
-        origin_node_id = cluster.self_node_id
-        if not origin_node_id:
-            raise StopanConfigRuntimeError(
-                "No pude resolver origin_node_id desde membership. "
-                "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
-            )
-
-        current_epoch = (
-            cluster.placement_epoch_excluding(
-                desired_rf=required_remote_copies,
-                cluster_token=cluster_token,
-                excluded_node_ids={origin_node_id},
-            )
-            if required_remote_copies > 0
-            else None
+        resolved_seed = remote_context.seed
+        cluster = remote_context.cluster
+        origin_node_id = remote_context.origin_node_id
+        current_epoch = remote_context.placement_epoch(
+            remote_targets=required_remote_copies,
         )
 
-        remote_candidate_node_ids = cluster.candidate_node_ids_excluding({origin_node_id})
-        remote_candidate_count = len(remote_candidate_node_ids)
+        remote_candidate_node_ids = remote_context.remote_candidate_node_ids
+        remote_candidate_count = remote_context.remote_candidate_count
 
         if strict_rf and remote_candidate_count < required_remote_copies:
             print("Copias remotas estrictas: no hay suficientes targets remotos elegibles.")
@@ -129,37 +125,36 @@ def push_to_network(
                 remote_candidates=remote_candidate_count,
             )
 
-        db.mark_stale_protection(desired_rf=desired_rf, current_epoch=current_epoch)
-        metadata_changed = True
+        scope_label = describe_protection_scope(scope, snapshot_id=snapshot_id)
+        if (scope or DEFAULT_PROTECTION_SCOPE) == DEFAULT_PROTECTION_SCOPE and snapshot_id is None:
+            db.mark_stale_protection(desired_rf=desired_rf, current_epoch=current_epoch)
+            metadata_changed = True
 
-        pending_chunks = db.get_pending_protection_chunks(
+        pending_chunks = scoped_replication_push_chunks(
+            db,
+            scope=scope,
+            snapshot_id=snapshot_id,
             desired_rf=desired_rf,
             current_epoch=current_epoch,
             limit=limit,
         )
 
         if not pending_chunks:
-            print("No hay chunks pendientes de protección para la política actual.")
+            print(f"No hay chunks pendientes de protección para scope={scope_label} y política actual.")
             return PushStats(
                 desired_rf=desired_rf,
                 remote_candidates=remote_candidate_count,
             )
 
-        coordinator = StreamingReplicationCoordinator(
-            repo=repo,
-            cluster=cluster,
-            rf=required_remote_copies,
-            cluster_token=cluster_token,
-            origin_node_id=origin_node_id,
+        remote_client = RemoteChunkClientPool(
             probe_timeout_s=probe_timeout_s,
-            stream_timeout_s=stream_timeout_s,
-            target_parallelism=target_parallelism,
             probe_batch_hashes=probe_batch_hashes,
+            stream_timeout_s=stream_timeout_s,
             stream_inflight=stream_inflight,
             max_message_bytes=max_message_bytes,
         )
 
-        print(f"Push: {len(pending_chunks)} chunks pendientes de protección")
+        print(f"Push: {len(pending_chunks)} chunks pendientes de protección scope={scope_label}")
         print(f"Membership seed: {resolved_seed}")
         print(f"Eligible members: {[f'{member.node_id[:8]}@{member.address}' for member in cluster.members]}")
         print(f"Self: {origin_node_id[:8]}@{self_addr}")
@@ -184,12 +179,26 @@ def push_to_network(
         already_present_remote = 0
 
         try:
-            for outcome in coordinator.replicate_chunks(pending_chunks):
+            for outcome in push_chunk_replicas(
+                repo=repo,
+                cluster=cluster,
+                chunk_hashes=pending_chunks,
+                required_remote_copies=required_remote_copies,
+                cluster_token=cluster_token,
+                origin_node_id=origin_node_id,
+                remote_client=remote_client,
+                target_parallelism=target_parallelism,
+            ):
                 attempted += 1
                 stored_remote += outcome.stored_remote_copies
                 already_present_remote += outcome.already_present_remote_copies
 
-                if outcome.protected_remote_copies >= required_remote_copies:
+                state = replication_push_state(
+                    protected_remote_copies=outcome.protected_remote_copies,
+                    required_remote_copies=required_remote_copies,
+                )
+
+                if state == ProtectionState.PLACED:
                     db.mark_chunk_placed(
                         outcome.chunk_hash,
                         desired_rf=desired_rf,
@@ -198,7 +207,7 @@ def push_to_network(
                     )
                     protected += 1
 
-                elif outcome.protected_remote_copies > 0:
+                elif state == ProtectionState.DEGRADED:
                     error = (
                         f"placement parcial: protected_remote_copies="
                         f"{outcome.protected_remote_copies}/{required_remote_copies} "
@@ -277,19 +286,14 @@ def push_to_network(
             )
 
     finally:
-        if coordinator is not None:
-            coordinator.close()
+        if remote_client is not None:
+            remote_client.close()
         db.commit()
         db.close()
 
-        if (
-            metadata_changed
-            and metadata_object_graph_auto_export is not None
-            and metadata_object_graph_auto_export.enabled
-            and sys.exc_info()[0] is None
-        ):
-            export_metadata_object_graph_after_metadata_change(
-                db_file=db_file,
-                settings=metadata_object_graph_auto_export,
-                context_label="PUSH",
-            )
+        export_after_successful_metadata_change(
+            metadata_changed=metadata_changed,
+            db_file=db_file,
+            settings=metadata_object_graph_auto_export,
+            context_label="PUSH",
+        )

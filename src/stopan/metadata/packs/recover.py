@@ -7,47 +7,27 @@ con la identidad local e importa el estado más reciente recuperable.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import grpc
 
 from stopan.errors import StopanNetworkError, StopanStorageError
 from stopan.common.fs import atomic_write_bytes, ensure_private_dir
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.passphrase import ScryptCost
-from stopan.metadata.identity.signatures import verify_metadata_pack_signature
 from stopan.metadata.objects.service import MetadataObjectGraphStoreService
-from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
 from stopan.metadata.packs.object_pack import MetadataObjectPackService
-from stopan.placement.cluster_resolver import require_cluster_view
-from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
-from stopan.rpc.options import grpc_channel_options
+from stopan.metadata.packs.discovery import discover_metadata_packs_from_network
+from stopan.metadata.packs.hashes import validate_pack_hash
+from stopan.metadata.packs.remote import (
+    MetadataPackSource,
+    metadata_pack_target_label as _target_label,
+    retrieve_metadata_pack_from_source as _retrieve_pack_from_source,
+)
 
 
 class MetadataPackRecoverError(StopanNetworkError, RuntimeError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class MetadataPackSource:
-    node_id: str
-    address: str
-    pack_hash: str
-    size_bytes: int
-    stored_at_unix: float
-    public_key_b64: str = ""
-    signature_b64: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class MetadataPackRecoveryCandidate:
-    pack_hash: str
-    newest_stored_at_unix: float
-    size_bytes: int
-    sources: tuple[MetadataPackSource, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,14 +46,21 @@ class DownloadedMetadataPackCandidate:
 
 
 @dataclass(frozen=True, slots=True)
-class MetadataPackRecoverResult:
-    owner_id: str
-    object_store_dir: Path
+class MetadataPackRecoverStats:
     candidates_seen: int
     unique_packs_seen: int
     list_targets_attempted: int
     list_targets_succeeded: int
     downloads_attempted: int
+    list_errors: tuple[str, ...]
+    download_errors: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataPackRecoverResult:
+    owner_id: str
+    object_store_dir: Path
+    stats: MetadataPackRecoverStats
     recovered_pack_hash: str
     recovered_pack_path: Path
     recovered_from_address: str
@@ -89,199 +76,7 @@ class MetadataPackRecoverResult:
     pack_protection_record_count: int
     pack_import_result: Any
     db_import_result: Any | None
-    list_errors: tuple[str, ...]
-    download_errors: tuple[str, ...]
 
-
-def _channel_options(
-    *,
-    max_message_bytes: int,
-    grpc_keepalive_time_ms: int,
-    grpc_keepalive_timeout_ms: int,
-    grpc_keepalive_permit_without_calls: bool,
-) -> list[tuple[str, int]]:
-    return grpc_channel_options(
-        max_message_bytes,
-        keepalive_time_ms=grpc_keepalive_time_ms,
-        keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-        keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-    )
-
-
-def _target_label(source: MetadataPackSource) -> str:
-    node = source.node_id[:8] if source.node_id else "desconocido"
-    return f"{node}@{source.address}"
-
-
-def _list_packs_from_target(
-    target: object,
-    *,
-    owner_id: str,
-    cluster_token: str,
-    timeout_s: float,
-    max_message_bytes: int,
-    grpc_keepalive_time_ms: int,
-    grpc_keepalive_timeout_ms: int,
-    grpc_keepalive_permit_without_calls: bool,
-) -> tuple[list[MetadataPackSource], str | None]:
-    node_id = str(getattr(target, "node_id", "") or "")
-    address = str(getattr(target, "address", "") or "")
-    if not address:
-        return [], "target sin address"
-
-    channel = grpc.insecure_channel(
-        address,
-        options=_channel_options(
-            max_message_bytes=max_message_bytes,
-            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-        ),
-    )
-    try:
-        stub = p2p_storage_pb2_grpc.MetadataPackServiceStub(channel)
-        response = stub.ListMetadataPacks(
-            p2p_storage_pb2.ListMetadataPacksRequest(
-                cluster_token=str(cluster_token or ""),
-                owner_id=owner_id,
-            ),
-            timeout=float(timeout_s),
-        )
-        records: list[MetadataPackSource] = []
-        for item in response.packs:
-            try:
-                pack_hash = validate_pack_hash(str(item.pack_hash))
-            except (TypeError, ValueError):
-                continue
-            if str(item.owner_id or "") != owner_id:
-                continue
-            public_key_b64 = str(getattr(item, "public_key_b64", "") or "")
-            signature_b64 = str(getattr(item, "signature_b64", "") or "")
-            if not verify_metadata_pack_signature(
-                owner_id=owner_id,
-                public_key_b64=public_key_b64,
-                signature_b64=signature_b64,
-                pack_hash=pack_hash,
-            ):
-                continue
-            records.append(
-                MetadataPackSource(
-                    node_id=node_id,
-                    address=address,
-                    pack_hash=pack_hash,
-                    size_bytes=int(item.size_bytes),
-                    stored_at_unix=float(item.stored_at_unix),
-                    public_key_b64=public_key_b64,
-                    signature_b64=signature_b64,
-                )
-            )
-        return records, None
-    except grpc.RpcError as exc:
-        return [], f"{node_id[:8] or 'desconocido'}@{address}: {exc.details() or str(exc)}"
-    except Exception as exc:
-        return [], f"{node_id[:8] or 'desconocido'}@{address}: {exc}"
-    finally:
-        try:
-            channel.close()
-        except Exception:
-            pass
-
-
-def _retrieve_pack_from_source(
-    source: MetadataPackSource,
-    *,
-    owner_id: str,
-    cluster_token: str,
-    timeout_s: float,
-    max_message_bytes: int,
-    grpc_keepalive_time_ms: int,
-    grpc_keepalive_timeout_ms: int,
-    grpc_keepalive_permit_without_calls: bool,
-) -> bytes:
-    if source.size_bytes > int(max_message_bytes):
-        raise MetadataPackRecoverError(
-            f"metadata pack {source.pack_hash} anunciado por {_target_label(source)} supera max_message_bytes: "
-            f"{source.size_bytes} > {int(max_message_bytes)}"
-        )
-
-    channel = grpc.insecure_channel(
-        source.address,
-        options=_channel_options(
-            max_message_bytes=max_message_bytes,
-            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-        ),
-    )
-    try:
-        stub = p2p_storage_pb2_grpc.MetadataPackServiceStub(channel)
-        response = stub.RetrieveMetadataPack(
-            p2p_storage_pb2.RetrieveMetadataPackRequest(
-                cluster_token=str(cluster_token or ""),
-                owner_id=owner_id,
-                pack_hash=source.pack_hash,
-            ),
-            timeout=float(timeout_s),
-        )
-        if int(response.status) != p2p_storage_pb2.METADATA_PACK_RETRIEVE_STATUS_FOUND:
-            raise MetadataPackRecoverError(
-                f"retrieve {source.pack_hash} desde {_target_label(source)} falló: "
-                f"status={int(response.status)} detail={response.detail or ''}"
-            )
-        data = bytes(response.pack_data)
-        calculated = calculate_pack_hash(data)
-        if calculated != source.pack_hash:
-            raise MetadataPackRecoverError(
-                f"pack_hash descargado no coincide desde {_target_label(source)}: "
-                f"esperado={source.pack_hash} calculado={calculated}"
-            )
-        public_key_b64 = str(getattr(response, "public_key_b64", "") or source.public_key_b64 or "")
-        signature_b64 = str(getattr(response, "signature_b64", "") or source.signature_b64 or "")
-        if not verify_metadata_pack_signature(
-            owner_id=owner_id,
-            public_key_b64=public_key_b64,
-            signature_b64=signature_b64,
-            pack_hash=source.pack_hash,
-        ):
-            raise MetadataPackRecoverError(
-            f"firma de metadata pack inválida desde {_target_label(source)}: "
-            f"{source.pack_hash}"
-        )
-        return data
-    finally:
-        try:
-            channel.close()
-        except Exception:
-            pass
-
-
-def _group_candidates(sources: list[MetadataPackSource]) -> list[MetadataPackRecoveryCandidate]:
-    grouped: dict[str, list[MetadataPackSource]] = {}
-    for source in sources:
-        grouped.setdefault(source.pack_hash, []).append(source)
-
-    candidates: list[MetadataPackRecoveryCandidate] = []
-    for pack_hash, pack_sources in grouped.items():
-        ordered = sorted(
-            pack_sources,
-            key=lambda item: (float(item.stored_at_unix), int(item.size_bytes), item.address),
-            reverse=True,
-        )
-        newest = ordered[0]
-        candidates.append(
-            MetadataPackRecoveryCandidate(
-                pack_hash=pack_hash,
-                newest_stored_at_unix=float(newest.stored_at_unix),
-                size_bytes=int(newest.size_bytes),
-                sources=tuple(ordered),
-            )
-        )
-
-    candidates.sort(
-        key=lambda item: (float(item.newest_stored_at_unix), int(item.size_bytes), item.pack_hash),
-        reverse=True,
-    )
-    return candidates
 
 
 def recover_metadata_from_network(
@@ -302,63 +97,50 @@ def recover_metadata_from_network(
     grpc_keepalive_permit_without_calls: bool,
     scrypt_cost: ScryptCost,
     db_file: str | Path,
+    default_desired_rf: int,
     import_db: bool = True,
     include_protection: bool = True,
-    default_desired_rf: int = 3,
     download_dir: str | Path | None = None,
     pack_out: str | Path | None = None,
-    max_candidates: int = 20,
+    max_candidates: int | None = None,
+    target_hash: str | None = None,
 ) -> MetadataPackRecoverResult:
     owner = validate_owner_id(owner_id)
+    requested_hash = validate_pack_hash(target_hash) if target_hash is not None else None
     object_store_path = Path(object_store_dir).expanduser().resolve()
     max_message_bytes = int(max_message_bytes)
     parallelism = max(1, int(target_parallelism))
 
     try:
-        resolved = require_cluster_view(
+        discovery = discover_metadata_packs_from_network(
+            owner_id=owner,
             membership_seed=membership_seed,
             self_addr=self_addr,
             cluster_token=cluster_token,
-            timeout_s=membership_timeout_s,
+            membership_timeout_s=membership_timeout_s,
+            rpc_timeout_s=rpc_timeout_s,
+            target_parallelism=parallelism,
             max_message_bytes=max_message_bytes,
-            missing_seed_message="Falta membership seed en la configuración.",
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+            desired_copies_by_hash=None,
+            max_candidates=None if requested_hash is not None else max_candidates,
         )
     except Exception as exc:
         raise MetadataPackRecoverError(str(exc)) from exc
 
-    cluster = resolved.cluster
-    targets = [member for member in cluster.members if str(getattr(member, "address", "") or "").strip()]
-    if not targets:
-        raise MetadataPackRecoverError("Membership no devolvió miembros elegibles del cluster.")
+    candidates = list(discovery.entries)
+    list_errors = list(discovery.stats.list_errors)
+    if requested_hash is not None:
+        candidates = [candidate for candidate in candidates if candidate.pack_hash == requested_hash]
 
-    all_sources: list[MetadataPackSource] = []
-    list_errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(parallelism, len(targets))) as executor:
-        futures = [
-            executor.submit(
-                _list_packs_from_target,
-                target,
-                owner_id=owner,
-                cluster_token=cluster_token,
-                timeout_s=rpc_timeout_s,
-                max_message_bytes=max_message_bytes,
-                grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-                grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-                grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-            )
-            for target in targets
-        ]
-        for future in as_completed(futures):
-            records, error = future.result()
-            all_sources.extend(records)
-            if error:
-                list_errors.append(error)
-
-    candidates = _group_candidates(all_sources)
-    if max_candidates > 0:
-        candidates = candidates[: int(max_candidates)]
     if not candidates:
         detail = "; ".join(list_errors[:5]) if list_errors else "no hay packs remotos"
+        if requested_hash is not None:
+            raise MetadataPackRecoverError(
+                f"No se encontró metadata pack target_hash={requested_hash} para owner_id={owner}. {detail}"
+            )
         raise MetadataPackRecoverError(f"No se encontraron metadata packs para owner_id={owner}. {detail}")
 
     pack_service = MetadataObjectPackService(scrypt_cost=scrypt_cost)
@@ -470,11 +252,15 @@ def recover_metadata_from_network(
         return MetadataPackRecoverResult(
             owner_id=owner,
             object_store_dir=object_store_path,
-            candidates_seen=len(all_sources),
-            unique_packs_seen=len(candidates),
-            list_targets_attempted=len(targets),
-            list_targets_succeeded=len(targets) - len(list_errors),
-            downloads_attempted=downloads_attempted,
+            stats=MetadataPackRecoverStats(
+                candidates_seen=discovery.stats.sources_seen,
+                unique_packs_seen=discovery.stats.unique_packs_seen,
+                list_targets_attempted=discovery.stats.list_targets_attempted,
+                list_targets_succeeded=discovery.stats.list_targets_succeeded,
+                downloads_attempted=downloads_attempted,
+                list_errors=tuple(list_errors),
+                download_errors=tuple(download_errors),
+            ),
             recovered_pack_hash=best.pack_hash,
             recovered_pack_path=best_path,
             recovered_from_address=best.source.address,
@@ -490,8 +276,6 @@ def recover_metadata_from_network(
             pack_protection_record_count=best.protection_record_count,
             pack_import_result=pack_import_result,
             db_import_result=db_import_result,
-            list_errors=tuple(list_errors),
-            download_errors=tuple(download_errors),
         )
 
     message = "No se pudo descargar e importar ningún metadata pack válido."

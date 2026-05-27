@@ -7,13 +7,17 @@ shards EC a objetos Python y mantiene canales reutilizables por dirección.
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 
-from stopan.rpc.errors import is_message_too_large_error
-from stopan.rpc.options import grpc_channel_options
-
-from .models import ErasureCodingError, require_hash64
+from stopan.common.sequences import ordered_unique_by
+from stopan.protection.ec.models import (
+    ErasureCodingError,
+    require_hash64,
+    require_non_negative_int,
+)
+from stopan.protection.remote_client_base import P2PStorageProtectionClient
+from stopan.rpc.errors import format_remote_error
+from stopan.rpc.p2p_storage_client import run_adaptive_batch_call
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +29,15 @@ class RemoteDataPackShardRef:
     def __post_init__(self) -> None:
         object.__setattr__(self, "pack_hash", require_hash64("pack_hash", self.pack_hash))
         object.__setattr__(self, "shard_hash", require_hash64("shard_hash", self.shard_hash))
-        object.__setattr__(self, "shard_index", _require_non_negative_int("shard_index", self.shard_index))
+        object.__setattr__(
+            self,
+            "shard_index",
+            require_non_negative_int("shard_index", self.shard_index),
+        )
+
+    @property
+    def identity_key(self) -> tuple[str, int, str]:
+        return self.pack_hash, self.shard_index, self.shard_hash
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +64,17 @@ class RemoteDataPackShardStoreResult:
         return self.status in {stored_status, already_present_status}
 
 
+class RemoteDataPackShardReplicationError(ErasureCodingError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        results: tuple[RemoteDataPackShardStoreResult, ...],
+    ):
+        super().__init__(message)
+        self.results = results
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteDataPackShardRetrieveResult:
     ref: RemoteDataPackShardRef
@@ -63,48 +86,14 @@ class RemoteDataPackShardRetrieveResult:
         return self.status == found_status
 
 
-class RemoteDataPackShardClientPool:
+class RemoteDataPackShardClientPool(P2PStorageProtectionClient):
     def __init__(self, *, timeout_s: float, max_message_bytes: int):
         self.timeout_s = float(timeout_s)
-        self.max_message_bytes = max(int(max_message_bytes), 1)
-        self._channels = {}
-        self._stubs = {}
-        self._grpc = None
-        self._pb = None
-        self._pb_grpc = None
-        self._lock = threading.Lock()
-        self._closed = threading.Event()
-
-    def _ensure_open(self) -> None:
-        if self._closed.is_set():
-            raise ErasureCodingError("RemoteDataPackShardClientPool cerrado")
-
-    def _ensure_runtime(self) -> None:
-        if self._grpc is not None:
-            return
-
-        import grpc
-        from stopan.protos import p2p_storage_pb2
-        from stopan.protos import p2p_storage_pb2_grpc
-
-        self._grpc = grpc
-        self._pb = p2p_storage_pb2
-        self._pb_grpc = p2p_storage_pb2_grpc
-
-    def _get_stub(self, addr: str):
-        self._ensure_runtime()
-
-        with self._lock:
-            self._ensure_open()
-            if addr not in self._stubs:
-                channel = self._grpc.insecure_channel(
-                    addr,
-                    options=grpc_channel_options(self.max_message_bytes),
-                )
-                self._channels[addr] = channel
-                self._stubs[addr] = self._pb_grpc.P2PStorageStub(channel)
-
-            return self._stubs[addr]
+        super().__init__(
+            max_message_bytes=max_message_bytes,
+            closed_message="RemoteDataPackShardClientPool cerrado",
+            closed_error_factory=ErasureCodingError,
+        )
 
     @property
     def store_status_stored(self) -> int:
@@ -115,6 +104,11 @@ class RemoteDataPackShardClientPool:
     def store_status_already_present(self) -> int:
         self._ensure_runtime()
         return self._pb.DATA_PACK_SHARD_STORE_STATUS_ALREADY_PRESENT
+
+    @property
+    def store_status_error(self) -> int:
+        self._ensure_runtime()
+        return self._pb.DATA_PACK_SHARD_STORE_STATUS_ERROR
 
     @property
     def retrieve_status_found(self) -> int:
@@ -174,18 +168,27 @@ class RemoteDataPackShardClientPool:
             timeout=self.timeout_s,
         )
 
-        return [
-            RemoteDataPackShardStoreResult(
-                ref=RemoteDataPackShardRef(
-                    pack_hash=item.pack_hash,
-                    shard_index=int(item.shard_index),
-                    shard_hash=item.shard_hash,
-                ),
-                status=item.status,
-                detail=item.detail or "",
-            )
-            for item in response_iter
-        ]
+        results: list[RemoteDataPackShardStoreResult] = []
+        try:
+            for item in response_iter:
+                results.append(
+                    RemoteDataPackShardStoreResult(
+                        ref=RemoteDataPackShardRef(
+                            pack_hash=item.pack_hash,
+                            shard_index=int(item.shard_index),
+                            shard_hash=item.shard_hash,
+                        ),
+                        status=item.status,
+                        detail=item.detail or "",
+                    )
+                )
+        except Exception as exc:
+            raise RemoteDataPackShardReplicationError(
+                f"ReplicateDataPackShards falló: {format_remote_error(exc)}",
+                results=tuple(results),
+            ) from exc
+
+        return results
 
     def retrieve_shard_batch(
         self,
@@ -200,25 +203,10 @@ class RemoteDataPackShardClientPool:
         if not ordered_refs:
             return {}
 
-        return self._retrieve_shard_batch_adaptive(addr=addr, refs=ordered_refs)
-
-    def _retrieve_shard_batch_adaptive(
-        self,
-        *,
-        addr: str,
-        refs: list[RemoteDataPackShardRef],
-    ) -> dict[tuple[str, int, str], RemoteDataPackShardRetrieveResult]:
-        try:
-            return self._retrieve_shard_batch_once(addr=addr, refs=refs)
-        except Exception as exc:
-            if len(refs) > 1 and is_message_too_large_error(exc):
-                mid = max(1, len(refs) // 2)
-                left = self._retrieve_shard_batch_adaptive(addr=addr, refs=refs[:mid])
-                right = self._retrieve_shard_batch_adaptive(addr=addr, refs=refs[mid:])
-                left.update(right)
-                return left
-
-            raise
+        return run_adaptive_batch_call(
+            items=ordered_refs,
+            call_once=lambda batch: self._retrieve_shard_batch_once(addr=addr, refs=batch),
+        )
 
     def _retrieve_shard_batch_once(
         self,
@@ -243,7 +231,7 @@ class RemoteDataPackShardClientPool:
                 shard_index=int(item.shard_index),
                 shard_hash=item.shard_hash,
             )
-            results[_ref_key(ref)] = RemoteDataPackShardRetrieveResult(
+            results[ref.identity_key] = RemoteDataPackShardRetrieveResult(
                 ref=ref,
                 status=item.status,
                 data=bytes(item.shard_data),
@@ -251,7 +239,7 @@ class RemoteDataPackShardClientPool:
             )
 
         for ref in refs:
-            key = _ref_key(ref)
+            key = ref.identity_key
             if key not in results:
                 results[key] = RemoteDataPackShardRetrieveResult(
                     ref=ref,
@@ -277,26 +265,12 @@ class RemoteDataPackShardClientPool:
             shard_data=item.data,
         )
 
-    def close(self) -> None:
-        with self._lock:
-            if self._closed.is_set():
-                return
-
-            self._closed.set()
-
-            for channel in self._channels.values():
-                channel.close()
-            self._channels.clear()
-            self._stubs.clear()
-
 
 def _dedupe_refs(refs: list[RemoteDataPackShardRef]) -> list[RemoteDataPackShardRef]:
-    ordered: dict[tuple[str, int, str], RemoteDataPackShardRef] = {}
     for ref in refs:
         if not isinstance(ref, RemoteDataPackShardRef):
             raise ErasureCodingError("refs debe contener RemoteDataPackShardRef")
-        ordered.setdefault(_ref_key(ref), ref)
-    return list(ordered.values())
+    return ordered_unique_by(refs, key=lambda ref: ref.identity_key)
 
 
 def _dedupe_payloads(
@@ -306,21 +280,9 @@ def _dedupe_payloads(
     for shard in shards:
         if not isinstance(shard, RemoteDataPackShardPayload):
             raise ErasureCodingError("shards debe contener RemoteDataPackShardPayload")
-        key = _ref_key(shard.ref)
+        key = shard.ref.identity_key
         existing = ordered.get(key)
         if existing is not None and existing.data != shard.data:
             raise ErasureCodingError("payload duplicado con datos distintos")
         ordered.setdefault(key, shard)
     return list(ordered.values())
-
-
-def _ref_key(ref: RemoteDataPackShardRef) -> tuple[str, int, str]:
-    return ref.pack_hash, ref.shard_index, ref.shard_hash
-
-
-def _require_non_negative_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ErasureCodingError(f"{name} debe ser int; recibido {type(value).__name__}")
-    if value < 0:
-        raise ErasureCodingError(f"{name} debe ser >= 0; recibido {value}")
-    return value

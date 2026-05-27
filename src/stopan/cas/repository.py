@@ -41,8 +41,7 @@ class CASRepository:
       - las escrituras usan archivo temporal y rename atómico;
       - get() descomprime y verifica el payload contra su hash de contenido;
       - get_compressed() devuelve el blob comprimido sin validarlo;
-      - el repositorio asume que chunk_hash ya llega validado mediante
-        require_valid_chunk_hash().
+      - el repositorio asume que chunk_hash ya llega validado como hash canónico de chunk.
     """
 
     __slots__ = ("data_folder", "_tls", "_ensured_dirs", "_dir_lock")

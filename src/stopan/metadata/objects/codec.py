@@ -93,10 +93,6 @@ def canonical_object_bytes(obj: MetadataPlainObject) -> bytes:
     return canonical_json_bytes(object_envelope(obj))
 
 
-def metadata_object_hash(obj: MetadataPlainObject) -> str:
-    return blake3.blake3(canonical_object_bytes(obj)).hexdigest()
-
-
 def encode_metadata_object(obj: MetadataPlainObject) -> EncodedMetadataObject:
     canonical = canonical_object_bytes(obj)
     return EncodedMetadataObject(

@@ -7,9 +7,5 @@ class MetadataObjectExchangeError(StopanDataError, RuntimeError):
     pass
 
 
-class MetadataObjectExportError(MetadataObjectExchangeError):
-    pass
-
-
 class MetadataObjectImportError(MetadataObjectExchangeError):
     pass

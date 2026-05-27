@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 
 from stopan.errors import StopanConfigValueError
-from stopan.placement.cluster_resolver import require_cluster_view
+from stopan.cluster.resolver import require_cluster_view
 from stopan.protection.policy import normalize_remote_rf
 
 

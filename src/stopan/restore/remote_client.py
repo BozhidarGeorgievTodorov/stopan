@@ -7,11 +7,9 @@ cuando una respuesta supera el límite de mensaje configurado.
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 
-from stopan.rpc.errors import is_message_too_large_error
-from stopan.rpc.options import grpc_channel_options
+from stopan.rpc.p2p_storage_client import P2PStorageClientRuntime, run_adaptive_batch_call
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,48 +38,26 @@ class RemoteStorageClientPool:
     def __init__(self, *, timeout_s: float, max_message_bytes: int):
         self.timeout_s = float(timeout_s)
         self.max_message_bytes = max(int(max_message_bytes), 1)
-        self._channels = {}
-        self._stubs = {}
-        self._grpc = None
-        self._pb = None
-        self._pb_grpc = None
-        self._lock = threading.Lock()
-        self._closed = threading.Event()
+        self._runtime = P2PStorageClientRuntime(
+            max_message_bytes=self.max_message_bytes,
+            closed_message="RemoteStorageClientPool cerrado",
+            closed_error_factory=RuntimeError,
+        )
 
     def _ensure_open(self) -> None:
-        if self._closed.is_set():
-            raise RuntimeError("RemoteStorageClientPool cerrado")
+        self._runtime.ensure_open()
 
     def _ensure_runtime(self) -> None:
         """Carga grpc/protobuf bajo demanda."""
+        self._runtime.ensure_runtime()
 
-        if self._grpc is not None:
-            return
-
-        import grpc
-        from stopan.protos import p2p_storage_pb2
-        from stopan.protos import p2p_storage_pb2_grpc
-
-        self._grpc = grpc
-        self._pb = p2p_storage_pb2
-        self._pb_grpc = p2p_storage_pb2_grpc
+    @property
+    def _pb(self):
+        return self._runtime.pb
 
     def _get_stub(self, addr: str):
         """Devuelve un stub reutilizable para addr, creándolo si hace falta."""
-        
-        self._ensure_runtime()
-
-        with self._lock:
-            self._ensure_open()
-            if addr not in self._stubs:
-                channel = self._grpc.insecure_channel(
-                    addr,
-                    options=grpc_channel_options(self.max_message_bytes),
-                )
-                self._channels[addr] = channel
-                self._stubs[addr] = self._pb_grpc.P2PStorageStub(channel)
-
-            return self._stubs[addr]
+        return self._runtime.get_stub(addr)
 
     @property
     def retrieve_status_found(self) -> int:
@@ -111,42 +87,13 @@ class RemoteStorageClientPool:
         if not ordered_hashes:
             return {}
 
-        return self._retrieve_chunk_batch_adaptive(
-            addr=addr,
-            chunk_hashes=ordered_hashes,
-        )
-
-    def _retrieve_chunk_batch_adaptive(
-        self,
-        *,
-        addr: str,
-        chunk_hashes: list[str],
-    ) -> dict[str, BatchRetrieveItemResult]:
-        """Ejecuta RetrieveChunkBatch y divide el batch si la respuesta es demasiado grande."""
-
-        try:
-            return self._retrieve_chunk_batch_once(
+        return run_adaptive_batch_call(
+            items=ordered_hashes,
+            call_once=lambda batch: self._retrieve_chunk_batch_once(
                 addr=addr,
-                chunk_hashes=chunk_hashes,
-            )
-
-        except Exception as exc:
-            if len(chunk_hashes) > 1 and is_message_too_large_error(exc):
-                mid = max(1, len(chunk_hashes) // 2)
-
-                left = self._retrieve_chunk_batch_adaptive(
-                    addr=addr,
-                    chunk_hashes=chunk_hashes[:mid],
-                )
-                right = self._retrieve_chunk_batch_adaptive(
-                    addr=addr,
-                    chunk_hashes=chunk_hashes[mid:],
-                )
-
-                left.update(right)
-                return left
-
-            raise
+                chunk_hashes=batch,
+            ),
+        )
 
     def _retrieve_chunk_batch_once(
         self,
@@ -186,13 +133,4 @@ class RemoteStorageClientPool:
         return results
 
     def close(self) -> None:
-        with self._lock:
-            if self._closed.is_set():
-                return
-
-            self._closed.set()
-
-            for channel in self._channels.values():
-                channel.close()
-            self._channels.clear()
-            self._stubs.clear()
+        self._runtime.close()

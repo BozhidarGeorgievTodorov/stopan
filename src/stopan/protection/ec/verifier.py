@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import sys
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from stopan.placement.cluster_resolver import require_cluster_view
 from stopan.metadata.database import MetadataDB, ErasureDataPackRecord
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
-    export_metadata_object_graph_after_metadata_change,
+    export_after_successful_metadata_change,
 )
 from stopan.protection.ec.remote_client import (
     RemoteDataPackShardClientPool,
     RemoteDataPackShardRef,
 )
+from stopan.protection.ec.shard_targets import group_erasure_shard_refs_by_address
+from stopan.protection.ec.states import data_pack_state
+from stopan.protection.concurrency import iter_completed_keyed_tasks
 from stopan.protection.policy import ProtectionState
+from stopan.protection.scope import describe_protection_scope, scoped_erasure_verification_candidates
+from stopan.protection.remote_context import resolve_remote_protection_context
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,6 @@ class ErasureVerificationStats:
 @dataclass(frozen=True)
 class _ShardProbeOutcome:
     address: str
-    requested_indexes: frozenset[int]
     present_indexes: frozenset[int]
     error: str | None = None
 
@@ -113,26 +113,14 @@ class ErasureDataPackVerifier:
                 ),
             )
 
-        refs_by_addr: dict[str, list[RemoteDataPackShardRef]] = defaultdict(list)
+        target_groups = group_erasure_shard_refs_by_address(
+            shard_rows=shard_rows,
+            node_addresses=self.cluster.node_addresses,
+            short_node_ids_in_errors=True,
+        )
+        refs_by_addr = target_groups.refs_by_address
         verified_indexes: set[int] = set()
-        errors: list[str] = []
-        address_by_node_id = self.cluster.node_addresses
-
-        for row in shard_rows:
-            target_address = address_by_node_id.get(row.node_id)
-            if target_address is None:
-                errors.append(
-                    f"shard={row.shard_index}: nodo {row.node_id[:8]} offline/ilocalizable"
-                )
-                continue
-
-            refs_by_addr[target_address].append(
-                RemoteDataPackShardRef(
-                    pack_hash=row.pack_hash,
-                    shard_index=row.shard_index,
-                    shard_hash=row.shard_hash,
-                )
-            )
+        errors = list(target_groups.offline_errors)
 
         outcomes = self._probe_targets(refs_by_addr)
 
@@ -151,15 +139,13 @@ class ErasureDataPackVerifier:
         error_summary = "; ".join(errors)[:1800] if errors else (
             f"verified_shards={len(verified_indexes)}/{total_shards}"
         )
-        if len(verified_indexes) >= pack.data_shards:
-            return _PackVerificationOutcome(
-                protection_state=ProtectionState.DEGRADED,
-                verified_shard_indexes=frozenset(verified_indexes),
-                error=error_summary,
-            )
-
+        protection_state = data_pack_state(
+            protected_shards=len(verified_indexes),
+            data_shards=pack.data_shards,
+            total_shards=total_shards,
+        )
         return _PackVerificationOutcome(
-            protection_state=ProtectionState.FAILED,
+            protection_state=protection_state,
             verified_shard_indexes=frozenset(verified_indexes),
             error=error_summary,
         )
@@ -173,26 +159,29 @@ class ErasureDataPackVerifier:
             return []
 
         outcomes: list[_ShardProbeOutcome] = []
+        tasks = {
+            address: (
+                lambda address=address, refs=refs: self._probe_address(address, refs)
+            )
+            for address, refs in refs_by_addr.items()
+        }
 
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ec-verify") as executor:
-            future_map = {
-                executor.submit(self._probe_address, address, refs): (address, refs)
-                for address, refs in refs_by_addr.items()
-            }
-
-            for future in as_completed(future_map):
-                address, refs = future_map[future]
-                try:
-                    outcomes.append(future.result())
-                except Exception as exc:
-                    outcomes.append(
-                        _ShardProbeOutcome(
-                            address=address,
-                            requested_indexes=frozenset(ref.shard_index for ref in refs),
-                            present_indexes=frozenset(),
-                            error=f"RPC {address}: {exc}",
-                        )
+        for completed in iter_completed_keyed_tasks(
+            tasks=tasks,
+            max_workers=max_workers,
+            thread_name_prefix="ec-verify",
+        ):
+            address = completed.key
+            if completed.error is not None:
+                outcomes.append(
+                    _ShardProbeOutcome(
+                        address=address,
+                        present_indexes=frozenset(),
+                        error=f"RPC {address}: {completed.error}",
                     )
+                )
+            else:
+                outcomes.append(completed.result)
 
         return outcomes
 
@@ -203,8 +192,9 @@ class ErasureDataPackVerifier:
     ) -> _ShardProbeOutcome:
         missing = self.client_pool.probe_missing_shards(addr=address, refs=refs)
         missing_indexes = {ref.shard_index for ref in missing}
-        requested_indexes = frozenset(ref.shard_index for ref in refs)
-        present_indexes = frozenset(index for index in requested_indexes if index not in missing_indexes)
+        present_indexes = frozenset(
+            ref.shard_index for ref in refs if ref.shard_index not in missing_indexes
+        )
 
         error = None
         if missing_indexes:
@@ -212,7 +202,6 @@ class ErasureDataPackVerifier:
 
         return _ShardProbeOutcome(
             address=address,
-            requested_indexes=requested_indexes,
             present_indexes=present_indexes,
             error=error,
         )
@@ -234,6 +223,9 @@ def verify_erasure_data_packs(
     db_file: str,
     include_verified: bool,
     limit: int | None,
+    scope: str | None,
+    snapshot_id: int | None,
+    pack_hash: str | None,
     target_parallelism: int,
     probe_timeout_s: float,
     max_message_bytes: int,
@@ -246,18 +238,21 @@ def verify_erasure_data_packs(
     )
     metadata_changed = False
 
-    resolved = require_cluster_view(
-        membership_seed=membership_seed,
-        self_addr=self_addr,
-        cluster_token=cluster_token,
-        timeout_s=membership_timeout_s,
-        max_message_bytes=max_message_bytes,
-        missing_seed_message="Falta membership seed. Usa '--membership-seed'.",
-    )
-    cluster = resolved.cluster
-
     try:
-        candidates = db.get_erasure_verification_candidates(
+        remote_context = resolve_remote_protection_context(
+            membership_seed=membership_seed,
+            self_addr=self_addr,
+            cluster_token=cluster_token,
+            timeout_s=membership_timeout_s,
+            max_message_bytes=max_message_bytes,
+            missing_seed_message="Falta membership seed. Usa '--membership-seed'.",
+        )
+        cluster = remote_context.cluster
+        candidates = scoped_erasure_verification_candidates(
+            db,
+            scope=scope,
+            snapshot_id=snapshot_id,
+            pack_hash=pack_hash,
             include_verified=include_verified,
             limit=limit,
         )
@@ -268,6 +263,7 @@ def verify_erasure_data_packs(
             cluster=cluster,
         )
 
+        print(f"Verify EC scope: {pack_hash if pack_hash else describe_protection_scope(scope, snapshot_id=snapshot_id)}")
         if include_verified:
             print("Modo reverify EC: incluyendo data packs ya VERIFIED.")
 
@@ -280,14 +276,9 @@ def verify_erasure_data_packs(
         db.commit()
         db.close()
 
-        if (
-            metadata_changed
-            and metadata_object_graph_auto_export is not None
-            and metadata_object_graph_auto_export.enabled
-            and sys.exc_info()[0] is None
-        ):
-            export_metadata_object_graph_after_metadata_change(
-                db_file=db_file,
-                settings=metadata_object_graph_auto_export,
-                context_label="VERIFY_EC",
-            )
+        export_after_successful_metadata_change(
+            metadata_changed=metadata_changed,
+            db_file=db_file,
+            settings=metadata_object_graph_auto_export,
+            context_label="VERIFY_EC",
+        )

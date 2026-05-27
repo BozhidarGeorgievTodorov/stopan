@@ -1,26 +1,34 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
-import sys
 
 from stopan.cas.repository import CASRepository
-from stopan.errors import StopanConfigRuntimeError
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import ErasureDataPackRecord, MetadataDB
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
-    export_metadata_object_graph_after_metadata_change,
+    export_after_successful_metadata_change,
 )
-from stopan.placement.cluster_resolver import require_cluster_view
-from stopan.protection.ec.models import DataPackShard, ErasureCodingError, ErasureSpec
-from stopan.protection.ec.packer import DataPackBuilder
+from stopan.protection.ec.metadata_adapter import spec_from_erasure_metadata
+from stopan.protection.ec.models import ErasureCodingError, ErasureSpec
+from stopan.protection.ec.packer import DataPackBuilder, build_data_pack
 from stopan.protection.ec.placement import plan_data_pack_shard_placement
-from stopan.protection.ec.remote_client import (
-    RemoteDataPackShardClientPool,
-    RemoteDataPackShardPayload,
-    RemoteDataPackShardRef,
+from stopan.protection.ec.push_execution import (
+    push_data_pack_shards,
+    refresh_data_pack_push_metadata,
+    register_data_pack_metadata,
 )
+from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
+from stopan.protection.ec.states import data_pack_state
 from stopan.protection.policy import ProtectionState
+from stopan.protection.remote_context import (
+    DEFAULT_REMOTE_PROTECTION_MISSING_SEED_MESSAGE,
+    resolve_remote_protection_context,
+)
+from stopan.protection.scope import (
+    describe_protection_scope,
+    scoped_erasure_push_new_chunks,
+    scoped_erasure_push_retry_packs,
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,8 @@ def push_erasure_data_packs_to_network(
     cluster_token: str,
     membership_timeout_s: float,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
+    scope: str | None = None,
+    snapshot_id: int | None = None,
 ) -> ErasurePushStats:
     spec = ErasureSpec(data_shards=int(ec_k), parity_shards=int(ec_m))
     pack_size = max(int(ec_pack_size_bytes), 1)
@@ -67,37 +77,26 @@ def push_erasure_data_packs_to_network(
     self_addr = str(self_addr or "").strip()
     cluster_token = str(cluster_token or "")
 
-    if not self_addr:
-        raise StopanConfigRuntimeError(
-            "Falta node.advertise_addr. Push EC necesita identificar el nodo origen."
-        )
-
     repo = CASRepository(local_shard_dir)
     db = MetadataDB(db_file)
     pool: RemoteDataPackShardClientPool | None = None
     metadata_changed = False
 
     try:
-        resolved = require_cluster_view(
+        remote_context = resolve_remote_protection_context(
             membership_seed=membership_seed,
             self_addr=self_addr,
             cluster_token=cluster_token,
             timeout_s=membership_timeout_s,
             max_message_bytes=max_message_bytes,
-            missing_seed_message=(
-                "Falta membership seed. Usa '--membership-seed' o define cluster.seeds en node.yaml."
+            missing_seed_message=DEFAULT_REMOTE_PROTECTION_MISSING_SEED_MESSAGE,
+            missing_origin_message=(
+                "Falta node.advertise_addr. Push EC necesita identificar el nodo origen."
             ),
         )
-        cluster = resolved.cluster
-        origin_node_id = cluster.self_node_id
-        if not origin_node_id:
-            raise StopanConfigRuntimeError(
-                "No pude resolver origin_node_id desde membership. "
-                "Asegúrate de que node.advertise_addr coincide con un miembro elegible."
-            )
-
-        remote_candidate_node_ids = cluster.candidate_node_ids_excluding({origin_node_id})
-        remote_candidate_count = len(remote_candidate_node_ids)
+        cluster = remote_context.cluster
+        origin_node_id = remote_context.origin_node_id
+        remote_candidate_count = remote_context.remote_candidate_count
         if remote_candidate_count < spec.total_shards:
             print("Push EC no iniciado: no hay suficientes nodos remotos elegibles.")
             print(
@@ -110,22 +109,34 @@ def push_erasure_data_packs_to_network(
                 required_remote_targets=spec.total_shards,
             )
 
-        placement_epoch = cluster.placement_epoch_excluding(
-            desired_rf=spec.total_shards,
-            cluster_token=cluster_token,
-            excluded_node_ids={origin_node_id},
-        )
+        placement_epoch = remote_context.placement_epoch(remote_targets=spec.total_shards)
 
-        pending_chunks = db.get_erasure_unprotected_chunks(limit=limit)
-        if not pending_chunks:
-            print("No hay chunks pendientes de protección EC.")
+        scope_label = describe_protection_scope(scope, snapshot_id=snapshot_id)
+        retry_packs = scoped_erasure_push_retry_packs(
+            db,
+            scope=scope,
+            snapshot_id=snapshot_id,
+            current_epoch=placement_epoch,
+            limit=limit,
+        )
+        pending_chunks = scoped_erasure_push_new_chunks(
+            db,
+            scope=scope,
+            snapshot_id=snapshot_id,
+            limit=limit,
+        )
+        if not retry_packs and not pending_chunks:
+            print(f"No hay chunks ni data packs pendientes de protección EC para scope={scope_label}.")
             return ErasurePushStats(
                 remote_candidates=remote_candidate_count,
                 required_remote_targets=spec.total_shards,
             )
 
-        print(f"Push EC: {len(pending_chunks)} chunks pendientes de protection packs")
-        print(f"Membership seed: {resolved.seed}")
+        print(
+            f"Push EC: {len(retry_packs)} data packs pendientes de reintento y "
+            f"{len(pending_chunks)} chunks nuevos pendientes scope={scope_label}"
+        )
+        print(f"Membership seed: {remote_context.seed}")
         print(f"Eligible members: {[f'{member.node_id[:8]}@{member.address}' for member in cluster.members]}")
         print(f"Self: {origin_node_id[:8]}@{self_addr}")
         print(
@@ -146,6 +157,24 @@ def push_erasure_data_packs_to_network(
             remote_candidates=remote_candidate_count,
             required_remote_targets=spec.total_shards,
         )
+
+        for record in retry_packs:
+            pack_chunk_count, pack_metadata_changed = _retry_existing_pack(
+                record=record,
+                db=db,
+                repo=repo,
+                pool=pool,
+                cluster=cluster,
+                origin_node_id=origin_node_id,
+                cluster_token=cluster_token,
+                remote_candidate_count=remote_candidate_count,
+                stats=stats,
+            )
+            stats.attempted_chunks += pack_chunk_count
+            metadata_changed = metadata_changed or pack_metadata_changed
+            if pack_metadata_changed and stats.attempted_packs % commit_every == 0:
+                db.commit()
+                _print_progress(stats)
 
         for chunk_hash in pending_chunks:
             try:
@@ -208,17 +237,12 @@ def push_erasure_data_packs_to_network(
         db.commit()
         db.close()
 
-        if (
-            metadata_changed
-            and metadata_object_graph_auto_export is not None
-            and metadata_object_graph_auto_export.enabled
-            and sys.exc_info()[0] is None
-        ):
-            export_metadata_object_graph_after_metadata_change(
-                db_file=db_file,
-                settings=metadata_object_graph_auto_export,
-                context_label="PUSH_EC",
-            )
+        export_after_successful_metadata_change(
+            metadata_changed=metadata_changed,
+            db_file=db_file,
+            settings=metadata_object_graph_auto_export,
+            context_label="PUSH_EC",
+        )
 
 
 def _flush_and_push_pack(
@@ -236,6 +260,117 @@ def _flush_and_push_pack(
     if pack is None:
         return
 
+    _push_pack(
+        pack=pack,
+        db=db,
+        pool=pool,
+        cluster=cluster,
+        origin_node_id=origin_node_id,
+        cluster_token=cluster_token,
+        placement_epoch=placement_epoch,
+        stats=stats,
+        refresh_existing=False,
+    )
+
+
+def _retry_existing_pack(
+    *,
+    record: ErasureDataPackRecord,
+    db: MetadataDB,
+    repo: CASRepository,
+    pool: RemoteDataPackShardClientPool,
+    cluster,
+    origin_node_id: str,
+    cluster_token: str,
+    remote_candidate_count: int,
+    stats: "_MutableErasurePushStats",
+) -> tuple[int, bool]:
+    chunks = db.get_erasure_pack_chunks(record.pack_hash)
+    chunk_count = len(chunks)
+    if not chunks:
+        print(f"   pack={record.pack_hash[:8]} omitido: no tiene chunks registrados")
+        return 0, False
+
+    record_spec = spec_from_erasure_metadata(record)
+    if remote_candidate_count < record_spec.total_shards:
+        stats.failed_packs += 1
+        stats.failed_chunks += chunk_count
+        print(
+            f"   pack={record.pack_hash[:8]} omitido: no hay suficientes nodos remotos "
+            f"para reintento EC ({remote_candidate_count}/{record_spec.total_shards})"
+        )
+        return chunk_count, False
+
+    record_placement_epoch = cluster.placement_epoch_excluding(
+        desired_rf=record_spec.total_shards,
+        cluster_token=cluster_token,
+        excluded_node_ids={origin_node_id},
+    )
+
+    materialized_chunks: list[tuple[str, bytes]] = []
+    missing_local = False
+    for chunk in chunks:
+        try:
+            data = repo.get(chunk.chunk_hash)
+        except FileNotFoundError:
+            stats.missing_local_chunks += 1
+            stats.failed_chunks += 1
+            missing_local = True
+            print(
+                f"   pack={record.pack_hash[:8]} chunk={chunk.chunk_hash[:8]} "
+                "omitido: no existe en CAS local"
+            )
+            continue
+        materialized_chunks.append((chunk.chunk_hash, data))
+
+    if missing_local:
+        stats.failed_packs += 1
+        return chunk_count, False
+
+    try:
+        pack = build_data_pack(chunks=materialized_chunks, spec=record_spec)
+    except ErasureCodingError as exc:
+        stats.failed_packs += 1
+        stats.failed_chunks += chunk_count
+        print(f"   pack={record.pack_hash[:8]} omitido: {exc}")
+        return chunk_count, False
+
+    if pack.pack_hash != record.pack_hash:
+        stats.failed_packs += 1
+        stats.failed_chunks += chunk_count
+        print(
+            f"   pack={record.pack_hash[:8]} omitido: el pack reconstruido no coincide "
+            f"con metadata ({pack.pack_hash[:8]})"
+        )
+        return chunk_count, False
+
+    stats.packed_chunks += len(pack.entries)
+    _push_pack(
+        pack=pack,
+        db=db,
+        pool=pool,
+        cluster=cluster,
+        origin_node_id=origin_node_id,
+        cluster_token=cluster_token,
+        placement_epoch=record_placement_epoch,
+        stats=stats,
+        refresh_existing=True,
+    )
+    return chunk_count, True
+
+
+def _push_pack(
+    *,
+    pack,
+    db: MetadataDB,
+    pool: RemoteDataPackShardClientPool,
+    cluster,
+    origin_node_id: str,
+    cluster_token: str,
+    placement_epoch: str,
+    stats: "_MutableErasurePushStats",
+    refresh_existing: bool,
+) -> None:
     stats.attempted_packs += 1
     placements = plan_data_pack_shard_placement(
         pack_hash=pack.pack_hash,
@@ -244,62 +379,33 @@ def _flush_and_push_pack(
         origin_node_id=origin_node_id,
         cluster_token=cluster_token,
     )
-    placement_by_index = {item.shard_index: item for item in placements}
-    payloads_by_address: dict[str, list[RemoteDataPackShardPayload]] = defaultdict(list)
 
-    for shard in pack.shards:
-        placement = placement_by_index[shard.shard_index]
-        ref = RemoteDataPackShardRef(
-            pack_hash=shard.pack_hash,
-            shard_index=shard.shard_index,
-            shard_hash=shard.shard_hash,
+    push_result = push_data_pack_shards(
+        pack=pack,
+        placements=placements,
+        pool=pool,
+    )
+    stats.stored_shards += push_result.stored_shards
+    stats.already_present_shards += push_result.already_present_shards
+    stats.failed_shards += push_result.failed_shards
+
+    for address, result in push_result.failed_results:
+        print(
+            f"   pack={pack.pack_hash[:8]} shard={result.ref.shard_index} "
+            f"falló en {address}: {result.detail}"
         )
-        payloads_by_address[placement.address].append(
-            RemoteDataPackShardPayload(ref=ref, data=shard.data)
-        )
 
-    successful_indexes: set[int] = set()
-
-    for address, payloads in sorted(payloads_by_address.items()):
-        refs = [item.ref for item in payloads]
-        missing_refs = pool.probe_missing_shards(addr=address, refs=refs)
-        missing_keys = {(ref.pack_hash, ref.shard_index, ref.shard_hash) for ref in missing_refs}
-
-        already_present_here = len(refs) - len(missing_refs)
-        stats.already_present_shards += already_present_here
-        for ref in refs:
-            key = (ref.pack_hash, ref.shard_index, ref.shard_hash)
-            if key not in missing_keys:
-                successful_indexes.add(ref.shard_index)
-
-        if not missing_refs:
-            continue
-
-        payloads_to_send = [
-            item for item in payloads
-            if (item.ref.pack_hash, item.ref.shard_index, item.ref.shard_hash) in missing_keys
-        ]
-
-        for result in pool.replicate_shards(addr=address, shards=payloads_to_send):
-            if result.is_success(pool.store_status_stored, pool.store_status_already_present):
-                successful_indexes.add(result.ref.shard_index)
-                if result.status == pool.store_status_stored:
-                    stats.stored_shards += 1
-                else:
-                    stats.already_present_shards += 1
-            else:
-                stats.failed_shards += 1
-                print(
-                    f"   pack={pack.pack_hash[:8]} shard={result.ref.shard_index} "
-                    f"falló en {address}: {result.detail}"
-                )
-
-    protection_state = _pack_state(
-        protected_shards=len(successful_indexes),
+    protection_state = data_pack_state(
+        protected_shards=len(push_result.successful_indexes),
         data_shards=pack.spec.data_shards,
         total_shards=pack.spec.total_shards,
     )
-    _register_pack_metadata(
+    metadata_writer = (
+        refresh_data_pack_push_metadata
+        if refresh_existing
+        else register_data_pack_metadata
+    )
+    metadata_writer(
         db=db,
         pack=pack,
         placements=placements,
@@ -307,7 +413,25 @@ def _flush_and_push_pack(
         placement_epoch=placement_epoch,
     )
 
-    chunk_count = len(pack.entries)
+    _apply_pack_state_to_stats(
+        pack_hash=pack.pack_hash,
+        chunk_count=len(pack.entries),
+        protected_shards=len(push_result.successful_indexes),
+        total_shards=pack.spec.total_shards,
+        protection_state=protection_state,
+        stats=stats,
+    )
+
+
+def _apply_pack_state_to_stats(
+    *,
+    pack_hash: str,
+    chunk_count: int,
+    protected_shards: int,
+    total_shards: int,
+    protection_state: ProtectionState,
+    stats: "_MutableErasurePushStats",
+) -> None:
     if protection_state == ProtectionState.PLACED:
         stats.placed_packs += 1
         stats.placed_chunks += chunk_count
@@ -315,64 +439,16 @@ def _flush_and_push_pack(
         stats.degraded_packs += 1
         stats.degraded_chunks += chunk_count
         print(
-            f"   pack={pack.pack_hash[:8]} DEGRADED: "
-            f"shards={len(successful_indexes)}/{pack.spec.total_shards}"
+            f"   pack={pack_hash[:8]} DEGRADED: "
+            f"shards={protected_shards}/{total_shards}"
         )
     else:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
         print(
-            f"   pack={pack.pack_hash[:8]} FAILED: "
-            f"shards={len(successful_indexes)}/{pack.spec.total_shards}"
+            f"   pack={pack_hash[:8]} FAILED: "
+            f"shards={protected_shards}/{total_shards}"
         )
-
-
-def _register_pack_metadata(
-    *,
-    db: MetadataDB,
-    pack,
-    placements,
-    protection_state: ProtectionState,
-    placement_epoch: str,
-) -> None:
-    placement_by_index = {item.shard_index: item for item in placements}
-    db.register_erasure_data_pack(
-        pack_hash=pack.pack_hash,
-        codec=pack.spec.codec,
-        data_shards=pack.spec.data_shards,
-        parity_shards=pack.spec.parity_shards,
-        payload_size=pack.payload_size,
-        padded_size=pack.padded_size,
-        shard_size=pack.shard_size,
-        chunks=[
-            (entry.chunk_hash, entry.offset, entry.length, entry.ordinal)
-            for entry in pack.entries
-        ],
-        shards=[
-            (
-                shard.shard_index,
-                shard.shard_hash,
-                placement_by_index[shard.shard_index].node_id,
-                len(shard.data),
-            )
-            for shard in pack.shards
-        ],
-        protection_state=protection_state,
-        placement_epoch=placement_epoch,
-    )
-
-
-def _pack_state(
-    *,
-    protected_shards: int,
-    data_shards: int,
-    total_shards: int,
-) -> ProtectionState:
-    if protected_shards >= total_shards:
-        return ProtectionState.PLACED
-    if protected_shards >= data_shards:
-        return ProtectionState.DEGRADED
-    return ProtectionState.FAILED
 
 
 def _print_progress(stats: "_MutableErasurePushStats") -> None:

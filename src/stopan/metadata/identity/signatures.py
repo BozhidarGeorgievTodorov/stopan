@@ -32,16 +32,6 @@ METADATA_PACK_SIGNATURE_FORMAT = "stopan.metadata_pack_signature"
 METADATA_PACK_SIGNATURE_VERSION = 1
 
 
-def sign_metadata_bytes(
-    *,
-    identity_file: str | Path,
-    passphrase: str | bytes,
-    data: bytes,
-) -> bytes:
-    private_identity = load_metadata_private_identity_file(identity_file, passphrase=passphrase)
-    return private_identity.sign(data)
-
-
 def verify_metadata_signature(
     *,
     owner_id: str,

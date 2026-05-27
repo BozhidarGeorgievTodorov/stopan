@@ -13,17 +13,21 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-import blake3
-
+from stopan.common.validators import (
+    require_strict_non_negative_int,
+    require_strict_positive_int,
+)
+from stopan.common.hashes import (
+    BLAKE3_HEX_LENGTH,
+    blake3_hex_digest,
+    is_valid_blake3_hex,
+)
 from stopan.errors import (
     StopanConfigError,
     StopanDataError,
     StopanDependencyError,
     StopanNetworkError,
 )
-
-
-_HASH_ALPHABET = set("0123456789abcdef")
 
 
 class ErasureCodingError(StopanDataError, RuntimeError):
@@ -46,45 +50,33 @@ def require_hash64(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise ErasureCodingError(f"{name} debe ser str; recibido {type(value).__name__}")
     text = value.strip()
-    if len(text) != 64 or any(char not in _HASH_ALPHABET for char in text):
-        raise ErasureCodingError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
+    if not is_valid_blake3_hex(text):
+        raise ErasureCodingError(
+            f"{name} debe tener {BLAKE3_HEX_LENGTH} caracteres hexadecimales lowercase"
+        )
     return text
 
 
 def require_non_negative_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ErasureCodingError(f"{name} debe ser int; recibido {type(value).__name__}")
-    if value < 0:
-        raise ErasureCodingError(f"{name} debe ser >= 0; recibido {value}")
-    return value
+    return require_strict_non_negative_int(name, value, error_factory=ErasureCodingError)
 
 
 def require_positive_int(name: str, value: object) -> int:
-    number = require_non_negative_int(name, value)
-    if number <= 0:
-        raise ErasureCodingError(f"{name} debe ser > 0; recibido {number}")
-    return number
+    return require_strict_positive_int(name, value, error_factory=ErasureCodingError)
 
 
 def require_config_non_negative_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ErasureCodingConfigError(f"{name} debe ser int; recibido {type(value).__name__}")
-    if value < 0:
-        raise ErasureCodingConfigError(f"{name} debe ser >= 0; recibido {value}")
-    return value
+    return require_strict_non_negative_int(name, value, error_factory=ErasureCodingConfigError)
 
 
 def require_config_positive_int(name: str, value: object) -> int:
-    number = require_config_non_negative_int(name, value)
-    if number <= 0:
-        raise ErasureCodingConfigError(f"{name} debe ser > 0; recibido {number}")
-    return number
+    return require_strict_positive_int(name, value, error_factory=ErasureCodingConfigError)
 
 
 def hash_bytes(data: bytes) -> str:
     if not isinstance(data, bytes):
         raise ErasureCodingError(f"data debe ser bytes; recibido {type(data).__name__}")
-    return blake3.blake3(data).hexdigest()
+    return blake3_hex_digest(data)
 
 
 @dataclass(frozen=True, slots=True)

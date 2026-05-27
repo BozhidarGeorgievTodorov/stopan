@@ -16,6 +16,7 @@ from stopan.metadata.database import MetadataDB
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.protection.policy import ProtectionState
 
+from .erasure_records import ErasureDataPackImportRows
 from .errors import MetadataObjectImportError
 from .reader import MetadataObjectReader
 from .validation import (
@@ -70,12 +71,16 @@ class MetadataDBImportWriter:
             "recipe_chunks",
             "chunks",
             "chunk_protection",
+            "erasure_data_packs",
+            "erasure_data_pack_chunks",
+            "erasure_data_pack_shards",
         )
-        non_empty: list[str] = []
-        for table in tables:
-            row = db.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
-            if row is not None and int(row["n"]) > 0:
-                non_empty.append(f"{table}={int(row['n'])}")
+        counts = db.count_operational_rows(tables)
+        non_empty = [
+            f"{table}={count}"
+            for table, count in counts.items()
+            if count > 0
+        ]
         if non_empty:
             raise MetadataObjectImportError(
                 "import-object-graph requiere una DB nueva o vacía; se encontró metadata existente: "
@@ -85,14 +90,7 @@ class MetadataDBImportWriter:
     def insert_chunks(self, db: MetadataDB, chunks: dict[str, int]) -> int:
         if not chunks:
             return 0
-        db.conn.executemany(
-            """
-            INSERT INTO chunks (hash, size, ref_count)
-            VALUES (?, ?, 0)
-            """,
-            [(chunk_hash, size) for chunk_hash, size in sorted(chunks.items())],
-        )
-        return len(chunks)
+        return db.object_import_insert_chunks(chunks)
 
     def insert_snapshots(
         self,
@@ -128,16 +126,16 @@ class MetadataDBImportWriter:
             if error is not None:
                 error = require_str("snapshot.error", error, allow_empty=True)
 
-            cursor = db.conn.execute(
-                """
-                INSERT INTO snapshots
-                    (uuid, root_path, origin_node_id, status, error, total_size, total_files, created_at)
-                VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (snapshot_uuid, root_path, origin_node_id, status, error, total_size, total_files, created_at),
+            snapshot_id = db.object_import_insert_snapshot(
+                snapshot_uuid=snapshot_uuid,
+                root_path=root_path,
+                origin_node_id=origin_node_id,
+                status=status,
+                error=error,
+                total_size=total_size,
+                total_files=total_files,
+                created_at=created_at,
             )
-            snapshot_id = int(cursor.lastrowid)
             snapshots_imported += 1
 
             snapshot_root_hash = optional_ref(
@@ -215,17 +213,7 @@ class MetadataDBImportWriter:
                 )
             )
 
-        db.conn.executemany(
-            """
-            INSERT INTO chunk_protection
-                (chunk_hash, desired_rf, protection_state, protected_remote_copies,
-                 placement_epoch, last_push_at, last_verify_at, last_error)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        return len(rows)
+        return db.object_import_insert_protection_records(rows)
 
     def insert_pending_protection_for_chunks(self, db: MetadataDB) -> int:
         rows = [
@@ -243,17 +231,17 @@ class MetadataDBImportWriter:
         ]
         if not rows:
             return 0
-        db.conn.executemany(
-            """
-            INSERT INTO chunk_protection
-                (chunk_hash, desired_rf, protection_state, protected_remote_copies,
-                 placement_epoch, last_push_at, last_verify_at, last_error)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        return len(rows)
+        return db.object_import_insert_protection_records(rows)
+
+    def insert_erasure_data_packs(
+        self,
+        db: MetadataDB,
+        records: list[ErasureDataPackImportRows],
+    ) -> int:
+        if not records:
+            return 0
+
+        return db.object_import_insert_erasure_data_pack_records(records)
 
     def _verify_snapshot_root_matches_entry(
         self,
@@ -420,10 +408,7 @@ class MetadataDBImportWriter:
             if known_size is not None and known_size != chunk_size:
                 raise MetadataObjectImportError(f"tamaño de chunk no coincide para {chunk_hash}")
             if known_size is None:
-                db.conn.execute(
-                    "INSERT INTO chunks (hash, size, ref_count) VALUES (?, ?, 0)",
-                    (chunk_hash, chunk_size),
-                )
+                db.object_import_insert_chunk_zero_ref(chunk_hash, chunk_size)
                 self.chunk_sizes[chunk_hash] = chunk_size
             chunks.append((order, chunk_hash, chunk_size))
 
@@ -453,36 +438,19 @@ class MetadataDBImportWriter:
                 created=False,
             )
 
-        db.conn.execute(
-            """
-            INSERT OR IGNORE INTO recipes (recipe_hash, chunk_count, total_size)
-            VALUES (?, ?, ?)
-            """,
-            (recipe_hash, chunk_count, total_size),
+        db.object_import_insert_recipe_if_missing(
+            recipe_hash=recipe_hash,
+            chunk_count=chunk_count,
+            total_size=total_size,
         )
-        row = db.conn.execute(
-            """
-            SELECT id, chunk_count, total_size
-            FROM recipes
-            WHERE recipe_hash = ?
-            """,
-            (recipe_hash,),
-        ).fetchone()
+        row = db.object_import_recipe_summary_by_hash(recipe_hash)
         if row is None:
             raise MetadataObjectImportError(f"no se pudo resolver recipe_id para {recipe_hash}")
         if row["chunk_count"] != chunk_count or row["total_size"] != total_size:
             raise MetadataObjectImportError(f"recipe_hash inconsistente: {recipe_hash}")
 
         recipe_id = row["id"]
-        existing_rows = db.conn.execute(
-            """
-            SELECT chunk_order, chunk_hash, chunk_size
-            FROM recipe_chunks
-            WHERE recipe_id = ?
-            ORDER BY chunk_order ASC
-            """,
-            (recipe_id,),
-        ).fetchall()
+        existing_rows = db.object_import_recipe_chunk_rows(recipe_id)
         existing_chunks = tuple(
             (row["chunk_order"], row["chunk_hash"], row["chunk_size"])
             for row in existing_rows
@@ -492,16 +460,7 @@ class MetadataDBImportWriter:
             if existing_chunks != tuple_chunks:
                 raise MetadataObjectImportError(f"recipe_hash duplicado con chunks distintos: {recipe_hash}")
         elif chunks:
-            db.conn.executemany(
-                """
-                INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
-                VALUES (?, ?, ?, ?)
-                """,
-                [
-                    (recipe_id, order, chunk_hash, chunk_size)
-                    for order, chunk_hash, chunk_size in chunks
-                ],
-            )
+            db.object_import_insert_recipe_chunks(recipe_id, chunks)
             created = True
         else:
             created = True
@@ -521,14 +480,7 @@ class MetadataDBImportWriter:
             increments[chunk_hash] += 1
         if not increments:
             return
-        db.conn.executemany(
-            """
-            UPDATE chunks
-            SET ref_count = ref_count + ?
-            WHERE hash = ?
-            """,
-            [(count, chunk_hash) for chunk_hash, count in sorted(increments.items())],
-        )
+        db.object_import_increment_chunk_ref_counts(increments)
 
     def _insert_snapshot_item(
         self,
@@ -545,12 +497,15 @@ class MetadataDBImportWriter:
         gid: int,
         recipe_id: int | None,
     ) -> None:
-        db.conn.execute(
-            """
-            INSERT INTO snapshot_items
-                (snapshot_id, path, item_type, size, mode, mtime, mtime_ns, uid, gid, recipe_id)
-            VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (snapshot_id, path, item_type, size, mode, mtime, mtime_ns, uid, gid, recipe_id),
+        db.object_import_insert_snapshot_item(
+            snapshot_id=snapshot_id,
+            path=path,
+            item_type=item_type,
+            size=size,
+            mode=mode,
+            mtime=mtime,
+            mtime_ns=mtime_ns,
+            uid=uid,
+            gid=gid,
+            recipe_id=recipe_id,
         )

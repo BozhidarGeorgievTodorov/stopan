@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from stopan.metadata.database import MetadataDB
 from stopan.restore.fetch import ChunkFetchService
+from stopan.restore.models import RestoreRunStats
 from stopan.restore.paths import RestorePaths, safe_restore_path
 from stopan.restore.prefetcher import OrderedBatchChunkPrefetcher
 from stopan.errors import StopanStorageError
@@ -30,6 +31,7 @@ class RestoreResult:
     final_dir: str | None = None
     work_dir: str | None = None
     error: str | None = None
+    stats: RestoreRunStats | None = None
 
 
 class SnapshotRestorer:
@@ -63,12 +65,13 @@ class SnapshotRestorer:
         Si el directorio final ya existe, no sobrescribe. Si existe el directorio
         .incomplete, continúa trabajando sobre él para permitir reintentos.
         """
-            
+        stats = self.fetch_service.stats
+
         status, error = self.db.get_snapshot_status(snapshot_id)
         if status is None:
             message = f"No existe el Snapshot ID {snapshot_id}."
             print(f"{message}")
-            return RestoreResult(snapshot_id=snapshot_id, completed=False, error=message)
+            return RestoreResult(snapshot_id=snapshot_id, completed=False, error=message, stats=stats)
 
         if status != "COMPLETE":
             message = f"Snapshot {snapshot_id} no es restaurable (status={status})."
@@ -76,7 +79,7 @@ class SnapshotRestorer:
             if error:
                 print(f"   Motivo registrado: {error}")
                 message = f"{message} {error}"
-            return RestoreResult(snapshot_id=snapshot_id, completed=False, error=message)
+            return RestoreResult(snapshot_id=snapshot_id, completed=False, error=message, stats=stats)
 
         snapshot_uuid = self.db.get_snapshot_uuid(snapshot_id)
         if not snapshot_uuid:
@@ -91,6 +94,7 @@ class SnapshotRestorer:
                 completed=True,
                 already_restored=True,
                 final_dir=paths.final_dir,
+                stats=stats,
             )
 
         items_gen = self.db.get_snapshot_items(snapshot_id)
@@ -103,6 +107,7 @@ class SnapshotRestorer:
                 completed=False,
                 work_dir=paths.incomplete_dir,
                 error=message,
+                stats=stats,
             )
 
         try:
@@ -121,14 +126,12 @@ class SnapshotRestorer:
             yield first_item
             yield from items_gen
 
-        processed_items = 0
-        successful_items = 0
         directories: list[tuple[str, dict]] = []
         current_tmp_path: str | None = None
 
         try:
             for item in iter_items():
-                processed_items += 1
+                stats.processed_items += 1
 
                 try:
                     full_path = safe_restore_path(paths.incomplete_dir, item["path"])
@@ -140,7 +143,8 @@ class SnapshotRestorer:
                 if item_type == "dir":
                     os.makedirs(full_path, exist_ok=True)
                     directories.append((full_path, item))
-                    successful_items += 1
+                    stats.directories_created += 1
+                    stats.successful_items += 1
                     continue
 
                 if item_type != "file":
@@ -151,9 +155,10 @@ class SnapshotRestorer:
 
                 if os.path.isdir(full_path):
                     print(f"   Se esperaba archivo pero existe directorio en {item['path']}")
+                    stats.files_failed += 1
                     continue
 
-                print(f"Restaurando (item {processed_items}): {item['path']}")
+                print(f"Restaurando (item {stats.processed_items}): {item['path']}")
                 current_tmp_path = full_path + ".tmp"
                 success_file = True
 
@@ -169,6 +174,7 @@ class SnapshotRestorer:
                         for chunk_hash, raw_chunk in prefetcher.iter_raw_chunks(chunk_hashes):
                             try:
                                 handle.write(raw_chunk)
+                                stats.bytes_written += len(raw_chunk)
                             except Exception as exc:
                                 print(
                                     f"   Error escribiendo chunk {chunk_hash[:8]} "
@@ -186,12 +192,14 @@ class SnapshotRestorer:
                         os.replace(current_tmp_path, full_path)
                         current_tmp_path = None
                         self.apply_item_metadata(full_path, item, is_dir=False)
-                        successful_items += 1
+                        stats.files_restored += 1
+                        stats.successful_items += 1
                     except Exception as exc:
                         print(f"   Error finalizando archivo {item['path']}: {exc}")
                         if current_tmp_path and os.path.exists(current_tmp_path):
                             os.remove(current_tmp_path)
                         current_tmp_path = None
+                        stats.files_failed += 1
                         print(
                             f"   Archivo {item['path']} no restaurado. "
                             "Se reintentará en la próxima ejecución."
@@ -200,6 +208,7 @@ class SnapshotRestorer:
                     if current_tmp_path and os.path.exists(current_tmp_path):
                         os.remove(current_tmp_path)
                     current_tmp_path = None
+                    stats.files_failed += 1
                     print(f"   Archivo {item['path']} no restaurado. Se reintentará en la próxima ejecución.")
 
         except KeyboardInterrupt:
@@ -212,10 +221,11 @@ class SnapshotRestorer:
                 snapshot_id=snapshot_id,
                 completed=False,
                 interrupted=True,
-                processed_items=processed_items,
-                successful_items=successful_items,
+                processed_items=stats.processed_items,
+                successful_items=stats.successful_items,
                 work_dir=paths.incomplete_dir,
                 error="restore interrumpido",
+                stats=stats,
             )
 
         finally:
@@ -223,7 +233,7 @@ class SnapshotRestorer:
             for directory_path, item in directories:
                 self.apply_item_metadata(directory_path, item, is_dir=True)
 
-        if successful_items == processed_items and processed_items > 0:
+        if stats.successful_items == stats.processed_items and stats.processed_items > 0:
             try:
                 os.replace(paths.incomplete_dir, paths.final_dir)
                 print("-" * 40)
@@ -232,9 +242,10 @@ class SnapshotRestorer:
                 return RestoreResult(
                     snapshot_id=snapshot_id,
                     completed=True,
-                    processed_items=processed_items,
-                    successful_items=successful_items,
+                    processed_items=stats.processed_items,
+                    successful_items=stats.successful_items,
                     final_dir=paths.final_dir,
+                    stats=stats,
                 )
             except OSError as exc:
                 message = f"Error al renombrar carpeta final: {exc}"
@@ -242,22 +253,24 @@ class SnapshotRestorer:
                 return RestoreResult(
                     snapshot_id=snapshot_id,
                     completed=False,
-                    processed_items=processed_items,
-                    successful_items=successful_items,
+                    processed_items=stats.processed_items,
+                    successful_items=stats.successful_items,
                     work_dir=paths.incomplete_dir,
                     error=message,
+                    stats=stats,
                 )
 
         print("-" * 40)
-        print(f"Restauración incompleta: {successful_items}/{processed_items} ítems.")
+        print(f"Restauración incompleta: {stats.successful_items}/{stats.processed_items} ítems.")
         print(f"Carpeta de trabajo: {paths.incomplete_dir}")
         return RestoreResult(
             snapshot_id=snapshot_id,
             completed=False,
-            processed_items=processed_items,
-            successful_items=successful_items,
+            processed_items=stats.processed_items,
+            successful_items=stats.successful_items,
             work_dir=paths.incomplete_dir,
-            error=f"restore incompleto: {successful_items}/{processed_items} items",
+            error=f"restore incompleto: {stats.successful_items}/{stats.processed_items} items",
+            stats=stats,
         )
 
     @staticmethod
@@ -267,7 +280,6 @@ class SnapshotRestorer:
 
         Los fallos no abortan el restore porque el contenido ya fue reconstruido.
         """
-            
         kind = "directorio" if is_dir else "archivo"
         try:
             os.chmod(path, item["mode"])

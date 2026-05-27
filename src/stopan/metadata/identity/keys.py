@@ -16,7 +16,6 @@ import blake3
 from stopan.common.encoding import b64decode, b64encode
 from stopan.errors import StopanDependencyError
 from stopan.common.json import canonical_json_bytes
-from stopan.common.secrets import passphrase_bytes
 from stopan.metadata.identity.models import (
     AEAD_CHACHA20_POLY1305,
     IDENTITY_ALGORITHM_ED25519_X25519,
@@ -29,6 +28,8 @@ from stopan.metadata.identity.models import (
     MetadataIdentityAuthenticationError,
     MetadataIdentityError,
 )
+from stopan.metadata.crypto.kdf import derive_master_key as _derive_master_key
+from stopan.metadata.crypto.kdf import derive_subkey as _derive_subkey
 from stopan.metadata.identity.passphrase import ScryptCost
 
 
@@ -42,9 +43,6 @@ class CryptographyPrimitives:
     Ed25519PublicKey: Any
     serialization: Any
     ChaCha20Poly1305: Any
-    Scrypt: Any
-    HKDF: Any
-    hashes: Any
     InvalidTag: type[Exception]
     InvalidSignature: type[Exception]
 
@@ -58,11 +56,9 @@ class X25519Primitives:
 def require_cryptography() -> CryptographyPrimitives:
     try:
         from cryptography.exceptions import InvalidSignature, InvalidTag
-        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
     except ImportError as exc:
         raise StopanDependencyError("Falta la dependencia 'cryptography' para usar identidad de metadata.") from exc
 
@@ -71,9 +67,6 @@ def require_cryptography() -> CryptographyPrimitives:
         Ed25519PublicKey=Ed25519PublicKey,
         serialization=serialization,
         ChaCha20Poly1305=ChaCha20Poly1305,
-        Scrypt=Scrypt,
-        HKDF=HKDF,
-        hashes=hashes,
         InvalidTag=InvalidTag,
         InvalidSignature=InvalidSignature,
     )
@@ -110,25 +103,11 @@ def require_raw_key(name: str, value: bytes) -> bytes:
 
 
 def derive_master_key(passphrase: str | bytes, *, salt: bytes, cost: ScryptCost) -> bytes:
-    crypto = require_cryptography()
-    kdf = crypto.Scrypt(
-        salt=salt,
-        length=cost.key_length,
-        n=cost.n,
-        r=cost.r,
-        p=cost.p,
-    )
-    return kdf.derive(passphrase_bytes(passphrase))
+    return _derive_master_key(passphrase, salt=salt, cost=cost)
 
 
 def derive_subkey(master_key: bytes, *, info: bytes) -> bytes:
-    crypto = require_cryptography()
-    return crypto.HKDF(
-        algorithm=crypto.hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=info,
-    ).derive(master_key)
+    return _derive_subkey(master_key, info=info)
 
 
 def require_private_key_role(key_role: str) -> str:

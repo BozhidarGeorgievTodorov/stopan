@@ -68,6 +68,20 @@ class ErasureDataPackShardRecord:
     last_error: str | None
 
 
+@dataclass(frozen=True)
+class MetadataPackPublicationRecord:
+    owner_id: str
+    pack_hash: str
+    desired_copies: int
+    pushed_at: float
+    pack_size_bytes: int
+    attempted_targets: int
+    successful_targets: int
+    stored_targets: int
+    already_present_targets: int
+    failed_targets: int
+
+
 class MetadataDB:
     """
     Guarda snapshots, recetas de chunks y estado de protección distribuida.
@@ -288,7 +302,137 @@ class MetadataDB:
             ON erasure_data_pack_shards(protection_state)
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS metadata_pack_publications (
+                owner_id TEXT NOT NULL,
+                pack_hash TEXT NOT NULL,
+                desired_copies INTEGER NOT NULL,
+                pushed_at REAL NOT NULL,
+                pack_size_bytes INTEGER NOT NULL DEFAULT 0,
+                attempted_targets INTEGER NOT NULL DEFAULT 0,
+                successful_targets INTEGER NOT NULL DEFAULT 0,
+                stored_targets INTEGER NOT NULL DEFAULT 0,
+                already_present_targets INTEGER NOT NULL DEFAULT 0,
+                failed_targets INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(owner_id, pack_hash)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_metadata_pack_publications_owner_pushed
+            ON metadata_pack_publications(owner_id, pushed_at DESC)
+        """)
+
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Metadata pack publications
+    # ------------------------------------------------------------------
+
+    def record_metadata_pack_publication(
+        self,
+        *,
+        owner_id: str,
+        pack_hash: str,
+        desired_copies: int,
+        pack_size_bytes: int,
+        attempted_targets: int,
+        successful_targets: int,
+        stored_targets: int,
+        already_present_targets: int,
+        failed_targets: int,
+        pushed_at: float | None = None,
+    ) -> None:
+        owner = _require_hash64("owner_id", owner_id)
+        pack = _require_hash64("pack_hash", pack_hash)
+        desired = _require_positive_int("desired_copies", desired_copies)
+        pack_size = _require_non_negative_int("pack_size_bytes", pack_size_bytes)
+        attempted = _require_non_negative_int("attempted_targets", attempted_targets)
+        successful = _require_non_negative_int("successful_targets", successful_targets)
+        stored = _require_non_negative_int("stored_targets", stored_targets)
+        already_present = _require_non_negative_int("already_present_targets", already_present_targets)
+        failed = _require_non_negative_int("failed_targets", failed_targets)
+        pushed = time.time() if pushed_at is None else float(pushed_at)
+
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO metadata_pack_publications (
+                    owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
+                    attempted_targets, successful_targets, stored_targets,
+                    already_present_targets, failed_targets
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_id, pack_hash) DO UPDATE SET
+                    desired_copies = excluded.desired_copies,
+                    pushed_at = excluded.pushed_at,
+                    pack_size_bytes = excluded.pack_size_bytes,
+                    attempted_targets = excluded.attempted_targets,
+                    successful_targets = excluded.successful_targets,
+                    stored_targets = excluded.stored_targets,
+                    already_present_targets = excluded.already_present_targets,
+                    failed_targets = excluded.failed_targets
+            """, (
+                owner,
+                pack,
+                desired,
+                pushed,
+                pack_size,
+                attempted,
+                successful,
+                stored,
+                already_present,
+                failed,
+            ))
+
+    def get_metadata_pack_publication(
+        self,
+        *,
+        owner_id: str,
+        pack_hash: str,
+    ) -> MetadataPackPublicationRecord | None:
+        owner = _require_hash64("owner_id", owner_id)
+        pack = _require_hash64("pack_hash", pack_hash)
+        row = self.conn.execute("""
+            SELECT owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
+                   attempted_targets, successful_targets, stored_targets,
+                   already_present_targets, failed_targets
+            FROM metadata_pack_publications
+            WHERE owner_id = ? AND pack_hash = ?
+            LIMIT 1
+        """, (owner, pack)).fetchone()
+        return _metadata_pack_publication_record(row) if row is not None else None
+
+    def get_metadata_pack_publications(
+        self,
+        *,
+        owner_id: str,
+        pack_hashes: Iterable[str] | None = None,
+    ) -> list[MetadataPackPublicationRecord]:
+        owner = _require_hash64("owner_id", owner_id)
+        if pack_hashes is None:
+            rows = self.conn.execute("""
+                SELECT owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
+                       attempted_targets, successful_targets, stored_targets,
+                       already_present_targets, failed_targets
+                FROM metadata_pack_publications
+                WHERE owner_id = ?
+                ORDER BY pushed_at DESC, pack_hash ASC
+            """, (owner,)).fetchall()
+            return [_metadata_pack_publication_record(row) for row in rows]
+
+        hashes = [_require_hash64("pack_hash", pack_hash) for pack_hash in pack_hashes]
+        if not hashes:
+            return []
+        placeholders = ", ".join("?" for _ in hashes)
+        rows = self.conn.execute(f"""
+            SELECT owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
+                   attempted_targets, successful_targets, stored_targets,
+                   already_present_targets, failed_targets
+            FROM metadata_pack_publications
+            WHERE owner_id = ? AND pack_hash IN ({placeholders})
+            ORDER BY pushed_at DESC, pack_hash ASC
+        """, (owner, *hashes)).fetchall()
+        return [_metadata_pack_publication_record(row) for row in rows]
+
 
     # ------------------------------------------------------------------
     # Snapshots
@@ -679,6 +823,98 @@ class MetadataDB:
             )
             self._insert_erasure_pack_chunks_once(pack_hash, chunk_rows)
             self._insert_erasure_pack_shards_once(pack_hash, shard_rows, state_value, last_push_at)
+
+
+    def refresh_erasure_data_pack_push(
+        self,
+        *,
+        pack_hash: str,
+        codec: str,
+        data_shards: int,
+        parity_shards: int,
+        payload_size: int,
+        padded_size: int,
+        shard_size: int,
+        chunks: Iterable[tuple[str, int, int, int]],
+        shards: Iterable[tuple[int, str, str, int]],
+        protection_state: ProtectionState,
+        placement_epoch: str | None,
+    ) -> None:
+        """
+        Actualiza el resultado de push de un data pack EC ya registrado.
+
+        No reasigna chunks a otro pack ni cambia la identidad del pack. Solo
+        refresca estado, epoch y filas de shards tras un reintento.
+        """
+        pack_hash = _require_hash64("pack_hash", pack_hash)
+        codec = _require_non_empty_text("codec", codec)
+        data_shards = _require_positive_int("data_shards", data_shards)
+        parity_shards = _require_non_negative_int("parity_shards", parity_shards)
+        payload_size = _require_non_negative_int("payload_size", payload_size)
+        padded_size = _require_non_negative_int("padded_size", padded_size)
+        shard_size = _require_positive_int("shard_size", shard_size)
+        state_value = _protection_state_value(protection_state)
+        total_shards = data_shards + parity_shards
+
+        if padded_size != shard_size * data_shards:
+            raise MetadataDatabaseError("padded_size debe coincidir con shard_size * data_shards")
+        if payload_size > padded_size:
+            raise MetadataDatabaseError("payload_size no puede ser mayor que padded_size")
+
+        chunk_rows = _normalize_erasure_chunk_rows(chunks, payload_size)
+        shard_rows = _normalize_erasure_shard_rows(shards, total_shards)
+        now = time.time()
+
+        with self.conn:
+            existing = self.conn.execute("""
+                SELECT codec, data_shards, parity_shards, payload_size, padded_size,
+                       shard_size
+                FROM erasure_data_packs
+                WHERE pack_hash = ?
+            """, (pack_hash,)).fetchone()
+            if existing is None:
+                raise MetadataDatabaseError(f"erasure data pack no registrado: {pack_hash}")
+
+            current = (
+                existing["codec"],
+                int(existing["data_shards"]),
+                int(existing["parity_shards"]),
+                int(existing["payload_size"]),
+                int(existing["padded_size"]),
+                int(existing["shard_size"]),
+            )
+            expected = (
+                codec,
+                data_shards,
+                parity_shards,
+                payload_size,
+                padded_size,
+                shard_size,
+            )
+            if current != expected:
+                raise MetadataDatabaseError(f"erasure data pack inconsistente: {pack_hash}")
+
+            self._assert_erasure_pack_chunks_match(pack_hash, chunk_rows)
+            self.conn.execute("""
+                UPDATE erasure_data_packs
+                SET protection_state = ?,
+                    placement_epoch = ?,
+                    last_push_at = ?,
+                    last_verify_at = NULL,
+                    last_error = NULL
+                WHERE pack_hash = ?
+            """, (
+                state_value,
+                placement_epoch,
+                now,
+                pack_hash,
+            ))
+            self._upsert_erasure_pack_shards_for_push(
+                pack_hash=pack_hash,
+                rows=shard_rows,
+                protection_state=state_value,
+                last_push_at=now,
+            )
 
     def get_erasure_data_pack(self, pack_hash: str) -> ErasureDataPackRecord | None:
         pack_hash = _require_hash64("pack_hash", pack_hash)
@@ -1099,6 +1335,691 @@ class MetadataDB:
                 last_push_at,
             ))
 
+    def _assert_erasure_pack_chunks_match(
+        self,
+        pack_hash: str,
+        rows: list[tuple[str, int, int, int]],
+    ) -> None:
+        existing_rows = self.conn.execute("""
+            SELECT chunk_hash, chunk_offset, chunk_length, chunk_ordinal
+            FROM erasure_data_pack_chunks
+            WHERE pack_hash = ?
+            ORDER BY chunk_ordinal ASC
+        """, (pack_hash,)).fetchall()
+        current = [
+            (
+                row["chunk_hash"],
+                int(row["chunk_offset"]),
+                int(row["chunk_length"]),
+                int(row["chunk_ordinal"]),
+            )
+            for row in existing_rows
+        ]
+        if current != rows:
+            raise MetadataDatabaseError(f"chunks EC inconsistentes para pack: {pack_hash}")
+
+    def _upsert_erasure_pack_shards_for_push(
+        self,
+        *,
+        pack_hash: str,
+        rows: list[tuple[int, str, str, int]],
+        protection_state: str,
+        last_push_at: float,
+    ) -> None:
+        seen_indexes = {shard_index for shard_index, _shard_hash, _node_id, _size in rows}
+        for shard_index, shard_hash, node_id, size in rows:
+            existing = self.conn.execute("""
+                SELECT 1
+                FROM erasure_data_pack_shards
+                WHERE pack_hash = ? AND shard_index = ?
+            """, (pack_hash, shard_index)).fetchone()
+            if existing is None:
+                self.conn.execute("""
+                    INSERT INTO erasure_data_pack_shards (
+                        pack_hash, shard_index, shard_hash, node_id, size,
+                        protection_state, last_push_at, last_verify_at, last_error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """, (
+                    pack_hash,
+                    shard_index,
+                    shard_hash,
+                    node_id,
+                    size,
+                    protection_state,
+                    last_push_at,
+                ))
+                continue
+
+            self.conn.execute("""
+                UPDATE erasure_data_pack_shards
+                SET shard_hash = ?,
+                    node_id = ?,
+                    size = ?,
+                    protection_state = ?,
+                    last_push_at = ?,
+                    last_verify_at = NULL,
+                    last_error = NULL
+                WHERE pack_hash = ?
+                  AND shard_index = ?
+            """, (
+                shard_hash,
+                node_id,
+                size,
+                protection_state,
+                last_push_at,
+                pack_hash,
+                shard_index,
+            ))
+
+        placeholders = ", ".join("?" for _ in seen_indexes)
+        if placeholders:
+            self.conn.execute(f"""
+                DELETE FROM erasure_data_pack_shards
+                WHERE pack_hash = ?
+                  AND shard_index NOT IN ({placeholders})
+            """, (pack_hash, *sorted(seen_indexes)))
+
+
+
+
+    # ------------------------------------------------------------------
+    # Metadata object graph import/export helpers
+    # ------------------------------------------------------------------
+
+    def count_operational_rows(self, tables: Iterable[str]) -> dict[str, int]:
+        allowed = {
+            "snapshots",
+            "snapshot_items",
+            "recipes",
+            "recipe_chunks",
+            "chunks",
+            "chunk_protection",
+            "erasure_data_packs",
+            "erasure_data_pack_chunks",
+            "erasure_data_pack_shards",
+        }
+        counts: dict[str, int] = {}
+        for table in tables:
+            if table not in allowed:
+                raise MetadataDatabaseError(f"tabla operacional no permitida: {table!r}")
+            row = self.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+            counts[table] = int(row["n"]) if row is not None else 0
+        return counts
+
+    def object_export_snapshot_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT id, root_path, origin_node_id, created_at, total_size,
+                   total_files, status, error, uuid
+            FROM snapshots
+            ORDER BY created_at ASC, uuid ASC
+            """
+        ).fetchall()
+
+    def object_export_snapshot_item_rows(self, snapshot_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT id, path, item_type, size, mode, mtime, mtime_ns, uid, gid, recipe_id
+            FROM snapshot_items
+            WHERE snapshot_id = ?
+            ORDER BY path ASC
+            """,
+            (int(snapshot_id),),
+        ).fetchall()
+
+    def object_export_recipe_row(self, recipe_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT id, recipe_hash, chunk_count, total_size
+            FROM recipes
+            WHERE id = ?
+            """,
+            (int(recipe_id),),
+        ).fetchone()
+
+    def object_export_recipe_hash(self, recipe_id: int) -> str | None:
+        row = self.conn.execute(
+            "SELECT recipe_hash FROM recipes WHERE id = ?",
+            (int(recipe_id),),
+        ).fetchone()
+        return None if row is None else row["recipe_hash"]
+
+    def object_export_recipe_chunk_rows(self, recipe_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT chunk_order, chunk_hash, chunk_size
+            FROM recipe_chunks
+            WHERE recipe_id = ?
+            ORDER BY chunk_order ASC
+            """,
+            (int(recipe_id),),
+        ).fetchall()
+
+    def object_export_known_chunk_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT hash, size
+            FROM chunks
+            ORDER BY hash ASC
+            """
+        ).fetchall()
+
+    def object_export_protection_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT chunk_hash, desired_rf, protection_state, protected_remote_copies,
+                   placement_epoch, last_push_at, last_verify_at, last_error
+            FROM chunk_protection
+            ORDER BY chunk_hash ASC
+            """
+        ).fetchall()
+
+    def object_export_erasure_pack_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
+                   padded_size, shard_size, protection_state, placement_epoch,
+                   created_at, last_push_at, last_verify_at, last_error
+            FROM erasure_data_packs
+            ORDER BY pack_hash ASC
+            """
+        ).fetchall()
+
+    def object_export_erasure_pack_chunk_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT chunk_hash, pack_hash, chunk_offset, chunk_length, chunk_ordinal
+            FROM erasure_data_pack_chunks
+            ORDER BY pack_hash ASC, chunk_ordinal ASC
+            """
+        ).fetchall()
+
+    def object_export_erasure_pack_shard_rows(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT pack_hash, shard_index, shard_hash, node_id, size,
+                   protection_state, last_push_at, last_verify_at, last_error
+            FROM erasure_data_pack_shards
+            ORDER BY pack_hash ASC, shard_index ASC
+            """
+        ).fetchall()
+
+    def object_import_insert_chunks(self, chunks: dict[str, int]) -> int:
+        if not chunks:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO chunks (hash, size, ref_count)
+            VALUES (?, ?, 0)
+            """,
+            [(chunk_hash, int(size)) for chunk_hash, size in sorted(chunks.items())],
+        )
+        return len(chunks)
+
+    def object_import_insert_snapshot(
+        self,
+        *,
+        snapshot_uuid: str,
+        root_path: str,
+        origin_node_id: str,
+        status: str,
+        error: str | None,
+        total_size: int,
+        total_files: int,
+        created_at: str,
+    ) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO snapshots
+                (uuid, root_path, origin_node_id, status, error, total_size, total_files, created_at)
+            VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_uuid,
+                root_path,
+                origin_node_id,
+                status,
+                error,
+                int(total_size),
+                int(total_files),
+                created_at,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def object_import_insert_protection_records(
+        self,
+        rows: Iterable[tuple[str, int, str, int, str | None, object, object, object]],
+    ) -> int:
+        normalized = [tuple(row) for row in rows]
+        if not normalized:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO chunk_protection
+                (chunk_hash, desired_rf, protection_state, protected_remote_copies,
+                 placement_epoch, last_push_at, last_verify_at, last_error)
+            VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            normalized,
+        )
+        return len(normalized)
+
+    def object_import_insert_erasure_data_pack_records(self, records: Iterable[object]) -> int:
+        count = 0
+        for record in records:
+            self.conn.execute(
+                """
+                INSERT INTO erasure_data_packs (
+                    pack_hash, codec, data_shards, parity_shards, payload_size,
+                    padded_size, shard_size, protection_state, placement_epoch,
+                    created_at, last_push_at, last_verify_at, last_error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                record.pack,
+            )
+            self.conn.executemany(
+                """
+                INSERT INTO erasure_data_pack_chunks (
+                    chunk_hash, pack_hash, chunk_offset, chunk_length, chunk_ordinal
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                record.chunks,
+            )
+            self.conn.executemany(
+                """
+                INSERT INTO erasure_data_pack_shards (
+                    pack_hash, shard_index, shard_hash, node_id, size,
+                    protection_state, last_push_at, last_verify_at, last_error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                record.shards,
+            )
+            count += 1
+        return count
+
+    def object_import_insert_chunk_zero_ref(self, chunk_hash: str, chunk_size: int) -> None:
+        self.conn.execute(
+            "INSERT INTO chunks (hash, size, ref_count) VALUES (?, ?, 0)",
+            (chunk_hash, int(chunk_size)),
+        )
+
+    def object_import_insert_recipe_if_missing(
+        self,
+        *,
+        recipe_hash: str,
+        chunk_count: int,
+        total_size: int,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO recipes (recipe_hash, chunk_count, total_size)
+            VALUES (?, ?, ?)
+            """,
+            (recipe_hash, int(chunk_count), int(total_size)),
+        )
+
+    def object_import_recipe_summary_by_hash(self, recipe_hash: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT id, chunk_count, total_size
+            FROM recipes
+            WHERE recipe_hash = ?
+            """,
+            (recipe_hash,),
+        ).fetchone()
+
+    def object_import_recipe_chunk_rows(self, recipe_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT chunk_order, chunk_hash, chunk_size
+            FROM recipe_chunks
+            WHERE recipe_id = ?
+            ORDER BY chunk_order ASC
+            """,
+            (int(recipe_id),),
+        ).fetchall()
+
+    def object_import_insert_recipe_chunks(
+        self,
+        recipe_id: int,
+        chunks: Iterable[tuple[int, str, int]],
+    ) -> None:
+        self.conn.executemany(
+            """
+            INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (int(recipe_id), int(order), chunk_hash, int(chunk_size))
+                for order, chunk_hash, chunk_size in chunks
+            ],
+        )
+
+    def object_import_increment_chunk_ref_counts(self, increments: dict[str, int]) -> None:
+        if not increments:
+            return
+        self.conn.executemany(
+            """
+            UPDATE chunks
+            SET ref_count = ref_count + ?
+            WHERE hash = ?
+            """,
+            [(int(count), chunk_hash) for chunk_hash, count in sorted(increments.items())],
+        )
+
+    def object_import_insert_snapshot_item(
+        self,
+        *,
+        snapshot_id: int,
+        path: str,
+        item_type: str,
+        size: int,
+        mode: int,
+        mtime: float,
+        mtime_ns: int,
+        uid: int,
+        gid: int,
+        recipe_id: int | None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO snapshot_items
+                (snapshot_id, path, item_type, size, mode, mtime, mtime_ns, uid, gid, recipe_id)
+            VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(snapshot_id),
+                path,
+                item_type,
+                int(size),
+                int(mode),
+                float(mtime),
+                int(mtime_ns),
+                int(uid),
+                int(gid),
+                recipe_id,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Protection scope queries
+    # ------------------------------------------------------------------
+
+    def snapshot_chunk_hashes(self, snapshot_id: int) -> tuple[str, ...]:
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT rc.chunk_hash
+            FROM snapshot_items AS si
+            JOIN recipe_chunks AS rc ON rc.recipe_id = si.recipe_id
+            WHERE si.snapshot_id = ?
+              AND si.item_type = 'file'
+              AND si.recipe_id IS NOT NULL
+            ORDER BY rc.chunk_hash ASC
+            """,
+            (int(snapshot_id),),
+        ).fetchall()
+        return tuple(row["chunk_hash"] for row in rows)
+
+    def all_reachable_chunk_hashes(self) -> tuple[str, ...]:
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT rc.chunk_hash
+            FROM snapshots AS s
+            JOIN snapshot_items AS si ON si.snapshot_id = s.id
+            JOIN recipe_chunks AS rc ON rc.recipe_id = si.recipe_id
+            WHERE s.status = 'COMPLETE'
+              AND si.item_type = 'file'
+              AND si.recipe_id IS NOT NULL
+            ORDER BY rc.chunk_hash ASC
+            """
+        ).fetchall()
+        return tuple(row["chunk_hash"] for row in rows)
+
+    def all_known_chunk_hashes(self) -> tuple[str, ...]:
+        rows = self.conn.execute("SELECT hash FROM chunks ORDER BY hash ASC").fetchall()
+        return tuple(row["hash"] for row in rows)
+
+    def chunk_protection_verification_candidates_for_hashes(
+        self,
+        chunk_hashes: Iterable[str],
+        *,
+        include_verified: bool,
+        limit: int | None,
+    ) -> list[VerificationCandidate]:
+        hashes = _unique_hashes(chunk_hashes)
+        if not hashes:
+            return []
+        states = [
+            ProtectionState.PENDING.value,
+            ProtectionState.PLACED.value,
+            ProtectionState.DEGRADED.value,
+            ProtectionState.FAILED.value,
+        ]
+        if include_verified:
+            states.append(ProtectionState.VERIFIED.value)
+        hash_placeholders = ", ".join("?" for _ in hashes)
+        state_placeholders = ", ".join("?" for _ in states)
+        query = f"""
+            SELECT chunk_hash, desired_rf, protection_state
+            FROM chunk_protection
+            WHERE chunk_hash IN ({hash_placeholders})
+              AND protection_state IN ({state_placeholders})
+            ORDER BY chunk_hash ASC
+        """
+        params: list[object] = list(hashes) + list(states)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [
+            VerificationCandidate(
+                chunk_hash=row["chunk_hash"],
+                desired_rf=int(row["desired_rf"]),
+                protection_state=ProtectionState(row["protection_state"]),
+            )
+            for row in rows
+        ]
+
+    def pending_protection_chunks_for_hashes(
+        self,
+        chunk_hashes: Iterable[str],
+        *,
+        desired_rf: int,
+        current_epoch: str | None,
+        limit: int | None,
+    ) -> list[str]:
+        hashes = _unique_hashes(chunk_hashes)
+        if not hashes:
+            return []
+        hash_placeholders = ", ".join("?" for _ in hashes)
+        params: list[object] = [
+            *hashes,
+            ProtectionState.PENDING.value,
+            ProtectionState.DEGRADED.value,
+            ProtectionState.FAILED.value,
+            int(desired_rf),
+        ]
+        query = f"""
+            SELECT chunk_hash
+            FROM chunk_protection
+            WHERE chunk_hash IN ({hash_placeholders})
+              AND (
+                    protection_state IN (?, ?, ?)
+                 OR desired_rf < ?
+        """
+        if current_epoch is not None:
+            query += """
+                 OR (
+                        protection_state IN (?, ?)
+                    AND (placement_epoch IS NULL OR placement_epoch <> ?)
+                 )
+            """
+            params.extend([
+                ProtectionState.PLACED.value,
+                ProtectionState.VERIFIED.value,
+                current_epoch,
+            ])
+        query += """
+              )
+            ORDER BY chunk_hash ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [row["chunk_hash"] for row in rows]
+
+    def erasure_pack_hashes_for_chunks(self, chunk_hashes: Iterable[str]) -> tuple[str, ...]:
+        hashes = _unique_hashes(chunk_hashes)
+        if not hashes:
+            return ()
+        placeholders = ", ".join("?" for _ in hashes)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT pack_hash
+            FROM erasure_data_pack_chunks
+            WHERE chunk_hash IN ({placeholders})
+            ORDER BY pack_hash ASC
+            """,
+            hashes,
+        ).fetchall()
+        return tuple(row["pack_hash"] for row in rows)
+
+    def all_erasure_pack_hashes(self) -> tuple[str, ...]:
+        rows = self.conn.execute(
+            "SELECT pack_hash FROM erasure_data_packs ORDER BY pack_hash ASC"
+        ).fetchall()
+        return tuple(row["pack_hash"] for row in rows)
+
+    def erasure_data_packs_by_hashes(
+        self,
+        pack_hashes: Iterable[str],
+        *,
+        include_verified: bool,
+        limit: int | None,
+    ) -> list[ErasureDataPackRecord]:
+        rows = self._select_erasure_data_pack_rows_by_hashes(
+            pack_hashes,
+            include_verified=include_verified,
+            limit=limit,
+        )
+        return [_erasure_pack_record(row) for row in rows]
+
+    def pending_erasure_data_packs_by_hashes(
+        self,
+        pack_hashes: Iterable[str],
+        *,
+        current_epoch: str | None,
+        limit: int | None,
+    ) -> list[ErasureDataPackRecord]:
+        hashes = _unique_hashes(pack_hashes)
+        if not hashes:
+            return []
+        hash_placeholders = ", ".join("?" for _ in hashes)
+        params: list[object] = [
+            *hashes,
+            ProtectionState.PENDING.value,
+            ProtectionState.DEGRADED.value,
+            ProtectionState.FAILED.value,
+        ]
+        query = f"""
+            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
+                   padded_size, shard_size, protection_state, placement_epoch,
+                   created_at, last_push_at, last_verify_at, last_error
+            FROM erasure_data_packs
+            WHERE pack_hash IN ({hash_placeholders})
+              AND (
+                    protection_state IN (?, ?, ?)
+        """
+        if current_epoch is not None:
+            query += """
+                 OR (
+                        protection_state IN (?, ?)
+                    AND (placement_epoch IS NULL OR placement_epoch <> ?)
+                 )
+            """
+            params.extend([
+                ProtectionState.PLACED.value,
+                ProtectionState.VERIFIED.value,
+                current_epoch,
+            ])
+        query += """
+              )
+            ORDER BY pack_hash ASC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [_erasure_pack_record(row) for row in rows]
+
+    def erasure_unprotected_chunks_for_hashes(
+        self,
+        chunk_hashes: Iterable[str],
+        *,
+        limit: int | None,
+    ) -> list[str]:
+        hashes = _unique_hashes(chunk_hashes)
+        if not hashes:
+            return []
+        placeholders = ", ".join("?" for _ in hashes)
+        query = f"""
+            SELECT c.hash
+            FROM chunks c
+            LEFT JOIN erasure_data_pack_chunks epc ON epc.chunk_hash = c.hash
+            WHERE c.hash IN ({placeholders})
+              AND epc.chunk_hash IS NULL
+            ORDER BY c.hash ASC
+        """
+        params: list[object] = list(hashes)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [row["hash"] for row in rows]
+
+    def _select_erasure_data_pack_rows_by_hashes(
+        self,
+        pack_hashes: Iterable[str],
+        *,
+        include_verified: bool,
+        limit: int | None,
+    ) -> list[sqlite3.Row]:
+        hashes = _unique_hashes(pack_hashes)
+        if not hashes:
+            return []
+        states = [
+            ProtectionState.PENDING.value,
+            ProtectionState.PLACED.value,
+            ProtectionState.DEGRADED.value,
+            ProtectionState.FAILED.value,
+        ]
+        if include_verified:
+            states.append(ProtectionState.VERIFIED.value)
+        hash_placeholders = ", ".join("?" for _ in hashes)
+        state_placeholders = ", ".join("?" for _ in states)
+        query = f"""
+            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
+                   padded_size, shard_size, protection_state, placement_epoch,
+                   created_at, last_push_at, last_verify_at, last_error
+            FROM erasure_data_packs
+            WHERE pack_hash IN ({hash_placeholders})
+              AND protection_state IN ({state_placeholders})
+            ORDER BY pack_hash ASC
+        """
+        params: list[object] = list(hashes) + list(states)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+        return self.conn.execute(query, tuple(params)).fetchall()
 
     # ------------------------------------------------------------------
     # Distributed protection
@@ -1437,6 +2358,10 @@ class MetadataDB:
 _HASH64_ALPHABET = set("0123456789abcdef")
 
 
+def _unique_hashes(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(_require_hash64("hash", value) for value in values))
+
+
 def _require_hash64(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise MetadataDatabaseError(f"{name} debe ser str; recibido {type(value).__name__}")
@@ -1531,6 +2456,21 @@ def _normalize_erasure_shard_rows(
         raise MetadataDatabaseError("los shards EC de un pack deben ir a nodos distintos")
 
     return rows
+
+
+def _metadata_pack_publication_record(row: sqlite3.Row) -> MetadataPackPublicationRecord:
+    return MetadataPackPublicationRecord(
+        owner_id=row["owner_id"],
+        pack_hash=row["pack_hash"],
+        desired_copies=int(row["desired_copies"]),
+        pushed_at=float(row["pushed_at"]),
+        pack_size_bytes=int(row["pack_size_bytes"]),
+        attempted_targets=int(row["attempted_targets"]),
+        successful_targets=int(row["successful_targets"]),
+        stored_targets=int(row["stored_targets"]),
+        already_present_targets=int(row["already_present_targets"]),
+        failed_targets=int(row["failed_targets"]),
+    )
 
 
 def _erasure_pack_record(row: sqlite3.Row) -> ErasureDataPackRecord:

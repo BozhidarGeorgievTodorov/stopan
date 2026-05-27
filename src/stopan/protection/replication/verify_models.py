@@ -1,8 +1,7 @@
 """
 Modelos de verificación de protección remota.
 
-Estas estructuras agrupan resultados de ProbeMissingChunks, outcomes por chunk
-y contadores agregados del verifier.
+Estas estructuras agrupan outcomes por chunk y contadores agregados del verifier.
 """
 
 from __future__ import annotations
@@ -11,35 +10,12 @@ from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True, slots=True)
-class ProbeExecutionResult:
-    """
-    Resultado de consultar un nodo remoto con ProbeMissingChunks.
-
-    present_hashes contiene solo los chunks que el nodo afirma tener. Si hubo
-    fallo de transporte, transport_error describe el error y el resultado no
-    debe contarse como copia verificada.
-    """
-
-    node_id: str
-    address: str
-    requested_hashes: tuple[str, ...]
-    present_hashes: frozenset[str]
-    transport_error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class VerificationOutcome:
-    """
-    Resultado de verificación para un chunk concreto.
-
-    success indica si se han confirmado al menos required_remote_copies copias
-    remotas para el placement_epoch evaluado.
-    """
+    """Resultado de verificación para un chunk concreto."""
 
     chunk_hash: str
     desired_rf: int
     placement_epoch: str
-    success: bool
     required_remote_copies: int
     verified_remote_copies: int
     error: str | None = None

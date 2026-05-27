@@ -10,12 +10,11 @@ from stopan.restore.errors import ChunkUnavailableError, RestoreDataError
 from stopan.cas.repository import CASRepository
 from stopan.metadata.database import MetadataDB, ErasureDataPackShardRecord
 from stopan.protection.ec.manifest import DataPackManifest
-from stopan.protection.ec.models import DataPackEntry, DataPackShard, ErasureSpec
+from stopan.protection.ec.metadata_adapter import manifest_from_erasure_metadata
+from stopan.protection.ec.models import DataPackShard
 from stopan.protection.ec.packer import extract_pack_chunks, reconstruct_payload
-from stopan.protection.ec.remote_client import (
-    RemoteDataPackShardClientPool,
-    RemoteDataPackShardRef,
-)
+from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
+from stopan.protection.ec.shard_targets import group_erasure_shard_refs_by_address
 
 
 @dataclass(frozen=True)
@@ -163,26 +162,7 @@ class ErasureChunkRecoveryService:
                 f"{len(pack_shards)}/{pack.data_shards}"
             )
 
-        manifest = DataPackManifest(
-            pack_hash=pack.pack_hash,
-            payload_size=pack.payload_size,
-            padded_size=pack.padded_size,
-            shard_size=pack.shard_size,
-            spec=ErasureSpec(
-                data_shards=pack.data_shards,
-                parity_shards=pack.parity_shards,
-                codec=pack.codec,
-            ),
-            entries=tuple(
-                DataPackEntry(
-                    chunk_hash=item.chunk_hash,
-                    offset=item.offset,
-                    length=item.length,
-                    ordinal=item.ordinal,
-                )
-                for item in pack_chunks
-            ),
-        )
+        manifest = manifest_from_erasure_metadata(pack=pack, chunks=pack_chunks)
         return _ErasurePackRecoveryJob(
             pack_hash=pack_hash,
             manifest=manifest,
@@ -212,27 +192,15 @@ class ErasureChunkRecoveryService:
         required: int,
     ) -> list[DataPackShard]:
         cluster = self.cluster_resolver.get_cluster()
-        
-        refs_by_addr: dict[str, list[RemoteDataPackShardRef]] = defaultdict(list)
-        found: list[DataPackShard] = []
-        errors: list[str] = []
-
         active_nodes = {m.node_id: m.address for m in cluster.members}
-
-        for row in shard_rows:
-            target_address = active_nodes.get(row.node_id)
-            
-            if not target_address:
-                errors.append(f"shard={row.shard_index}: nodo {row.node_id} offline/ilocalizable")
-                continue
-
-            refs_by_addr[target_address].append(
-                RemoteDataPackShardRef(
-                    pack_hash=row.pack_hash,
-                    shard_index=row.shard_index,
-                    shard_hash=row.shard_hash,
-                )
-            )
+        target_groups = group_erasure_shard_refs_by_address(
+            shard_rows=shard_rows,
+            node_addresses=active_nodes,
+            short_node_ids_in_errors=False,
+        )
+        refs_by_addr = target_groups.refs_by_address
+        found: list[DataPackShard] = []
+        errors = list(target_groups.offline_errors)
 
         if len(refs_by_addr) < required:
             raise ChunkUnavailableError(

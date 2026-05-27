@@ -20,6 +20,8 @@ from stopan.cli.validation import (
 )
 from stopan.config.defaults import DEFAULT_EC_PACK_SIZE_BYTES
 
+PROTECTION_SCOPE_CHOICES = ("pending", "snapshot", "all-reachable", "all-known-chunks")
+
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -41,6 +43,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ec-m", type=int, default=None, help="Número de parity shards por data pack EC.")
     parser.add_argument("--ec-pack-size-bytes", type=int, default=None, help="Tamaño objetivo máximo del payload de cada data pack EC.")
     parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución.")
+    parser.add_argument(
+        "--scope",
+        choices=PROTECTION_SCOPE_CHOICES,
+        default="pending",
+        help=(
+            "Alcance del push. pending conserva el comportamiento actual; "
+            "snapshot filtra por --snapshot-id; all-reachable protege chunks alcanzables "
+            "desde snapshots completos; all-known-chunks protege todos los chunks conocidos."
+        ),
+    )
+    parser.add_argument("--snapshot-id", type=int, default=None, help="Snapshot completo que acota el push.")
     parser.add_argument("--target-parallelism", type=int, default=None, help="Número de targets procesados en paralelo.")
     parser.add_argument("--probe-batch-hashes", type=int, default=None, help="Hashes por probe de inventario remoto.")
     parser.add_argument("--stream-inflight", type=int, default=None, help="Ventana máxima de chunks en vuelo por stream.")
@@ -66,6 +79,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args,
         (
             IntRange("limit", "--limit", 1),
+            IntRange("snapshot_id", "--snapshot-id", 1),
             IntRange("max_message_bytes", "--max-message-bytes", 1),
             IntRange("commit_every", "--commit-every", 1),
         ),
@@ -75,6 +89,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args,
         (FloatRange("stream_timeout_s", "--stream-timeout-s", 0.0, inclusive=False),),
     )
+
+    if args.snapshot_id is not None and args.scope not in ("pending", "snapshot"):
+        parser.error("--snapshot-id no se puede combinar con --scope distinto de snapshot")
+    if args.snapshot_id is not None:
+        args.scope = "snapshot"
+    if args.scope == "snapshot" and args.snapshot_id is None:
+        parser.error("--scope snapshot requiere --snapshot-id")
 
     if args.protection_mode == "ec":
         reject_present(
@@ -149,6 +170,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         stats = push_erasure_data_packs_to_network(
             membership_seed=args.membership_seed or first_seed(cfg),
             limit=args.limit,
+            scope=args.scope,
+            snapshot_id=args.snapshot_id,
             ec_k=args.ec_k,
             ec_m=args.ec_m,
             ec_pack_size_bytes=args.ec_pack_size_bytes,
@@ -193,12 +216,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ajusta --remote-copies o protection.remote_copies."
         )
 
-    from stopan.protection.pusher import push_to_network
+    from stopan.protection.replication.pusher import push_to_network
 
     stats = push_to_network(
         membership_seed=args.membership_seed or first_seed(cfg),
         rf=remote_copies,
         limit=args.limit,
+        scope=args.scope,
+        snapshot_id=args.snapshot_id,
         target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
         probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.replication.probe_batch_hashes)),
         stream_inflight=int(choose(args.stream_inflight, cfg.replication.stream_inflight)),

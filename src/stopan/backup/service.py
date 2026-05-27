@@ -11,9 +11,9 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import time
-from pathlib import Path
 
 from .identity import resolve_origin_node_id
+from .models import BackupRunStats
 from .policy import build_backup_fast_path_policy
 from .worker import process_file_worker
 from stopan.chunking.chunk_index import ChunkIndex
@@ -111,14 +111,7 @@ def backup_directory(
         previous_snapshot_id = db.get_prev_snapshot_id(root_path, snapshot_id)
         shared_index = ChunkIndex()
 
-        total_files = 0
-        total_size = 0
-        total_chunks = 0
-        total_processed = 0
-        total_written = 0
-        total_skipped = 0
-        total_skipped_local = 0
-        total_skipped_remote = 0
+        totals = BackupRunStats()
 
         max_pending_futures = max(1, workers * 3)
         future_map: dict = {}
@@ -127,10 +120,6 @@ def backup_directory(
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
 
             def collect_completed(*, wait_for_all: bool) -> None:
-                nonlocal total_files, total_size
-                nonlocal total_chunks, total_processed, total_written
-                nonlocal total_skipped, total_skipped_local, total_skipped_remote
-
                 if not future_map:
                     return
 
@@ -163,14 +152,7 @@ def backup_directory(
                     )
                     db.set_item_recipe(item_id, recipe_id)
 
-                    total_files += 1
-                    total_size += file_size
-                    total_chunks += stats.chunks_total
-                    total_processed += stats.processed
-                    total_written += stats.written
-                    total_skipped += stats.skipped
-                    total_skipped_local += stats.skipped_local
-                    total_skipped_remote += stats.skipped_remote
+                    totals.add_worker_file(file_size=file_size, stats=stats)
 
             for rel_path, full_path, stat_info, item_type in walker.walk():
                 item_id = db.add_item(snapshot_id, rel_path, stat_info, item_type)
@@ -181,27 +163,13 @@ def backup_directory(
                 if previous_snapshot_id is not None and not safe_mode:
                     previous_item = db.get_item_by_path(previous_snapshot_id, rel_path)
                     if previous_item is not None:
-                        mtime_ns = getattr(
-                            stat_info,
-                            "st_mtime_ns",
-                            int(stat_info.st_mtime * 1_000_000_000),
-                        )
-                        unchanged = (
-                            previous_item["size"] == stat_info.st_size
-                            and previous_item["mode"] == stat_info.st_mode
-                            and previous_item["uid"] == getattr(stat_info, "st_uid", None)
-                            and previous_item["gid"] == getattr(stat_info, "st_gid", None)
-                            and previous_item["mtime_ns"] == mtime_ns
-                            and previous_item["recipe_id"] is not None
-                        )
-                        if unchanged:
+                        if _is_unchanged_file(previous_item, stat_info):
                             db.set_item_recipe(item_id, previous_item["recipe_id"])
                             db.ensure_recipe_protection(
                                 previous_item["recipe_id"],
                                 desired_rf=policy.desired_rf,
                             )
-                            total_files += 1
-                            total_size += stat_info.st_size
+                            totals.add_reused_file(file_size=stat_info.st_size)
                             continue
 
                 future = executor.submit(
@@ -224,15 +192,9 @@ def backup_directory(
             if future_map:
                 collect_completed(wait_for_all=True)
 
-        if failed_files:
-            preview = "; ".join(f"{path}: {error}" for path, error in failed_files[:5])
-            if len(failed_files) > 5:
-                preview += f"; ... (+{len(failed_files) - 5} más)"
-            raise StopanStorageError(
-                f"Backup incompleto: fallaron {len(failed_files)} archivo(s). {preview}"
-            )
+        _raise_if_failed_files(failed_files)
 
-        db.finish_snapshot(snapshot_id, total_size, total_files)
+        db.finish_snapshot(snapshot_id, totals.size, totals.files)
         db.commit()
         snapshot_completed = True
 
@@ -258,21 +220,21 @@ def backup_directory(
         db.close()
 
     elapsed = time.perf_counter() - started_at
-    speed = _format_speed(total_size, elapsed)
+    speed = _format_speed(totals.size, elapsed)
 
     print(f"Backup completado: snapshot {snapshot_id}")
-    print(f"Archivos: {total_files}")
-    print(f"Tamaño: {total_size} bytes")
+    print(f"Archivos: {totals.files}")
+    print(f"Tamaño: {totals.size} bytes")
     print(f"Tiempo: {elapsed:.2f} segundos")
     print(f"Velocidad: {speed}")
     print(f"Workers: {workers}")
-    print(f"Chunks totales: {total_chunks}")
-    print(f"Chunks procesados: {total_processed}")
-    print(f"Chunks escritos: {total_written}")
+    print(f"Chunks totales: {totals.chunks_total}")
+    print(f"Chunks procesados: {totals.processed}")
+    print(f"Chunks escritos: {totals.written}")
     print(
         "Chunks saltados: "
-        f"{total_skipped} "
-        f"(local: {total_skipped_local}, remoto: {total_skipped_remote})"
+        f"{totals.skipped} "
+        f"(local: {totals.skipped_local}, remoto: {totals.skipped_remote})"
     )
 
     if snapshot_completed and metadata_object_graph_auto_export is not None:
@@ -281,6 +243,34 @@ def backup_directory(
             settings=metadata_object_graph_auto_export,
             context_label="BACKUP",
         )
+
+
+def _is_unchanged_file(previous_item: dict, stat_info: os.stat_result) -> bool:
+    mtime_ns = getattr(
+        stat_info,
+        "st_mtime_ns",
+        int(stat_info.st_mtime * 1_000_000_000),
+    )
+    return (
+        previous_item["size"] == stat_info.st_size
+        and previous_item["mode"] == stat_info.st_mode
+        and previous_item["uid"] == getattr(stat_info, "st_uid", None)
+        and previous_item["gid"] == getattr(stat_info, "st_gid", None)
+        and previous_item["mtime_ns"] == mtime_ns
+        and previous_item["recipe_id"] is not None
+    )
+
+
+def _raise_if_failed_files(failed_files: list[tuple[str, str]]) -> None:
+    if not failed_files:
+        return
+
+    preview = "; ".join(f"{path}: {error}" for path, error in failed_files[:5])
+    if len(failed_files) > 5:
+        preview += f"; ... (+{len(failed_files) - 5} más)"
+    raise StopanStorageError(
+        f"Backup incompleto: fallaron {len(failed_files)} archivo(s). {preview}"
+    )
 
 
 def _normalize_worker_count(workers: int) -> int:

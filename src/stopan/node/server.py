@@ -21,9 +21,8 @@ from stopan.protos import p2p_storage_pb2_grpc
 from stopan.rpc.options import grpc_server_options
 
 from .identity import NodeIdentityStore
-from .membership import MembershipManager, MembershipServicer, MembershipSettings
-from .metadata import MetadataPackServiceServicer
-from .storage_rpc import StorageNodeServicer
+from .membership import MembershipManager, MembershipSettings
+from .services import MembershipServicer, MetadataPackServiceServicer, StorageNodeServicer
 
 
 _SHUTDOWN_GRACE_S = 5.0

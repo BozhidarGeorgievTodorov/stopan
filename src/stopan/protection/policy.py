@@ -105,3 +105,24 @@ def is_record_sufficient(
         return False
 
     return True
+
+
+def protection_state_from_thresholds(
+    *,
+    confirmed: int,
+    success_threshold: int,
+    degraded_threshold: int,
+    success_state: ProtectionState,
+    degraded_state: ProtectionState = ProtectionState.DEGRADED,
+    failed_state: ProtectionState = ProtectionState.FAILED,
+) -> ProtectionState:
+    confirmed = int(confirmed)
+    success_threshold = int(success_threshold)
+    degraded_threshold = int(degraded_threshold)
+
+    if confirmed >= success_threshold:
+        return success_state
+    if confirmed >= degraded_threshold:
+        return degraded_state
+    return failed_state
+

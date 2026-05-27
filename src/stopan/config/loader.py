@@ -242,6 +242,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
         "distributed_pack_store_dir": _as_str,
         "pack_copies": _as_int,
         "strict_pack_copies": _as_bool,
+        "pack_discovery_max_candidates": _as_int,
+        "cli_warning_limit": _as_int,
         "max_distributed_pack_bytes": _as_int,
         "max_distributed_packs_per_owner": _as_int,
         "max_distributed_pack_bytes_per_owner": _as_int,

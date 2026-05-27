@@ -9,6 +9,7 @@ solo deja el object graph o el pack cifrado desactualizado.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
 from pathlib import Path
 
 from stopan.errors import (
@@ -125,12 +126,13 @@ def export_metadata_object_graph_after_metadata_change(
     print(f"   object_store: {result.root_dir}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
-    print(f"   objects_total: {result.objects_total}")
-    print(f"   objects_written: {result.objects_written}")
-    print(f"   objects_reused: {result.objects_reused}")
-    print(f"   snapshots: {result.snapshot_count}")
-    print(f"   known_chunks: {result.known_chunk_count}")
-    print(f"   protection_records: {result.protection_record_count}")
+    stats = result.stats
+    print(f"   objects_total: {stats.objects_total}")
+    print(f"   objects_written: {stats.objects_written}")
+    print(f"   objects_reused: {stats.objects_reused}")
+    print(f"   snapshots: {stats.snapshot_count}")
+    print(f"   known_chunks: {stats.known_chunk_count}")
+    print(f"   protection_records: {stats.protection_record_count}")
 
     pack_path = None
     pack_hash = None
@@ -150,7 +152,7 @@ def export_metadata_object_graph_after_metadata_change(
             )
             pack_path = pack_result.path
             pack_hash = pack_result.pack_hash
-            objects_packed = pack_result.objects_packed
+            objects_packed = pack_result.stats.objects_packed
         except Exception as exc:
             raise MetadataAutoExportError(
                 f"{context_label} completado y object graph actualizado, "
@@ -160,19 +162,36 @@ def export_metadata_object_graph_after_metadata_change(
         print(f"Metadata object pack creado tras {context_label.lower()}")
         print(f"   path: {pack_result.path}")
         print(f"   pack_hash: {pack_result.pack_hash}")
-        print(f"   objects_packed: {pack_result.objects_packed}")
+        print(f"   objects_packed: {pack_result.stats.objects_packed}")
 
     return MetadataObjectGraphAutoExportResult(
         root_dir=Path(result.root_dir),
         catalog_hash=result.catalog_hash,
         state_digest=result.state_digest,
-        objects_total=result.objects_total,
-        objects_written=result.objects_written,
-        objects_reused=result.objects_reused,
-        snapshot_count=result.snapshot_count,
-        known_chunk_count=result.known_chunk_count,
-        protection_record_count=result.protection_record_count,
+        objects_total=stats.objects_total,
+        objects_written=stats.objects_written,
+        objects_reused=stats.objects_reused,
+        snapshot_count=stats.snapshot_count,
+        known_chunk_count=stats.known_chunk_count,
+        protection_record_count=stats.protection_record_count,
         pack_path=Path(pack_path) if pack_path is not None else None,
         pack_hash=pack_hash,
         objects_packed=objects_packed,
     )
+
+
+def export_after_successful_metadata_change(
+    *,
+    metadata_changed: bool,
+    db_file: str,
+    settings: MetadataObjectGraphAutoExport | None,
+    context_label: str,
+) -> MetadataObjectGraphAutoExportResult | None:
+    if not metadata_changed or sys.exc_info()[0] is not None:
+        return None
+    return export_metadata_object_graph_after_metadata_change(
+        db_file=db_file,
+        settings=settings,
+        context_label=context_label,
+    )
+

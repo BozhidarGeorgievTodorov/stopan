@@ -23,6 +23,11 @@ from stopan.metadata.objects.models import (
     CatalogObject,
     ChunkListObject,
     ChunkRef,
+    ErasureDataPackChunkObject,
+    ErasureDataPackIndexObject,
+    ErasureDataPackRecordObject,
+    ErasureDataPackShardObject,
+    ErasureDataPackShardPlacementObject,
     FileObject,
     IndexShardRef,
     KnownChunkIndexObject,
@@ -72,9 +77,19 @@ class MetadataObjectGraphExporter:
         known_chunk_index_ref, known_chunk_count = self._export_known_chunk_index()
         protection_index_ref = None
         protection_record_count = 0
+        erasure_data_pack_index_ref = None
+        erasure_pack_count = 0
+        erasure_chunk_count = 0
+        erasure_shard_count = 0
 
         if include_protection:
             protection_index_ref, protection_record_count = self._export_protection_index()
+            (
+                erasure_data_pack_index_ref,
+                erasure_pack_count,
+                erasure_chunk_count,
+                erasure_shard_count,
+            ) = self._export_erasure_data_pack_index()
 
         catalog = CatalogObject(
             snapshot_index=snapshot_index_ref,
@@ -83,6 +98,10 @@ class MetadataObjectGraphExporter:
             snapshot_count=snapshot_count,
             known_chunk_count=known_chunk_count,
             protection_record_count=protection_record_count,
+            erasure_data_pack_index=erasure_data_pack_index_ref,
+            erasure_data_pack_count=erasure_pack_count,
+            erasure_data_pack_chunk_count=erasure_chunk_count,
+            erasure_data_pack_shard_count=erasure_shard_count,
         )
         catalog_ref = self._put(catalog)
         state_digest = canonical_state_digest(
@@ -112,14 +131,7 @@ class MetadataObjectGraphExporter:
         return ObjectRef(object_type=encoded.object_type, object_hash=encoded.object_hash)
 
     def _export_snapshot_index(self) -> tuple[ObjectRef, int]:
-        rows = self.db.conn.execute(
-            """
-            SELECT id, root_path, origin_node_id, created_at, total_size,
-                   total_files, status, error, uuid
-            FROM snapshots
-            ORDER BY created_at ASC, uuid ASC
-            """
-        ).fetchall()
+        rows = self.db.object_export_snapshot_rows()
 
         entries: list[SnapshotIndexEntry] = []
         for row in rows:
@@ -160,15 +172,7 @@ class MetadataObjectGraphExporter:
 
     def _export_snapshot_tree(self, snapshot_id: int) -> ObjectRef:
         root = _TreeNode()
-        rows = self.db.conn.execute(
-            """
-            SELECT id, path, item_type, size, mode, mtime, mtime_ns, uid, gid, recipe_id
-            FROM snapshot_items
-            WHERE snapshot_id = ?
-            ORDER BY path ASC
-            """,
-            (snapshot_id,),
-        ).fetchall()
+        rows = self.db.object_export_snapshot_item_rows(snapshot_id)
 
         for row in rows:
             path = row["path"]
@@ -260,26 +264,11 @@ class MetadataObjectGraphExporter:
             recipe_hash = self._recipe_hash_for_id(recipe_id)
             return cached, recipe_hash
 
-        recipe_row = self.db.conn.execute(
-            """
-            SELECT id, recipe_hash, chunk_count, total_size
-            FROM recipes
-            WHERE id = ?
-            """,
-            (recipe_id,),
-        ).fetchone()
+        recipe_row = self.db.object_export_recipe_row(recipe_id)
         if recipe_row is None:
             raise MetadataObjectError(f"snapshot item references missing recipe_id={recipe_id}")
 
-        chunk_rows = self.db.conn.execute(
-            """
-            SELECT chunk_order, chunk_hash, chunk_size
-            FROM recipe_chunks
-            WHERE recipe_id = ?
-            ORDER BY chunk_order ASC
-            """,
-            (recipe_id,),
-        ).fetchall()
+        chunk_rows = self.db.object_export_recipe_chunk_rows(recipe_id)
 
         chunk_refs = tuple(
             ChunkRef(
@@ -303,22 +292,13 @@ class MetadataObjectGraphExporter:
         return recipe_ref, recipe_hash
 
     def _recipe_hash_for_id(self, recipe_id: int) -> str:
-        row = self.db.conn.execute(
-            "SELECT recipe_hash FROM recipes WHERE id = ?",
-            (recipe_id,),
-        ).fetchone()
-        if row is None:
+        recipe_hash = self.db.object_export_recipe_hash(recipe_id)
+        if recipe_hash is None:
             raise MetadataObjectError(f"recipe_id cacheado no encontrado: {recipe_id}")
-        return row["recipe_hash"]
+        return recipe_hash
 
     def _export_known_chunk_index(self) -> tuple[ObjectRef, int]:
-        rows = self.db.conn.execute(
-            """
-            SELECT hash, size
-            FROM chunks
-            ORDER BY hash ASC
-            """
-        ).fetchall()
+        rows = self.db.object_export_known_chunk_rows()
 
         grouped: dict[str, list[KnownChunkRecord]] = defaultdict(list)
         for row in rows:
@@ -337,14 +317,7 @@ class MetadataObjectGraphExporter:
         return index_ref, len(rows)
 
     def _export_protection_index(self) -> tuple[ObjectRef, int]:
-        rows = self.db.conn.execute(
-            """
-            SELECT chunk_hash, desired_rf, protection_state, protected_remote_copies,
-                   placement_epoch, last_push_at, last_verify_at, last_error
-            FROM chunk_protection
-            ORDER BY chunk_hash ASC
-            """
-        ).fetchall()
+        rows = self.db.object_export_protection_rows()
 
         grouped: dict[str, list[ProtectionRecordObject]] = defaultdict(list)
         for row in rows:
@@ -370,3 +343,75 @@ class MetadataObjectGraphExporter:
 
         index_ref = self._put(ProtectionIndexObject(shards=tuple(shards), total_records=len(rows)))
         return index_ref, len(rows)
+
+
+    def _export_erasure_data_pack_index(self) -> tuple[ObjectRef, int, int, int]:
+        pack_rows = self.db.object_export_erasure_pack_rows()
+
+        chunk_rows = self.db.object_export_erasure_pack_chunk_rows()
+        shard_rows = self.db.object_export_erasure_pack_shard_rows()
+
+        chunks_by_pack: dict[str, list[ErasureDataPackChunkObject]] = defaultdict(list)
+        for row in chunk_rows:
+            chunks_by_pack[row["pack_hash"]].append(
+                ErasureDataPackChunkObject(
+                    chunk_hash=row["chunk_hash"],
+                    offset=row["chunk_offset"],
+                    length=row["chunk_length"],
+                    ordinal=row["chunk_ordinal"],
+                )
+            )
+
+        shards_by_pack: dict[str, list[ErasureDataPackShardPlacementObject]] = defaultdict(list)
+        for row in shard_rows:
+            shards_by_pack[row["pack_hash"]].append(
+                ErasureDataPackShardPlacementObject(
+                    shard_index=row["shard_index"],
+                    shard_hash=row["shard_hash"],
+                    node_id=row["node_id"],
+                    size=row["size"],
+                    protection_state=row["protection_state"],
+                    last_push_at=row["last_push_at"],
+                    last_verify_at=row["last_verify_at"],
+                    last_error=row["last_error"],
+                )
+            )
+
+        grouped: dict[str, list[ErasureDataPackRecordObject]] = defaultdict(list)
+        for row in pack_rows:
+            pack_hash = row["pack_hash"]
+            grouped[pack_hash[:2]].append(
+                ErasureDataPackRecordObject(
+                    pack_hash=pack_hash,
+                    codec=row["codec"],
+                    data_shards=row["data_shards"],
+                    parity_shards=row["parity_shards"],
+                    payload_size=row["payload_size"],
+                    padded_size=row["padded_size"],
+                    shard_size=row["shard_size"],
+                    protection_state=row["protection_state"],
+                    placement_epoch=row["placement_epoch"],
+                    created_at=row["created_at"],
+                    last_push_at=row["last_push_at"],
+                    last_verify_at=row["last_verify_at"],
+                    last_error=row["last_error"],
+                    chunks=tuple(chunks_by_pack[pack_hash]),
+                    shards=tuple(shards_by_pack[pack_hash]),
+                )
+            )
+
+        shards: list[IndexShardRef] = []
+        for prefix in sorted(grouped.keys()):
+            records = tuple(grouped[prefix])
+            shard_ref = self._put(ErasureDataPackShardObject(prefix=prefix, records=records))
+            shards.append(IndexShardRef(prefix=prefix, count=len(records), ref=shard_ref))
+
+        index_ref = self._put(
+            ErasureDataPackIndexObject(
+                shards=tuple(shards),
+                total_packs=len(pack_rows),
+                total_chunks=len(chunk_rows),
+                total_shards=len(shard_rows),
+            )
+        )
+        return index_ref, len(pack_rows), len(chunk_rows), len(shard_rows)

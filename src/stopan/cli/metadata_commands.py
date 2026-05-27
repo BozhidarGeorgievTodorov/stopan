@@ -33,10 +33,72 @@ from stopan.metadata.identity import (
 from stopan.metadata.objects.gc import MetadataObjectGarbageCollector
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
 from stopan.metadata.packs.object_pack import MetadataObjectPackService
+from stopan.metadata.database import MetadataDB
 
 
-_MAX_GC_ERRORS_TO_PRINT = 20
-_MAX_RECOVER_WARNINGS_TO_PRINT = 10
+def _configured_warning_limit(cfg) -> int:
+    return max(1, int(cfg.metadata.cli_warning_limit))
+
+
+def _print_limited_items(title: str, items, *, limit: int) -> None:
+    values = tuple(items or ())
+    if not values:
+        return
+    print(title)
+    for item in values[:limit]:
+        print(f"   - {item}")
+    if len(values) > limit:
+        print(f"   ... (+{len(values) - limit} más)")
+
+
+def _format_desired_copies(value: int | None) -> str:
+    return str(int(value)) if value is not None else "unknown"
+
+
+def _print_metadata_pack_sources(sources) -> None:
+    for source in sources:
+        node = source.node_id[:8] or "unknown"
+        stored_at = format_time(source.stored_at_unix) if source.stored_at_unix else "-"
+        print(f"         - {node}@{source.address} stored_at={stored_at} size={format_bytes(source.size_bytes)}")
+
+
+def _print_metadata_pack_discovery_entries(entries, *, show_sources: bool) -> None:
+    for entry in entries:
+        print(f"   pack_hash: {entry.pack_hash}")
+        print("      check: presence")
+        print(f"      presence_state: {entry.presence_state.value}")
+        print(f"      copies: {entry.copies_seen}/{_format_desired_copies(entry.desired_copies)}")
+        print(f"      desired_copies_source: {entry.desired_copies_source}")
+        if entry.desired_copies is None:
+            print("      note: no hay publicación local con copias esperadas; estado UNKNOWN")
+        print(f"      size: {format_bytes(entry.size_bytes)}")
+        if entry.newest_stored_at_unix:
+            print(f"      newest_stored_at: {format_time(entry.newest_stored_at_unix)}")
+        if entry.oldest_stored_at_unix and entry.oldest_stored_at_unix != entry.newest_stored_at_unix:
+            print(f"      oldest_stored_at: {format_time(entry.oldest_stored_at_unix)}")
+        if show_sources:
+            print("      sources:")
+            _print_metadata_pack_sources(entry.sources)
+
+
+def _print_metadata_pack_verification_results(results, *, show_sources: bool) -> None:
+    for result in results:
+        print(f"   pack_hash: {result.pack_hash}")
+        print(f"      check: {result.details.check_kind}")
+        print(f"      presence_state: {result.state.value}")
+        print(f"      copies: {result.copies_seen}/{_format_desired_copies(result.desired_copies)}")
+        print(f"      desired_copies_source: {result.details.desired_copies_source}")
+        if result.details.reason:
+            print(f"      reason: {result.details.reason}")
+        if result.size_bytes:
+            print(f"      size: {format_bytes(result.size_bytes)}")
+        if result.newest_stored_at_unix:
+            print(f"      newest_stored_at: {format_time(result.newest_stored_at_unix)}")
+        if result.oldest_stored_at_unix and result.oldest_stored_at_unix != result.newest_stored_at_unix:
+            print(f"      oldest_stored_at: {format_time(result.oldest_stored_at_unix)}")
+        if show_sources and result.sources:
+            print("      sources:")
+            _print_metadata_pack_sources(result.sources)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -70,6 +132,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"   distributed_pack_store_status: {dir_status(cfg.metadata.distributed_pack_store_dir)}")
     print(f"   pack_copies: {int(cfg.metadata.pack_copies)}")
     print(f"   strict_pack_copies: {bool(cfg.metadata.strict_pack_copies)}")
+    print(f"   pack_discovery_max_candidates: {int(cfg.metadata.pack_discovery_max_candidates)}")
+    print(f"   cli_warning_limit: {int(cfg.metadata.cli_warning_limit)}")
     print(f"   max_distributed_pack_bytes: {format_bytes(int(cfg.metadata.max_distributed_pack_bytes))}")
     print(f"   max_distributed_packs_per_owner: {int(cfg.metadata.max_distributed_packs_per_owner)}")
     print(f"   max_distributed_pack_bytes_per_owner: {format_bytes(int(cfg.metadata.max_distributed_pack_bytes_per_owner))}")
@@ -285,13 +349,14 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
     print(f"   object_store: {result.root_dir}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
-    print(f"   objects_total: {result.objects_total}")
-    print(f"   objects_written: {result.objects_written}")
-    print(f"   objects_reused: {result.objects_reused}")
-    print(f"   canonical_bytes: {format_bytes(result.total_canonical_bytes)}")
-    print(f"   snapshots: {result.snapshot_count}")
-    print(f"   known_chunks: {result.known_chunk_count}")
-    print(f"   protection_records: {result.protection_record_count}")
+    stats = result.stats
+    print(f"   objects_total: {stats.objects_total}")
+    print(f"   objects_written: {stats.objects_written}")
+    print(f"   objects_reused: {stats.objects_reused}")
+    print(f"   canonical_bytes: {format_bytes(stats.total_canonical_bytes)}")
+    print(f"   snapshots: {stats.snapshot_count}")
+    print(f"   known_chunks: {stats.known_chunk_count}")
+    print(f"   protection_records: {stats.protection_record_count}")
 
     if bool(args.pack):
         pack_service = object_pack_service_from_config(args, cfg)
@@ -310,14 +375,15 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
         print(f"   pack_created_at: {format_time(pack_result.pack_created_at_unix)}")
         print(f"   catalog_hash: {pack_result.catalog_hash}")
         print(f"   state_digest: {pack_result.state_digest}")
-        print(f"   objects_packed: {pack_result.objects_packed}")
-        print(f"   canonical_bytes: {format_bytes(pack_result.total_canonical_bytes)}")
-        print(f"   pack_plaintext: {format_bytes(pack_result.plaintext_bytes)}")
-        print(f"   compressed: {format_bytes(pack_result.compressed_bytes)}")
-        print(f"   ciphertext: {format_bytes(pack_result.ciphertext_bytes)}")
-        print(f"   snapshots: {pack_result.snapshot_count}")
-        print(f"   known_chunks: {pack_result.known_chunk_count}")
-        print(f"   protection_records: {pack_result.protection_record_count}")
+        pack_stats = pack_result.stats
+        print(f"   objects_packed: {pack_stats.objects_packed}")
+        print(f"   canonical_bytes: {format_bytes(pack_stats.total_canonical_bytes)}")
+        print(f"   pack_plaintext: {format_bytes(pack_stats.plaintext_bytes)}")
+        print(f"   compressed: {format_bytes(pack_stats.compressed_bytes)}")
+        print(f"   ciphertext: {format_bytes(pack_stats.ciphertext_bytes)}")
+        print(f"   snapshots: {pack_stats.snapshot_count}")
+        print(f"   known_chunks: {pack_stats.known_chunk_count}")
+        print(f"   protection_records: {pack_stats.protection_record_count}")
 
     return 0
 
@@ -341,18 +407,22 @@ def cmd_import_object_graph(args: argparse.Namespace) -> int:
     print(f"   object_store: {result.object_store_dir}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
-    print(f"   objects_read: {result.objects_read}")
-    print(f"   canonical_bytes: {format_bytes(result.total_canonical_bytes)}")
-    print(f"   snapshots_imported: {result.snapshots_imported}")
-    print(f"   complete_snapshots_imported: {result.complete_snapshots_imported}")
-    print(f"   items_imported: {result.items_imported}")
+    stats = result.stats
+    print(f"   objects_read: {stats.objects_read}")
+    print(f"   canonical_bytes: {format_bytes(stats.total_canonical_bytes)}")
+    print(f"   snapshots_imported: {stats.snapshots_imported}")
+    print(f"   complete_snapshots_imported: {stats.complete_snapshots_imported}")
+    print(f"   items_imported: {stats.items_imported}")
     print(
-        f"   recipes: imported={result.recipes_imported} "
-        f"reused={result.recipes_reused}"
+        f"   recipes: imported={stats.recipes_imported} "
+        f"reused={stats.recipes_reused}"
     )
-    print(f"   known_chunks_imported: {result.chunks_imported}")
-    print(f"   protection_records_imported: {result.protection_records_imported}")
-    print(f"   pending_protection_records_created: {result.pending_protection_records_created}")
+    print(f"   known_chunks_imported: {stats.chunks_imported}")
+    print(f"   protection_records_imported: {stats.protection_records_imported}")
+    print(f"   pending_protection_records_created: {stats.pending_protection_records_created}")
+    print(f"   erasure_data_packs_imported: {stats.erasure_data_packs_imported}")
+    print(f"   erasure_pack_chunks_imported: {stats.erasure_pack_chunks_imported}")
+    print(f"   erasure_pack_shards_imported: {stats.erasure_pack_shards_imported}")
     return 0
 
 
@@ -457,12 +527,7 @@ def cmd_gc_object_store(args: argparse.Namespace) -> int:
     print(f"   pack_files_unreadable: {result.pack_files_unreadable}")
     print(f"   pack_bytes_deleted: {format_bytes(result.pack_bytes_deleted)}")
 
-    if result.errors:
-        print("Errors / skipped items")
-        for error in result.errors[:_MAX_GC_ERRORS_TO_PRINT]:
-            print(f"   - {error}")
-        if len(result.errors) > _MAX_GC_ERRORS_TO_PRINT:
-            print(f"   ... (+{len(result.errors) - _MAX_GC_ERRORS_TO_PRINT} más)")
+    _print_limited_items("Errors / skipped items", result.errors, limit=_configured_warning_limit(cfg))
 
     if result.dry_run:
         print("\nDry-run activo: no se borró nada. Usa --apply para ejecutar el borrado real.")
@@ -476,15 +541,16 @@ def print_metadata_pack_push_result(result) -> int:
     print(f"   pack_hash: {result.pack_hash}")
     print(f"   pack_path: {result.pack_path}")
     print(f"   pack_size: {format_bytes(result.pack_size_bytes)}")
-    print(f"   pack_copies: {result.desired_rf}")
-    print(f"   remote_candidates: {result.remote_candidates}")
-    print(f"   attempted_targets: {result.attempted_targets}")
-    print(f"   successful_targets: {result.successful_targets}")
-    print(f"   stored_targets: {result.stored_targets}")
-    print(f"   already_present_targets: {result.already_present_targets}")
-    print(f"   failed_targets: {result.failed_targets}")
+    stats = result.stats
+    print(f"   pack_copies: {stats.desired_rf}")
+    print(f"   remote_candidates: {stats.remote_candidates}")
+    print(f"   attempted_targets: {stats.attempted_targets}")
+    print(f"   successful_targets: {stats.successful_targets}")
+    print(f"   stored_targets: {stats.stored_targets}")
+    print(f"   already_present_targets: {stats.already_present_targets}")
+    print(f"   failed_targets: {stats.failed_targets}")
 
-    if result.insufficient_remote_targets:
+    if stats.insufficient_remote_targets:
         print("   insufficient_remote_targets: true")
 
     if result.target_results:
@@ -581,6 +647,41 @@ def find_reusable_latest_object_pack(
     )
     return path, summary
 
+
+def metadata_pack_publication_map(cfg, *, owner_id: str) -> dict[str, int]:
+    db = MetadataDB(cfg.node.db_file)
+    try:
+        return {
+            record.pack_hash: int(record.desired_copies)
+            for record in db.get_metadata_pack_publications(owner_id=owner_id)
+        }
+    finally:
+        db.close()
+
+
+def record_metadata_pack_publication(cfg, result) -> None:
+    stats = result.stats
+    desired = int(stats.desired_rf)
+    if desired < 1:
+        return
+
+    db = MetadataDB(cfg.node.db_file)
+    try:
+        db.record_metadata_pack_publication(
+            owner_id=result.owner_id,
+            pack_hash=result.pack_hash,
+            desired_copies=desired,
+            pack_size_bytes=int(result.pack_size_bytes),
+            attempted_targets=int(stats.attempted_targets),
+            successful_targets=int(stats.successful_targets),
+            stored_targets=int(stats.stored_targets),
+            already_present_targets=int(stats.already_present_targets),
+            failed_targets=int(stats.failed_targets),
+        )
+    finally:
+        db.close()
+
+
 def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str | Path):
     owner_id = owner_id_from_args(args, cfg)
     identity_file = identity_file_from_args(args, cfg)
@@ -588,7 +689,7 @@ def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str 
 
     from stopan.metadata.packs.pusher import push_metadata_pack_to_network
 
-    return push_metadata_pack_to_network(
+    result = push_metadata_pack_to_network(
         pack_path=pack_path,
         owner_id=owner_id,
         identity_file=identity_file,
@@ -606,6 +707,8 @@ def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str 
         self_addr=cfg.node.advertise_addr,
         cluster_token=cfg.cluster.token,
     )
+    record_metadata_pack_publication(cfg, result)
+    return result
 
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -675,8 +778,9 @@ def cmd_push(args: argparse.Namespace) -> int:
     print(f"   pack_created_at: {format_time(pack_result.pack_created_at_unix)}")
     print(f"   catalog_hash: {pack_result.catalog_hash}")
     print(f"   state_digest: {pack_result.state_digest}")
-    print(f"   objects_packed: {pack_result.objects_packed}")
-    print(f"   ciphertext: {format_bytes(pack_result.ciphertext_bytes)}")
+    pack_stats = pack_result.stats
+    print(f"   objects_packed: {pack_stats.objects_packed}")
+    print(f"   ciphertext: {format_bytes(pack_stats.ciphertext_bytes)}")
 
     result = push_pack_result_from_path(args, cfg, pack_path=pack_result.path)
     return print_metadata_pack_push_result(result)
@@ -719,16 +823,20 @@ def cmd_recover(args: argparse.Namespace) -> int:
         ),
         download_dir=args.download_dir,
         pack_out=args.pack_out,
-        max_candidates=int(args.max_candidates),
+        max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
+        target_hash=args.target_hash,
     )
 
     print("Metadata recover remoto completado")
     print(f"   owner_id: {result.owner_id}")
     print(f"   object_store: {result.object_store_dir}")
-    print(f"   list_targets: {result.list_targets_succeeded}/{result.list_targets_attempted}")
-    print(f"   candidates_seen: {result.candidates_seen}")
-    print(f"   unique_packs_seen: {result.unique_packs_seen}")
-    print(f"   downloads_attempted: {result.downloads_attempted}")
+    stats = result.stats
+    print(f"   list_targets: {stats.list_targets_succeeded}/{stats.list_targets_attempted}")
+    print(f"   candidates_seen: {stats.candidates_seen}")
+    print(f"   unique_packs_seen: {stats.unique_packs_seen}")
+    print(f"   downloads_attempted: {stats.downloads_attempted}")
+    if args.target_hash:
+        print(f"   target_hash: {args.target_hash}")
     print(f"   recovered_pack_hash: {result.recovered_pack_hash}")
     print(f"   recovered_pack_path: {result.recovered_pack_path}")
     print(f"   recovered_from: {result.recovered_from_node_id[:8] or 'unknown'}@{result.recovered_from_address}")
@@ -747,39 +855,128 @@ def cmd_recover(args: argparse.Namespace) -> int:
     print(f"   protection_records: {result.pack_protection_record_count}")
 
     pack_import = result.pack_import_result
+    pack_import_stats = pack_import.stats
     print("Imported object pack")
-    print(f"   objects_total: {pack_import.objects_total}")
-    print(f"   objects_written: {pack_import.objects_written}")
-    print(f"   objects_reused: {pack_import.objects_reused}")
+    print(f"   objects_total: {pack_import_stats.objects_total}")
+    print(f"   objects_written: {pack_import_stats.objects_written}")
+    print(f"   objects_reused: {pack_import_stats.objects_reused}")
 
     if result.db_import_result is not None:
         db_import = result.db_import_result
         print("Rebuilt local metadata DB")
         print(f"   db_file: {db_import.db_file}")
-        print(f"   snapshots_imported: {db_import.snapshots_imported}")
-        print(f"   complete_snapshots_imported: {db_import.complete_snapshots_imported}")
-        print(f"   items_imported: {db_import.items_imported}")
-        print(f"   known_chunks_imported: {db_import.chunks_imported}")
-        print(f"   protection_records_imported: {db_import.protection_records_imported}")
-        print(f"   pending_protection_records_created: {db_import.pending_protection_records_created}")
+        db_import_stats = db_import.stats
+        print(f"   snapshots_imported: {db_import_stats.snapshots_imported}")
+        print(f"   complete_snapshots_imported: {db_import_stats.complete_snapshots_imported}")
+        print(f"   items_imported: {db_import_stats.items_imported}")
+        print(f"   known_chunks_imported: {db_import_stats.chunks_imported}")
+        print(f"   protection_records_imported: {db_import_stats.protection_records_imported}")
+        print(f"   pending_protection_records_created: {db_import_stats.pending_protection_records_created}")
+        print(f"   erasure_data_packs_imported: {db_import_stats.erasure_data_packs_imported}")
+        print(f"   erasure_pack_chunks_imported: {db_import_stats.erasure_pack_chunks_imported}")
+        print(f"   erasure_pack_shards_imported: {db_import_stats.erasure_pack_shards_imported}")
     else:
         print("Rebuilt local metadata DB: skipped (--no-import-db)")
 
-    if result.list_errors:
-        print("List warnings")
-        for item in result.list_errors[:_MAX_RECOVER_WARNINGS_TO_PRINT]:
-            print(f"   - {item}")
-        if len(result.list_errors) > _MAX_RECOVER_WARNINGS_TO_PRINT:
-            print(f"   ... (+{len(result.list_errors) - _MAX_RECOVER_WARNINGS_TO_PRINT} más)")
-
-    if result.download_errors:
-        print("Download warnings")
-        for item in result.download_errors[:_MAX_RECOVER_WARNINGS_TO_PRINT]:
-            print(f"   - {item}")
-        if len(result.download_errors) > _MAX_RECOVER_WARNINGS_TO_PRINT:
-            print(f"   ... (+{len(result.download_errors) - _MAX_RECOVER_WARNINGS_TO_PRINT} más)")
+    warning_limit = _configured_warning_limit(cfg)
+    _print_limited_items("List warnings", stats.list_errors, limit=warning_limit)
+    _print_limited_items("Download warnings", stats.download_errors, limit=warning_limit)
 
     return 0
+
+
+
+def cmd_discover_metadata_packs(args: argparse.Namespace) -> int:
+    cfg = load_runtime_config(args)
+    owner_id = owner_id_from_args(args, cfg)
+
+    from stopan.metadata.packs.discovery import discover_metadata_packs_from_network
+
+    desired_copies_by_hash = metadata_pack_publication_map(cfg, owner_id=owner_id)
+
+    result = discover_metadata_packs_from_network(
+        owner_id=owner_id,
+        membership_seed=args.membership_seed or first_seed(cfg),
+        self_addr=cfg.node.advertise_addr,
+        cluster_token=cfg.cluster.token,
+        membership_timeout_s=float(cfg.membership.rpc_timeout_s),
+        rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
+        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
+        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+        grpc_keepalive_time_ms=int(cfg.grpc.keepalive_time_ms),
+        grpc_keepalive_timeout_ms=int(cfg.grpc.keepalive_timeout_ms),
+        grpc_keepalive_permit_without_calls=bool(cfg.grpc.keepalive_permit_without_calls),
+        desired_copies_by_hash=desired_copies_by_hash,
+        max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
+    )
+
+    stats = result.stats
+    print("Metadata packs distribuidos")
+    print(f"   owner_id: {result.owner_id}")
+    print(f"   list_targets: {stats.list_targets_succeeded}/{stats.list_targets_attempted}")
+    print(f"   sources_seen: {stats.sources_seen}")
+    print(f"   unique_packs_seen: {stats.unique_packs_seen}")
+    print(f"   publications_known: {stats.publications_known}")
+
+    if not result.entries:
+        print("   packs: (none)")
+    else:
+        print("Packs")
+        _print_metadata_pack_discovery_entries(result.entries, show_sources=bool(args.show_sources))
+
+    _print_limited_items("List warnings", stats.list_errors, limit=_configured_warning_limit(cfg))
+
+    return 0
+
+
+def cmd_verify_metadata_packs(args: argparse.Namespace) -> int:
+    cfg = load_runtime_config(args)
+    owner_id = owner_id_from_args(args, cfg)
+
+    from stopan.metadata.packs.verifier import verify_metadata_packs_from_network
+
+    desired_copies_by_hash = metadata_pack_publication_map(cfg, owner_id=owner_id)
+
+    result = verify_metadata_packs_from_network(
+        owner_id=owner_id,
+        membership_seed=args.membership_seed or first_seed(cfg),
+        self_addr=cfg.node.advertise_addr,
+        cluster_token=cfg.cluster.token,
+        membership_timeout_s=float(cfg.membership.rpc_timeout_s),
+        rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
+        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
+        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+        grpc_keepalive_time_ms=int(cfg.grpc.keepalive_time_ms),
+        grpc_keepalive_timeout_ms=int(cfg.grpc.keepalive_timeout_ms),
+        grpc_keepalive_permit_without_calls=bool(cfg.grpc.keepalive_permit_without_calls),
+        desired_copies_by_hash=desired_copies_by_hash,
+        pack_hash=args.pack_hash,
+        verify_all=bool(args.all),
+        max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
+    )
+
+    stats = result.stats
+    print("Verificación de metadata packs distribuidos")
+    print(f"   owner_id: {result.owner_id}")
+    print(f"   list_targets: {stats.list_targets_succeeded}/{stats.list_targets_attempted}")
+    print(f"   sources_seen: {stats.sources_seen}")
+    print(f"   candidates_checked: {stats.candidates_checked}")
+    print(f"   publications_known: {stats.publications_known}")
+    print("   check: presence")
+    print(f"   presence_verified: {stats.verified}")
+    print(f"   presence_degraded: {stats.degraded}")
+    print(f"   presence_failed: {stats.failed}")
+    print(f"   presence_unknown: {stats.unknown}")
+
+    if not result.results:
+        print("   packs: (none)")
+    else:
+        print("Packs")
+        _print_metadata_pack_verification_results(result.results, show_sources=bool(args.show_sources))
+
+    _print_limited_items("List warnings", stats.list_errors, limit=_configured_warning_limit(cfg))
+
+    return 0 if result.results and stats.failed == 0 else 1
 
 
 def cmd_pack_object_graph(args: argparse.Namespace) -> int:
@@ -799,14 +996,15 @@ def cmd_pack_object_graph(args: argparse.Namespace) -> int:
     print(f"   pack_hash: {result.pack_hash}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
-    print(f"   objects_packed: {result.objects_packed}")
-    print(f"   canonical_bytes: {format_bytes(result.total_canonical_bytes)}")
-    print(f"   pack_plaintext: {format_bytes(result.plaintext_bytes)}")
-    print(f"   compressed: {format_bytes(result.compressed_bytes)}")
-    print(f"   ciphertext: {format_bytes(result.ciphertext_bytes)}")
-    print(f"   snapshots: {result.snapshot_count}")
-    print(f"   known_chunks: {result.known_chunk_count}")
-    print(f"   protection_records: {result.protection_record_count}")
+    stats = result.stats
+    print(f"   objects_packed: {stats.objects_packed}")
+    print(f"   canonical_bytes: {format_bytes(stats.total_canonical_bytes)}")
+    print(f"   pack_plaintext: {format_bytes(stats.plaintext_bytes)}")
+    print(f"   compressed: {format_bytes(stats.compressed_bytes)}")
+    print(f"   ciphertext: {format_bytes(stats.ciphertext_bytes)}")
+    print(f"   snapshots: {stats.snapshot_count}")
+    print(f"   known_chunks: {stats.known_chunk_count}")
+    print(f"   protection_records: {stats.protection_record_count}")
     return 0
 
 
@@ -867,11 +1065,12 @@ def cmd_import_object_pack(args: argparse.Namespace) -> int:
     print(f"   object_store: {result.object_store_dir}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
-    print(f"   objects_total: {result.objects_total}")
-    print(f"   objects_written: {result.objects_written}")
-    print(f"   objects_reused: {result.objects_reused}")
-    print(f"   canonical_bytes: {format_bytes(result.total_canonical_bytes)}")
-    print(f"   snapshots: {result.snapshot_count}")
-    print(f"   known_chunks: {result.known_chunk_count}")
-    print(f"   protection_records: {result.protection_record_count}")
+    stats = result.stats
+    print(f"   objects_total: {stats.objects_total}")
+    print(f"   objects_written: {stats.objects_written}")
+    print(f"   objects_reused: {stats.objects_reused}")
+    print(f"   canonical_bytes: {format_bytes(stats.total_canonical_bytes)}")
+    print(f"   snapshots: {stats.snapshot_count}")
+    print(f"   known_chunks: {stats.known_chunk_count}")
+    print(f"   protection_records: {stats.protection_record_count}")
     return 0

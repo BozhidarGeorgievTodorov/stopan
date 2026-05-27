@@ -10,19 +10,18 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterable
-
-import blake3
-import grpc
 
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.signatures import sign_metadata_pack_hash
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
-from stopan.placement.cluster_resolver import require_cluster_view
+from stopan.metadata.packs.remote import (
+    MetadataPackTargetResult,
+    select_metadata_pack_targets,
+    store_metadata_pack_on_target,
+)
+from stopan.cluster.resolver import require_cluster_view
 from stopan.protection.policy import normalize_remote_rf
-from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
-from stopan.rpc.options import grpc_channel_options
 
 
 class MetadataPackPushError(StopanNetworkError, RuntimeError):
@@ -30,41 +29,7 @@ class MetadataPackPushError(StopanNetworkError, RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class MetadataPackTarget:
-    node_id: str
-    address: str
-
-
-@dataclass(frozen=True, slots=True)
-class MetadataPackTargetResult:
-    node_id: str
-    address: str
-    status: int
-    detail: str
-    size_bytes: int = 0
-    stored_at_unix: float = 0.0
-    public_key_b64: str = ""
-    signature_b64: str = ""
-
-    @property
-    def stored(self) -> bool:
-        return self.status == p2p_storage_pb2.METADATA_PACK_STORE_STATUS_STORED
-
-    @property
-    def already_present(self) -> bool:
-        return self.status == p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ALREADY_PRESENT
-
-    @property
-    def success(self) -> bool:
-        return self.stored or self.already_present
-
-
-@dataclass(frozen=True, slots=True)
-class MetadataPackPushResult:
-    owner_id: str
-    pack_hash: str
-    pack_path: Path
-    pack_size_bytes: int
+class MetadataPackPushStats:
     desired_rf: int
     remote_candidates: int
     attempted_targets: int
@@ -73,147 +38,24 @@ class MetadataPackPushResult:
     already_present_targets: int
     failed_targets: int
     insufficient_remote_targets: bool
-    target_results: tuple[MetadataPackTargetResult, ...]
 
     @property
     def protected(self) -> bool:
         return self.successful_targets >= self.desired_rf
 
 
-def _channel_options(
-    *,
-    max_message_bytes: int,
-    grpc_keepalive_time_ms: int,
-    grpc_keepalive_timeout_ms: int,
-    grpc_keepalive_permit_without_calls: bool,
-) -> list[tuple[str, int]]:
-    return grpc_channel_options(
-        max_message_bytes,
-        keepalive_time_ms=grpc_keepalive_time_ms,
-        keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-        keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-    )
+@dataclass(frozen=True, slots=True)
+class MetadataPackPushResult:
+    owner_id: str
+    pack_hash: str
+    pack_path: Path
+    pack_size_bytes: int
+    stats: MetadataPackPushStats
+    target_results: tuple[MetadataPackTargetResult, ...]
 
-
-def _hrw_score(*, owner_id: str, pack_hash: str, cluster_token: str, node_id: str, address: str) -> int:
-    payload = "\x00".join(
-        [
-            "stopan.metadata-pack.hrw.v1",
-            str(cluster_token or ""),
-            owner_id,
-            pack_hash,
-            node_id,
-            address,
-        ]
-    ).encode("utf-8")
-    return int.from_bytes(blake3.blake3(payload).digest(), "big", signed=False)
-
-
-def _select_targets(
-    members: Iterable[object],
-    *,
-    owner_id: str,
-    pack_hash: str,
-    cluster_token: str,
-    rf: int,
-    self_addr: str,
-    self_node_id: str | None,
-) -> list[MetadataPackTarget]:
-    candidates: list[MetadataPackTarget] = []
-    normalized_self_addr = str(self_addr or "").strip()
-    normalized_self_node_id = str(self_node_id or "").strip()
-
-    for member in members:
-        node_id = str(getattr(member, "node_id", "") or "").strip()
-        address = str(getattr(member, "address", "") or "").strip()
-        if not address:
-            continue
-        if normalized_self_addr and address == normalized_self_addr:
-            continue
-        if normalized_self_node_id and node_id == normalized_self_node_id:
-            continue
-        candidates.append(MetadataPackTarget(node_id=node_id, address=address))
-
-    candidates.sort(
-        key=lambda target: _hrw_score(
-            owner_id=owner_id,
-            pack_hash=pack_hash,
-            cluster_token=cluster_token,
-            node_id=target.node_id,
-            address=target.address,
-        ),
-        reverse=True,
-    )
-    return candidates[: max(0, int(rf))]
-
-
-def _store_pack_on_target(
-    target: MetadataPackTarget,
-    *,
-    owner_id: str,
-    pack_hash: str,
-    pack_data: bytes,
-    public_key_b64: str,
-    signature_b64: str,
-    cluster_token: str,
-    timeout_s: float,
-    max_message_bytes: int,
-    grpc_keepalive_time_ms: int,
-    grpc_keepalive_timeout_ms: int,
-    grpc_keepalive_permit_without_calls: bool,
-) -> MetadataPackTargetResult:
-    channel = grpc.insecure_channel(
-        target.address,
-        options=_channel_options(
-            max_message_bytes=max_message_bytes,
-            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-        ),
-    )
-    try:
-        stub = p2p_storage_pb2_grpc.MetadataPackServiceStub(channel)
-        response = stub.StoreMetadataPack(
-            p2p_storage_pb2.StoreMetadataPackRequest(
-                cluster_token=str(cluster_token or ""),
-                owner_id=owner_id,
-                pack_hash=pack_hash,
-                pack_data=pack_data,
-                public_key_b64=public_key_b64,
-                signature_b64=signature_b64,
-            ),
-            timeout=float(timeout_s),
-        )
-        return MetadataPackTargetResult(
-            node_id=target.node_id,
-            address=target.address,
-            status=int(response.status),
-            detail=str(response.detail or ""),
-            size_bytes=int(response.size_bytes),
-            stored_at_unix=float(response.stored_at_unix),
-            public_key_b64=str(getattr(response, "public_key_b64", "") or ""),
-            signature_b64=str(getattr(response, "signature_b64", "") or ""),
-        )
-    except grpc.RpcError as exc:
-        detail = exc.details() or str(exc)
-        return MetadataPackTargetResult(
-            node_id=target.node_id,
-            address=target.address,
-            status=p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ERROR,
-            detail=detail,
-        )
-    except Exception as exc:
-        return MetadataPackTargetResult(
-            node_id=target.node_id,
-            address=target.address,
-            status=p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ERROR,
-            detail=str(exc),
-        )
-    finally:
-        try:
-            channel.close()
-        except Exception:
-            pass
+    @property
+    def protected(self) -> bool:
+        return self.stats.protected
 
 
 def push_metadata_pack_to_network(
@@ -268,14 +110,16 @@ def push_metadata_pack_to_network(
             pack_hash=pack_hash,
             pack_path=path,
             pack_size_bytes=len(pack_data),
-            desired_rf=desired_rf,
-            remote_candidates=0,
-            attempted_targets=0,
-            successful_targets=0,
-            stored_targets=0,
-            already_present_targets=0,
-            failed_targets=0,
-            insufficient_remote_targets=False,
+            stats=MetadataPackPushStats(
+                desired_rf=desired_rf,
+                remote_candidates=0,
+                attempted_targets=0,
+                successful_targets=0,
+                stored_targets=0,
+                already_present_targets=0,
+                failed_targets=0,
+                insufficient_remote_targets=False,
+            ),
             target_results=(),
         )
 
@@ -311,18 +155,20 @@ def push_metadata_pack_to_network(
             pack_hash=pack_hash,
             pack_path=path,
             pack_size_bytes=len(pack_data),
-            desired_rf=desired_rf,
-            remote_candidates=remote_candidate_count,
-            attempted_targets=0,
-            successful_targets=0,
-            stored_targets=0,
-            already_present_targets=0,
-            failed_targets=0,
-            insufficient_remote_targets=True,
+            stats=MetadataPackPushStats(
+                desired_rf=desired_rf,
+                remote_candidates=remote_candidate_count,
+                attempted_targets=0,
+                successful_targets=0,
+                stored_targets=0,
+                already_present_targets=0,
+                failed_targets=0,
+                insufficient_remote_targets=True,
+            ),
             target_results=(),
         )
 
-    targets = _select_targets(
+    targets = select_metadata_pack_targets(
         remote_candidates,
         owner_id=owner,
         pack_hash=pack_hash,
@@ -337,7 +183,7 @@ def push_metadata_pack_to_network(
         with ThreadPoolExecutor(max_workers=min(parallelism, len(targets))) as executor:
             futures = [
                 executor.submit(
-                    _store_pack_on_target,
+                    store_metadata_pack_on_target,
                     target,
                     owner_id=owner,
                     pack_hash=pack_hash,
@@ -367,13 +213,15 @@ def push_metadata_pack_to_network(
         pack_hash=pack_hash,
         pack_path=path,
         pack_size_bytes=len(pack_data),
-        desired_rf=desired_rf,
-        remote_candidates=remote_candidate_count,
-        attempted_targets=len(results),
-        successful_targets=successful,
-        stored_targets=stored,
-        already_present_targets=already_present,
-        failed_targets=failed,
-        insufficient_remote_targets=False,
+        stats=MetadataPackPushStats(
+            desired_rf=desired_rf,
+            remote_candidates=remote_candidate_count,
+            attempted_targets=len(results),
+            successful_targets=successful,
+            stored_targets=stored,
+            already_present_targets=already_present,
+            failed_targets=failed,
+            insufficient_remote_targets=False,
+        ),
         target_results=tuple(results),
     )

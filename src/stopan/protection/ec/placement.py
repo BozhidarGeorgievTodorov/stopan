@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stopan.placement.cluster_view import ClusterMember, ClusterView
+from stopan.cluster.view import ClusterMember, ClusterView
 
 from .models import (
     ErasureCodingConfigError,
@@ -18,6 +18,7 @@ from .models import (
     ErasureCodingNetworkError,
     ErasureSpec,
     require_hash64,
+    require_non_negative_int,
 )
 
 
@@ -30,7 +31,7 @@ class DataPackShardPlacement:
 
     def __post_init__(self) -> None:
         pack_hash = require_hash64("pack_hash", self.pack_hash)
-        shard_index = _require_non_negative_int("shard_index", self.shard_index)
+        shard_index = require_non_negative_int("shard_index", self.shard_index)
         node_id = str(self.node_id or "").strip()
         address = str(self.address or "").strip()
 
@@ -111,10 +112,3 @@ def _require_distinct_nodes(placements: tuple[DataPackShardPlacement, ...]) -> N
     if len(node_ids) != len(set(node_ids)):
         raise ErasureCodingError("los shards EC de un pack deben ir a nodos distintos")
 
-
-def _require_non_negative_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ErasureCodingError(f"{name} debe ser int; recibido {type(value).__name__}")
-    if value < 0:
-        raise ErasureCodingError(f"{name} debe ser >= 0; recibido {value}")
-    return value

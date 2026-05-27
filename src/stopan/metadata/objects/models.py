@@ -46,6 +46,8 @@ class MetadataObjectType(str, Enum):
     KNOWN_CHUNK_SHARD = "known_chunk_shard"
     PROTECTION_INDEX = "protection_index"
     PROTECTION_SHARD = "protection_shard"
+    ERASURE_DATA_PACK_INDEX = "erasure_data_pack_index"
+    ERASURE_DATA_PACK_SHARD = "erasure_data_pack_shard"
 
 
 def _require_str(name: str, value: object, *, allow_empty: bool = False) -> str:
@@ -515,6 +517,195 @@ class ProtectionIndexObject:
 
 
 @dataclass(frozen=True, slots=True)
+class ErasureDataPackChunkObject:
+    chunk_hash: str
+    offset: int
+    length: int
+    ordinal: int
+
+    def __post_init__(self) -> None:
+        _require_hash64("erasure_pack_chunk.chunk_hash", self.chunk_hash)
+        _require_int("erasure_pack_chunk.offset", self.offset, min_value=0)
+        _require_int("erasure_pack_chunk.length", self.length, min_value=1)
+        _require_int("erasure_pack_chunk.ordinal", self.ordinal, min_value=0)
+
+
+@dataclass(frozen=True, slots=True)
+class ErasureDataPackShardPlacementObject:
+    shard_index: int
+    shard_hash: str
+    node_id: str
+    size: int
+    protection_state: str
+    last_push_at: float | None
+    last_verify_at: float | None
+    last_error: str | None
+
+    def __post_init__(self) -> None:
+        _require_int("erasure_pack_shard.shard_index", self.shard_index, min_value=0)
+        _require_hash64("erasure_pack_shard.shard_hash", self.shard_hash)
+        _require_node_id("erasure_pack_shard.node_id", self.node_id)
+        _require_int("erasure_pack_shard.size", self.size, min_value=1)
+        _require_str("erasure_pack_shard.protection_state", self.protection_state)
+        if self.protection_state not in _VALID_PROTECTION_STATES:
+            raise MetadataObjectError(f"estado de erasure pack shard inválido: {self.protection_state!r}")
+        if self.last_push_at is not None:
+            _require_number("erasure_pack_shard.last_push_at", self.last_push_at, min_value=0.0)
+        if self.last_verify_at is not None:
+            _require_number("erasure_pack_shard.last_verify_at", self.last_verify_at, min_value=0.0)
+        if self.last_error is not None:
+            _require_str("erasure_pack_shard.last_error", self.last_error, allow_empty=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ErasureDataPackRecordObject:
+    pack_hash: str
+    codec: str
+    data_shards: int
+    parity_shards: int
+    payload_size: int
+    padded_size: int
+    shard_size: int
+    protection_state: str
+    placement_epoch: str | None
+    created_at: float
+    last_push_at: float | None
+    last_verify_at: float | None
+    last_error: str | None
+    chunks: tuple[ErasureDataPackChunkObject, ...]
+    shards: tuple[ErasureDataPackShardPlacementObject, ...]
+
+    def __post_init__(self) -> None:
+        _require_hash64("erasure_data_pack.pack_hash", self.pack_hash)
+        _require_str("erasure_data_pack.codec", self.codec)
+        _require_int("erasure_data_pack.data_shards", self.data_shards, min_value=1)
+        _require_int("erasure_data_pack.parity_shards", self.parity_shards, min_value=0)
+        _require_int("erasure_data_pack.payload_size", self.payload_size, min_value=0)
+        _require_int("erasure_data_pack.padded_size", self.padded_size, min_value=0)
+        _require_int("erasure_data_pack.shard_size", self.shard_size, min_value=1)
+        if self.padded_size != self.shard_size * self.data_shards:
+            raise MetadataObjectError("erasure_data_pack.padded_size debe coincidir con shard_size * data_shards")
+        if self.payload_size > self.padded_size:
+            raise MetadataObjectError("erasure_data_pack.payload_size no puede ser mayor que padded_size")
+        _require_str("erasure_data_pack.protection_state", self.protection_state)
+        if self.protection_state not in _VALID_PROTECTION_STATES:
+            raise MetadataObjectError(f"estado de erasure data pack inválido: {self.protection_state!r}")
+        if self.placement_epoch is not None:
+            _require_str("erasure_data_pack.placement_epoch", self.placement_epoch, allow_empty=True)
+        _require_number("erasure_data_pack.created_at", self.created_at, min_value=0.0)
+        if self.last_push_at is not None:
+            _require_number("erasure_data_pack.last_push_at", self.last_push_at, min_value=0.0)
+        if self.last_verify_at is not None:
+            _require_number("erasure_data_pack.last_verify_at", self.last_verify_at, min_value=0.0)
+        if self.last_error is not None:
+            _require_str("erasure_data_pack.last_error", self.last_error, allow_empty=True)
+
+        chunks = _as_tuple("erasure_data_pack.chunks", self.chunks)
+        shards = _as_tuple("erasure_data_pack.shards", self.shards)
+        object.__setattr__(self, "chunks", chunks)
+        object.__setattr__(self, "shards", shards)
+        if not chunks:
+            raise MetadataObjectError("erasure_data_pack debe contener al menos un chunk")
+
+        previous_end = 0
+        seen_chunks: set[str] = set()
+        for expected_ordinal, chunk in enumerate(chunks):
+            if not isinstance(chunk, ErasureDataPackChunkObject):
+                raise MetadataObjectError("erasure_data_pack.chunks debe contener ErasureDataPackChunkObject")
+            if chunk.chunk_hash in seen_chunks:
+                raise MetadataObjectError(f"chunk EC duplicado: {chunk.chunk_hash}")
+            if chunk.ordinal != expected_ordinal:
+                raise MetadataObjectError("chunks de erasure_data_pack deben tener ordinales consecutivos desde 0")
+            if chunk.offset != previous_end:
+                raise MetadataObjectError("chunks de erasure_data_pack deben cubrir el payload de forma contigua")
+            previous_end = chunk.offset + chunk.length
+            seen_chunks.add(chunk.chunk_hash)
+        if previous_end != self.payload_size:
+            raise MetadataObjectError("chunks de erasure_data_pack no cubren exactamente payload_size")
+
+        expected_indexes = list(range(self.data_shards + self.parity_shards))
+        indexes: list[int] = []
+        node_ids: set[str] = set()
+        for shard in shards:
+            if not isinstance(shard, ErasureDataPackShardPlacementObject):
+                raise MetadataObjectError("erasure_data_pack.shards debe contener ErasureDataPackShardPlacementObject")
+            indexes.append(shard.shard_index)
+            if shard.node_id in node_ids:
+                raise MetadataObjectError("shards de erasure_data_pack deben estar en nodos distintos")
+            node_ids.add(shard.node_id)
+        if indexes != expected_indexes:
+            raise MetadataObjectError("shards de erasure_data_pack deben cubrir todos los índices esperados")
+
+
+@dataclass(frozen=True, slots=True)
+class ErasureDataPackShardObject:
+    prefix: str
+    records: tuple[ErasureDataPackRecordObject, ...]
+
+    object_type: MetadataObjectType = field(
+        init=False,
+        default=MetadataObjectType.ERASURE_DATA_PACK_SHARD,
+    )
+
+    def __post_init__(self) -> None:
+        _require_str("erasure_data_pack_shard.prefix", self.prefix)
+        if not re.fullmatch(r"[0-9a-f]{2}", self.prefix):
+            raise MetadataObjectError("erasure_data_pack_shard.prefix debe tener dos caracteres hexadecimales lowercase")
+        records = _as_tuple("erasure_data_pack_shard.records", self.records)
+        object.__setattr__(self, "records", records)
+        seen = set()
+        previous_hash: str | None = None
+        for record in records:
+            if not isinstance(record, ErasureDataPackRecordObject):
+                raise MetadataObjectError("erasure_data_pack_shard.records debe contener ErasureDataPackRecordObject")
+            if not record.pack_hash.startswith(self.prefix):
+                raise MetadataObjectError("erasure_data_pack_shard contiene un record fuera de su prefix")
+            if record.pack_hash in seen:
+                raise MetadataObjectError(f"erasure data pack duplicado: {record.pack_hash}")
+            if previous_hash is not None and record.pack_hash < previous_hash:
+                raise MetadataObjectError("erasure_data_pack_shard.records debe estar ordenado por pack_hash")
+            seen.add(record.pack_hash)
+            previous_hash = record.pack_hash
+
+
+@dataclass(frozen=True, slots=True)
+class ErasureDataPackIndexObject:
+    shards: tuple[IndexShardRef, ...]
+    total_packs: int
+    total_chunks: int
+    total_shards: int
+
+    object_type: MetadataObjectType = field(
+        init=False,
+        default=MetadataObjectType.ERASURE_DATA_PACK_INDEX,
+    )
+
+    def __post_init__(self) -> None:
+        shards = _as_tuple("erasure_data_pack_index.shards", self.shards)
+        object.__setattr__(self, "shards", shards)
+        _require_int("erasure_data_pack_index.total_packs", self.total_packs, min_value=0)
+        _require_int("erasure_data_pack_index.total_chunks", self.total_chunks, min_value=0)
+        _require_int("erasure_data_pack_index.total_shards", self.total_shards, min_value=0)
+        seen = set()
+        previous_prefix: str | None = None
+        total = 0
+        for shard in shards:
+            if not isinstance(shard, IndexShardRef):
+                raise MetadataObjectError("erasure_data_pack_index.shards debe contener IndexShardRef")
+            if shard.ref.object_type != MetadataObjectType.ERASURE_DATA_PACK_SHARD:
+                raise MetadataObjectError("erasure_data_pack_index shard ref debe referenciar erasure_data_pack_shard")
+            if shard.prefix in seen:
+                raise MetadataObjectError(f"prefix de erasure_data_pack_index duplicado: {shard.prefix}")
+            if previous_prefix is not None and shard.prefix < previous_prefix:
+                raise MetadataObjectError("erasure_data_pack_index.shards debe estar ordenado por prefix")
+            seen.add(shard.prefix)
+            previous_prefix = shard.prefix
+            total += shard.count
+        if total != self.total_packs:
+            raise MetadataObjectError("erasure_data_pack_index.total_packs no coincide con los contadores de shards")
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogObject:
     snapshot_index: ObjectRef
     known_chunk_index: ObjectRef
@@ -522,6 +713,10 @@ class CatalogObject:
     snapshot_count: int
     known_chunk_count: int
     protection_record_count: int
+    erasure_data_pack_index: ObjectRef | None = None
+    erasure_data_pack_count: int = 0
+    erasure_data_pack_chunk_count: int = 0
+    erasure_data_pack_shard_count: int = 0
 
     object_type: MetadataObjectType = field(init=False, default=MetadataObjectType.CATALOG)
 
@@ -542,6 +737,14 @@ class CatalogObject:
         _require_int("catalog.snapshot_count", self.snapshot_count, min_value=0)
         _require_int("catalog.known_chunk_count", self.known_chunk_count, min_value=0)
         _require_int("catalog.protection_record_count", self.protection_record_count, min_value=0)
+        if self.erasure_data_pack_index is not None:
+            if not isinstance(self.erasure_data_pack_index, ObjectRef):
+                raise MetadataObjectError("catalog.erasure_data_pack_index debe ser ObjectRef")
+            if self.erasure_data_pack_index.object_type != MetadataObjectType.ERASURE_DATA_PACK_INDEX:
+                raise MetadataObjectError("catalog.erasure_data_pack_index debe referenciar erasure_data_pack_index")
+        _require_int("catalog.erasure_data_pack_count", self.erasure_data_pack_count, min_value=0)
+        _require_int("catalog.erasure_data_pack_chunk_count", self.erasure_data_pack_chunk_count, min_value=0)
+        _require_int("catalog.erasure_data_pack_shard_count", self.erasure_data_pack_shard_count, min_value=0)
 
 
 MetadataPlainObject = (
@@ -556,4 +759,6 @@ MetadataPlainObject = (
     | KnownChunkShardObject
     | ProtectionIndexObject
     | ProtectionShardObject
+    | ErasureDataPackIndexObject
+    | ErasureDataPackShardObject
 )

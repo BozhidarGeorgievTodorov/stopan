@@ -26,6 +26,7 @@ from stopan.restore.remote_client import RemoteStorageClientPool
 from stopan.protection.policy import normalize_remote_rf
 from stopan.rpc.errors import format_rpc_error, is_rpc_error
 from stopan.restore.errors import ChunkUnavailableError, RestoreDataError
+from stopan.restore.models import RestoreRunStats
 
 
 class ChunkFetchService:
@@ -64,6 +65,7 @@ class ChunkFetchService:
         self.max_chunk_size = max(int(max_chunk_size), 1)
         self.ec_recovery_service = ec_recovery_service
         self.remote_chunk_recovery = bool(remote_chunk_recovery)
+        self.stats = RestoreRunStats()
 
     def fetch_many_raw_chunks(
         self,
@@ -78,6 +80,7 @@ class ChunkFetchService:
         pudieron resolver. No lanza por fallo individual de chunk.
         """
         ordered_hashes = list(chunk_hashes)
+        self.stats.chunks_requested += len(ordered_hashes)
         results: dict[str, bytes | Exception] = {}
         missing_hashes: list[str] = []
         local_errors: dict[str, list[str]] = {}
@@ -85,6 +88,7 @@ class ChunkFetchService:
         for chunk_hash in ordered_hashes:
             try:
                 results[chunk_hash] = self.repo.get(chunk_hash)
+                self.stats.chunks_from_local_cas += 1
                 continue
             except FileNotFoundError:
                 pass
@@ -106,6 +110,7 @@ class ChunkFetchService:
                             f"CAS local cache desde P2P: {exc}"
                         )
                     results[chunk_hash] = raw_data
+                    self.stats.chunks_from_local_p2p_cas += 1
                     continue
                 except FileNotFoundError:
                     pass
@@ -134,6 +139,10 @@ class ChunkFetchService:
                     target_parallelism=max(int(target_parallelism), 1),
                 )
             results.update(remote_results)
+            self.stats.chunks_failed += sum(
+                1 for chunk_hash in missing_hashes
+                if isinstance(remote_results.get(chunk_hash), Exception)
+            )
 
         return results
 
@@ -182,6 +191,7 @@ class ChunkFetchService:
                 continue
             if not isinstance(value, Exception):
                 remote_results[chunk_hash] = value
+                self.stats.chunks_from_ec += 1
                 continue
 
             previous = remote_results.get(chunk_hash)
@@ -189,6 +199,7 @@ class ChunkFetchService:
                 remote_results[chunk_hash] = ChunkUnavailableError(
                     f"{previous} | EC: {value}"
                 )
+                self.stats.ec_recovery_failures += 1
             else:
                 remote_results[chunk_hash] = value
 
@@ -348,6 +359,7 @@ class ChunkFetchService:
                             error_map[chunk_hash].append(
                                 f"{member.address}: chunk corrupto: {exc}"
                             )
+                            self.stats.remote_chunks_corrupt += 1
                             continue
 
                         try:
@@ -360,6 +372,7 @@ class ChunkFetchService:
                             )
 
                         result_map[chunk_hash] = raw_data
+                        self.stats.chunks_from_remote_replication += 1
                         unresolved.discard(chunk_hash)
 
         for chunk_hash in list(unresolved):

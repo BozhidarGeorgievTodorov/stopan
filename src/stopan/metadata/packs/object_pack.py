@@ -47,6 +47,18 @@ class MetadataObjectPackSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class MetadataObjectPackExportStats:
+    objects_packed: int
+    total_canonical_bytes: int
+    plaintext_bytes: int
+    compressed_bytes: int
+    ciphertext_bytes: int
+    snapshot_count: int
+    known_chunk_count: int
+    protection_record_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class MetadataObjectPackExportResult:
     path: Path
     pack_hash: str
@@ -54,11 +66,15 @@ class MetadataObjectPackExportResult:
     pack_created_at_unix: float
     catalog_hash: str
     state_digest: str
-    objects_packed: int
+    stats: MetadataObjectPackExportStats
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataObjectPackImportStats:
+    objects_total: int
+    objects_written: int
+    objects_reused: int
     total_canonical_bytes: int
-    plaintext_bytes: int
-    compressed_bytes: int
-    ciphertext_bytes: int
     snapshot_count: int
     known_chunk_count: int
     protection_record_count: int
@@ -73,13 +89,7 @@ class MetadataObjectPackImportResult:
     object_store_dir: Path
     catalog_hash: str
     state_digest: str
-    objects_total: int
-    objects_written: int
-    objects_reused: int
-    total_canonical_bytes: int
-    snapshot_count: int
-    known_chunk_count: int
-    protection_record_count: int
+    stats: MetadataObjectPackImportStats
 
 
 class MetadataObjectPackService:
@@ -139,14 +149,16 @@ class MetadataObjectPackService:
             pack_created_at_unix=pack_created_at_unix,
             catalog_hash=latest.catalog_hash,
             state_digest=latest.state_digest,
-            objects_packed=len(objects),
-            total_canonical_bytes=latest.total_canonical_bytes,
-            plaintext_bytes=len(plaintext),
-            compressed_bytes=compressed_bytes,
-            ciphertext_bytes=ciphertext_bytes,
-            snapshot_count=latest.snapshot_count,
-            known_chunk_count=latest.known_chunk_count,
-            protection_record_count=latest.protection_record_count,
+            stats=MetadataObjectPackExportStats(
+                objects_packed=len(objects),
+                total_canonical_bytes=latest.total_canonical_bytes,
+                plaintext_bytes=len(plaintext),
+                compressed_bytes=compressed_bytes,
+                ciphertext_bytes=ciphertext_bytes,
+                snapshot_count=latest.snapshot_count,
+                known_chunk_count=latest.known_chunk_count,
+                protection_record_count=latest.protection_record_count,
+            ),
         )
 
     def inspect_pack(
@@ -222,11 +234,13 @@ class MetadataObjectPackService:
             object_store_dir=store.root_dir,
             catalog_hash=latest.catalog_hash,
             state_digest=latest.state_digest,
-            objects_total=len(objects),
-            objects_written=written,
-            objects_reused=reused,
-            total_canonical_bytes=latest.total_canonical_bytes,
-            snapshot_count=latest.snapshot_count,
-            known_chunk_count=latest.known_chunk_count,
-            protection_record_count=latest.protection_record_count,
+            stats=MetadataObjectPackImportStats(
+                objects_total=len(objects),
+                objects_written=written,
+                objects_reused=reused,
+                total_canonical_bytes=latest.total_canonical_bytes,
+                snapshot_count=latest.snapshot_count,
+                known_chunk_count=latest.known_chunk_count,
+                protection_record_count=latest.protection_record_count,
+            ),
         )

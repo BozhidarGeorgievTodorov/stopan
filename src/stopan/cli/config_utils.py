@@ -39,17 +39,6 @@ def load_runtime_config(args: argparse.Namespace) -> StopanConfig:
     return load_config(config_path)
 
 
-def require_config_file(path: str | None) -> str:
-    if not path:
-        raise StopanConfigError("Falta --config con la ruta del fichero YAML de configuración.")
-
-    config_path = Path(path)
-    if not config_path.exists():
-        raise StopanConfigError(f"No existe el fichero de configuración Stopan: {config_path}")
-
-    return str(config_path)
-
-
 def first_seed(cfg: StopanConfig) -> str | None:
     return cfg.cluster.seeds[0] if cfg.cluster.seeds else None
 

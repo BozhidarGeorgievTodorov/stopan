@@ -32,6 +32,12 @@ def is_rpc_error(exc: Exception) -> bool:
     return isinstance(exc, grpc.RpcError)
 
 
+def format_remote_error(exc: Exception) -> str:
+    if is_rpc_error(exc):
+        return format_rpc_error(exc)
+    return str(exc)
+
+
 def is_message_too_large_error(exc: Exception) -> bool:
     """
     Detecta errores de tamaño de mensaje gRPC tanto en cliente como en servidor.

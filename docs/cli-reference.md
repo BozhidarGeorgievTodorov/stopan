@@ -1,6 +1,6 @@
 # Stopan: Manual de Operaciones y Referencia CLI
 
-Este documento detalla los flujos avanzados, opciones de rendimiento y comandos manuales de bajo nivel para la administración del sistema Stopan. Para ver el flujo de inicio rápido y la arquitectura general, consulta el `README.md` principal.
+Este documento detalla los flujos avanzados, opciones de rendimiento y comandos manuales de bajo nivel para la administración del sistema Stopan. Para ver el flujo de inicio rápido consulta el `README.md`; para arquitectura interna y responsabilidades de carpetas consultar `docs/architecture.md`.
 
 ## 1. Opciones avanzadas de Backup Local
 
@@ -31,42 +31,54 @@ python -m stopan backup test_data --safe
 ```
 
 
-## 2. Matriz de semántica CLI para copias remotas
+## 2. Matriz de flags para copias remotas
 
 | Comando | Modo | Flags requeridos | Flags opcionales | Flags incompatibles | Significado |
 |---|---|---|---|---|---|
 | `backup` | snapshot local | `source_path` | `workers`, `--fast`, `--fast-remote`, `--safe`, `--deterministic`, `--desired-remote-copies` | `--safe` desactiva fast-path local y remoto | `--desired-remote-copies` solo guarda en metadata las copias remotas deseadas; no envía chunks. |
-| `push` | `replication` | membership seed/config | `--remote-copies`, `--strict-remote-copies`, `--target-parallelism`, `--probe-batch-hashes`, `--stream-inflight` | `--ec-k`, `--ec-m`, `--ec-pack-size-bytes` | `--remote-copies` son copias remotas completas por chunk; la copia local no cuenta. |
-| `push` | `ec` | membership seed/config, `--ec-k`, `--ec-m` | `--ec-pack-size-bytes`, `--limit`, timeouts | `--remote-copies`, `--strict-remote-copies`, flags de probe/stream de replicación | No usa copias remotas completas; usa `ec_k + ec_m` shards remotos. |
-| `verify` | `replication` | membership seed/config | `--target-parallelism`, `--probe-batch-hashes`, `--reverify-verified` | flags EC de `push` | No acepta flag de copias; lee de metadata las copias remotas deseadas de cada chunk. |
-| `verify` | `ec` | membership seed/config | `--target-parallelism`, `--reverify-verified` | `--probe-batch-hashes`, flags EC de `push` | No usa copias remotas completas ni `--ec-k/--ec-m`; lee specs EC desde metadata. |
+| `push` | `replication` | membership seed/config | `--remote-copies`, `--strict-remote-copies`, `--target-parallelism`, `--probe-batch-hashes`, `--stream-inflight`, `--scope`, `--snapshot-id` | `--ec-k`, `--ec-m`, `--ec-pack-size-bytes` | `--remote-copies` son copias remotas completas por chunk; la copia local no cuenta. Puede acotarse por snapshot o scope. |
+| `push` | `ec` | membership seed/config, `--ec-k`, `--ec-m` | `--ec-pack-size-bytes`, `--limit`, `--scope`, `--snapshot-id`, timeouts | `--remote-copies`, `--strict-remote-copies`, flags de probe/stream de replicación | No usa copias remotas completas; usa `ec_k + ec_m` shards remotos. Puede acotarse por snapshot o scope sin duplicar chunks ya empaquetados. |
+| `verify` | `replication` | membership seed/config | `--target-parallelism`, `--probe-batch-hashes`, `--reverify-verified`, `--scope`, `--snapshot-id` | flags EC de `push`, `--pack-hash` | No acepta flag de copias; lee de metadata las copias remotas deseadas de cada chunk y puede acotar la auditoría por snapshot o scope. |
+| `verify` | `ec` | membership seed/config | `--target-parallelism`, `--reverify-verified`, `--scope`, `--snapshot-id`, `--pack-hash` | `--probe-batch-hashes`, flags EC de `push`; `--pack-hash` con `--scope`/`--snapshot-id` | No usa copias remotas completas ni `--ec-k/--ec-m`; lee specs EC desde metadata y puede auditar un data pack concreto. |
 | `restore` | `none` | `snapshot_id` | `--out`, `--prefetch-window` | `--membership-seed`, `--replication-targets` | No usa red. Es el default. |
 | `restore` | `replication`/`auto` | `snapshot_id`, membership seed/config | `--replication-targets`, `--batch-target-parallelism`, `--prefetch-window` | flags EC de `push` | `--replication-targets` limita cuántos targets HRW se consultan por chunk ausente; no es factor de protección. |
 | `restore` | `ec` | `snapshot_id`, membership seed/config | `--batch-target-parallelism`, `--prefetch-window` | `--replication-targets`, flags EC de `push` | Reconstruye desde data packs EC registrados; no usa targets de replicación. |
-| `metadata push` | pack distribuido | identity/passphrase, membership seed/config | `--pack-in`, `--object-store`, `--pack-out`, `--pack-dir`, `--pack-copies`, `--strict-pack-copies`, `--target-parallelism` | `--pack-in` con `--object-store`, `--pack-out` o `--pack-dir`; `--pack-out` con `--pack-dir` | `--pack-copies` son copias remotas del metadata pack, separadas de la política de chunks. |
-| `metadata recover` / `metadata import-graph` | reconstrucción metadata | según comando | `--default-desired-remote-copies` | flags de `push`/EC | Solo rellena metadata `PENDING` si no se importa `chunk_protection`. |
+| `metadata pack push` | pack distribuido | identity/passphrase, membership seed/config | `--pack-in`, `--object-store`, `--pack-out`, `--pack-dir`, `--pack-copies`, `--strict-pack-copies`, `--target-parallelism` | `--pack-in` con `--object-store`, `--pack-out` o `--pack-dir`; `--pack-out` con `--pack-dir` | `--pack-copies` son copias remotas del metadata pack, separadas de la política de chunks. |
+| `metadata pack discover` | inventario remoto | owner/identity, membership seed/config | `--max-candidates`, `--show-sources` | flags de descarga/importación | Lista packs remotos del owner. Muestra `presence_state` solo si existe publicación local con copias esperadas; si no, `UNKNOWN`. |
+| `metadata pack verify` | auditoría remota | owner/identity, membership seed/config | `--pack-hash`, `--all`, `--max-candidates`, `--show-sources` | `--pack-hash` con `--all` | Verifica presencia remota contra publicaciones locales persistidas. Con `--pack-hash` usa `ProbeMetadataPack`; sin hash usa discovery. Si no conoce la intención, muestra `UNKNOWN`. |
+| `metadata pack recover` / `metadata graph import` | reconstrucción metadata | según comando | `--target-hash`, `--default-desired-remote-copies` | flags de `push`/EC | `recover` elige el latest válido si no hay `--target-hash`; con hash fijo recupera solo ese pack. |
 
 ## 3. Contrato general de flags
 
-Stopan no acepta abreviaturas implícitas de flags largos. Los nombres deben escribirse completos para evitar aliases accidentales y mantener estable el contrato público del CLI.
+Los flags largos se escriben completos. Stopan rechaza prefijos implícitos para mantener estable el contrato público del CLI.
 
 Las validaciones de rango se hacen antes de iniciar trabajo real:
 
 - valores `>= 0`: copias deseadas que permiten modo local-only, `ec_m`, edades de GC y periodos de gracia.
-- valores `>= 1`: workers, `snapshot_id`, límites, paralelismos, tamaños de mensaje, ventanas de restore, `ec_k`, `commit_every`, `max_candidates` y parámetros scrypt `r/p`.
+- valores `>= 1`: workers, `snapshot_id`, límites, paralelismos, tamaños de mensaje, ventanas de restore, `ec_k`, `commit_every`, `max_candidates`, `metadata.pack_discovery_max_candidates`, `metadata.cli_warning_limit`, `metadata pack push --pack-copies` y parámetros scrypt `r/p`.
 - valores `> 0`: timeouts RPC/probe/stream.
 - `--scrypt-n` debe ser `>= 2` y potencia de dos; `--metadata-key-length` debe ser `>= 32`.
 
+
+Los límites operativos de descubrimiento de metadata packs siguen la configuración efectiva:
+
+- `metadata.pack_discovery_max_candidates` define el límite por defecto para `metadata pack discover`, `metadata pack verify` sin `--pack-hash` y `metadata pack recover` automático.
+- `metadata.cli_warning_limit` define cuántos warnings/errores repetitivos imprime la CLI de metadata antes de resumir el resto.
+- `--max-candidates` puede sobrescribir el límite de candidatos en una ejecución concreta.
+- `metadata pack discover` y `metadata pack verify` usan la publicación local persistida por `metadata pack push` para conocer las copias esperadas. Si no existe publicación local, imprimen `desired_copies: unknown` y `presence_state: UNKNOWN`.
+- `metadata pack verify` comprueba presencia distribuida. `metadata pack recover` descarga el pack elegido y valida firma/hash antes de importarlo.
+
 También se rechazan combinaciones que dejarían flags ignorados:
 
-- `metadata object-store-status --passphrase-file` requiere `--decrypt-latest`.
-- `metadata export-graph --pack-out`, `--pack-dir` o `--identity-file` requieren `--pack`; `--pack-out` y `--pack-dir` son incompatibles.
-- `metadata pack-graph --out` y `--pack-dir` son incompatibles.
-- `metadata inspect-pack --passphrase-file` o `--identity-file` requieren `--decrypt`.
-- `metadata recover --pack-out` y `--download-dir` son incompatibles.
-- `metadata recover --no-import-db` es incompatible con `--no-protection` y con `--default-desired-remote-copies`.
+- `metadata graph status --passphrase-file` requiere `--decrypt-latest`.
+- `metadata graph export --pack-out`, `--pack-dir` o `--identity-file` requieren `--pack`; `--pack-out` y `--pack-dir` son incompatibles.
+- `metadata pack create --out` y `--pack-dir` son incompatibles.
+- `metadata pack inspect --passphrase-file` o `--identity-file` requieren `--decrypt`.
+- `metadata pack verify --pack-hash` y `--all` son incompatibles.
+- `metadata pack recover --pack-out` y `--download-dir` son incompatibles; `--target-hash` limita la recuperación a un pack concreto.
+- `metadata pack recover --no-import-db` es incompatible con `--no-protection` y con `--default-desired-remote-copies`.
 
-Se mantienen tres precedencias explícitas: `backup --safe` desactiva fast-path aunque se pase `--fast` o `--fast-remote`; `metadata push --pack-copies 0` puede combinarse con `--membership-seed` aunque no envíe el pack; y `metadata list-object-packs --pack-dir` tiene prioridad sobre `--object-store`.
+Se mantienen tres precedencias explícitas: `backup --safe` desactiva fast-path aunque se pase `--fast` o `--fast-remote`; `metadata pack push --pack-copies 0` puede combinarse con `--membership-seed` aunque no envíe el pack; y `metadata pack list --pack-dir` tiene prioridad sobre `--object-store`.
 
 Los errores controlados del CLI se muestran sin traceback por defecto y usan prefijos estables según categoría:
 
@@ -95,6 +107,8 @@ python -m stopan backup test_data \
 **Protección por replicación de chunks:**
 
 Por defecto, `push` usa `--protection-mode replication`. En este modo, `--remote-copies` indica cuántas copias remotas completas se requieren por chunk. La copia local no cuenta y el nodo origen se excluye del placement.
+
+`push` acepta scopes de protección. El scope por defecto es `pending`: procesa chunks/data packs pendientes, degradados, fallidos o con `placement_epoch` obsoleto según metadata. `--scope snapshot --snapshot-id ID` limita el trabajo a chunks alcanzables desde un snapshot completo; `--scope all-reachable` usa todos los chunks alcanzables desde snapshots completos; `--scope all-known-chunks` usa todos los chunks registrados en metadata.
 
 ```bash
 python -m stopan push \
@@ -161,6 +175,20 @@ python -m stopan verify --membership-seed localhost:50051 --reverify-verified
 python -m stopan verify --protection-mode ec
 ```
 
+Para verificar un data pack EC concreto:
+
+```bash
+python -m stopan verify --protection-mode ec --pack-hash HASH
+```
+
+Para acotar la auditoría de datos por snapshot o scope:
+
+```bash
+python -m stopan verify --scope snapshot --snapshot-id 1
+python -m stopan verify --scope all-reachable
+python -m stopan verify --protection-mode ec --scope all-known-chunks
+```
+
 Para volver a auditar packs EC ya verificados:
 
 ```bash
@@ -211,12 +239,12 @@ python -m stopan restore 1 \
 
 Aunque `backup` puede actualizar y empaquetar el grafo automáticamente, el flujo se puede descomponer en pasos manuales para auditoría o recuperación granular.
 
-El metadata object graph usa `--passphrase-file`; los metadata packs usan `--passphrase-file` y `--identity-file`. Por eso `export-graph` e `import-graph` planos no necesitan identidad, pero `pack-graph`, `import-pack`, `push`, `recover`, `inspect-pack --decrypt` y `gc` sí la necesitan cuando trabajan con packs.
+El metadata object graph usa `--passphrase-file`. Los metadata packs usan `--passphrase-file` y `--identity-file`. `metadata graph export` y `metadata graph import` no necesitan identidad; `metadata pack create`, `metadata pack import`, `metadata pack push`, `metadata pack recover`, `metadata pack inspect --decrypt` y `metadata graph gc` sí la usan cuando trabajan con packs.
 
 **Exportar el grafo de metadata desde SQLite a un object store local:**
 
 ```bash
-python -m stopan metadata export-graph \
+python -m stopan metadata graph export \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase
 ```
@@ -224,7 +252,7 @@ python -m stopan metadata export-graph \
 **Empaquetar un grafo previamente exportado:**
 
 ```bash
-python -m stopan metadata pack-graph \
+python -m stopan metadata pack create \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json \
@@ -234,13 +262,13 @@ python -m stopan metadata pack-graph \
 **Inspeccionar el contenido de un pack (metadatos públicos):**
 
 ```bash
-python -m stopan metadata inspect-pack latest.stopanmetapack
+python -m stopan metadata pack inspect latest.stopanmetapack
 ```
 
 **Inspeccionar descifrando su contenido interno:**
 
 ```bash
-python -m stopan metadata inspect-pack latest.stopanmetapack \
+python -m stopan metadata pack inspect latest.stopanmetapack \
   --decrypt \
   --identity-file metadata_identity.json \
   --passphrase-file metadata.passphrase
@@ -249,7 +277,7 @@ python -m stopan metadata inspect-pack latest.stopanmetapack \
 **Importar un pack externo a un object store local:**
 
 ```bash
-python -m stopan metadata import-pack latest.stopanmetapack \
+python -m stopan metadata pack import latest.stopanmetapack \
   --object-store metadata_object_store_imported \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json
@@ -258,7 +286,7 @@ python -m stopan metadata import-pack latest.stopanmetapack \
 **Distribuir un metadata pack por la red P2P:**
 
 ```bash
-python -m stopan metadata push \
+python -m stopan metadata pack push \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json \
@@ -266,22 +294,47 @@ python -m stopan metadata push \
   --pack-copies 3
 ```
 
+**Descubrir y verificar metadata packs distribuidos del owner:**
+
+```bash
+python -m stopan metadata pack discover \
+  --identity-file metadata_identity.json \
+  --membership-seed localhost:50051 \
+  --show-sources
+
+python -m stopan metadata pack verify \
+  --identity-file metadata_identity.json \
+  --membership-seed localhost:50051 \
+  --all
+```
+
+**Recuperar un metadata pack distribuido concreto:**
+
+```bash
+python -m stopan metadata pack recover \
+  --object-store metadata_object_store_imported \
+  --passphrase-file metadata.passphrase \
+  --identity-file metadata_identity.json \
+  --membership-seed localhost:50051 \
+  --target-hash PACK_HASH
+```
+
 **Reconstruir la base SQLite a partir del object store importado:**
 
 ```bash
-python -m stopan metadata import-graph \
+python -m stopan metadata graph import \
   --object-store metadata_object_store_imported \
   --passphrase-file metadata.passphrase
 ```
 
 ## 6. Garbage Collection
 
-Stopan permite limpiar objetos y packs de metadata que ya no forman parte del estado vivo. En el contrato actual, `metadata gc` recibe también `--identity-file` porque el collector puede necesitar inspeccionar packs de metadata.
+Stopan permite limpiar objetos y packs de metadata que ya no forman parte del estado vivo. `metadata graph gc` recibe también `--identity-file` porque el collector puede necesitar inspeccionar packs de metadata.
 
 **Limpieza de objetos sueltos exclusivamente (modo seguro/dry-run):**
 
 ```bash
-python -m stopan metadata gc \
+python -m stopan metadata graph gc \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json \
@@ -292,7 +345,7 @@ python -m stopan metadata gc \
 **Limpieza de packs exclusivamente (modo seguro/dry-run):**
 
 ```bash
-python -m stopan metadata gc \
+python -m stopan metadata graph gc \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json \

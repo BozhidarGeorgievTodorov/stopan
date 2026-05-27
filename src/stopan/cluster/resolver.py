@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from stopan.cluster.membership_client import ClusterMembershipClient
+from stopan.cluster.view import ClusterView
 from stopan.errors import StopanNetworkError, StopanUsageError
-from stopan.placement.cluster_view import ClusterMembershipClient, ClusterView
 
 
 @dataclass(frozen=True, slots=True)

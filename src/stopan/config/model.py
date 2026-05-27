@@ -39,6 +39,8 @@ from stopan.config.defaults import (
     DEFAULT_METADATA_OBJECT_STORE_DIR,
     DEFAULT_METADATA_OWNER_ID,
     DEFAULT_METADATA_PACK_COPIES,
+    DEFAULT_METADATA_PACK_DISCOVERY_MAX_CANDIDATES,
+    DEFAULT_METADATA_CLI_WARNING_LIMIT,
     DEFAULT_METADATA_PASSPHRASE_FILE,
     DEFAULT_METADATA_SCRYPT_N,
     DEFAULT_METADATA_STRICT_PACK_COPIES,
@@ -253,6 +255,8 @@ class MetadataConfig:
     distributed_pack_store_dir: str = DEFAULT_METADATA_DISTRIBUTED_PACK_STORE_DIR
     pack_copies: int = DEFAULT_METADATA_PACK_COPIES
     strict_pack_copies: bool = DEFAULT_METADATA_STRICT_PACK_COPIES
+    pack_discovery_max_candidates: int = DEFAULT_METADATA_PACK_DISCOVERY_MAX_CANDIDATES
+    cli_warning_limit: int = DEFAULT_METADATA_CLI_WARNING_LIMIT
     max_distributed_pack_bytes: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACK_BYTES
     max_distributed_packs_per_owner: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACKS_PER_OWNER
     max_distributed_pack_bytes_per_owner: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACK_BYTES_PER_OWNER
@@ -276,6 +280,8 @@ class MetadataConfig:
         _require_str("metadata.distributed_pack_store_dir", self.distributed_pack_store_dir)
         _require_int("metadata.pack_copies", self.pack_copies, min_value=0)
         _require_bool("metadata.strict_pack_copies", self.strict_pack_copies)
+        _require_int("metadata.pack_discovery_max_candidates", self.pack_discovery_max_candidates, min_value=1)
+        _require_int("metadata.cli_warning_limit", self.cli_warning_limit, min_value=1)
         _require_int("metadata.max_distributed_pack_bytes", self.max_distributed_pack_bytes, min_value=1)
         _require_int("metadata.max_distributed_packs_per_owner", self.max_distributed_packs_per_owner, min_value=1)
         _require_int(

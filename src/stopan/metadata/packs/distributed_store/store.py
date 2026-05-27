@@ -409,7 +409,7 @@ class MetadataPackStore:
         pack = validate_pack_hash(pack_hash)
 
         if not isinstance(data, bytes):
-            raise TypeError(f"data debe ser bytes; recibido {type(data).__name__}")
+            raise MetadataPackStoreError(f"data debe ser bytes; recibido {type(data).__name__}")
         if not data:
             raise MetadataPackStoreError("metadata pack vacío rejected")
         if len(data) > self.max_pack_bytes:

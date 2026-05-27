@@ -7,13 +7,9 @@ join o ping indirecto.
 
 from __future__ import annotations
 
-import threading
-
-import grpc
-
 from stopan.protos import membership_pb2_grpc
 from stopan.node.errors import MembershipConfigError
-from stopan.rpc.options import grpc_channel_options
+from stopan.rpc.channels import RpcChannelCache
 
 from .validation import is_valid_address
 
@@ -29,31 +25,22 @@ class ChannelCache:
         keepalive_timeout_ms: int,
         keepalive_permit_without_calls: bool,
     ):
-        self._lock = threading.Lock()
-        self._map: dict[str, tuple[grpc.Channel, membership_pb2_grpc.MembershipStub]] = {}
-        self._options = grpc_channel_options(
-            max_message_bytes,
+        self._cache = RpcChannelCache(
+            max_message_bytes=max_message_bytes,
+            stub_factory=membership_pb2_grpc.MembershipStub,
             keepalive_time_ms=keepalive_time_ms,
             keepalive_timeout_ms=keepalive_timeout_ms,
             keepalive_permit_without_calls=keepalive_permit_without_calls,
+            validate_address=is_valid_address,
+            invalid_address_error_factory=lambda address: MembershipConfigError(
+                f"Dirección de membership inválida: {address!r}"
+            ),
         )
 
     def get(self, address: str) -> membership_pb2_grpc.MembershipStub:
         """Devuelve un stub Membership reutilizable para address."""
-        address = str(address).strip()
-        if not is_valid_address(address):
-            raise MembershipConfigError(f"Dirección de membership inválida: {address!r}")
-
-        with self._lock:
-            if address not in self._map:
-                channel = grpc.insecure_channel(address, options=self._options)
-                stub = membership_pb2_grpc.MembershipStub(channel)
-                self._map[address] = (channel, stub)
-            return self._map[address][1]
+        return self._cache.get(address)
 
     def close_all(self) -> None:
         """Cierra todos los canales abiertos y vacía la caché."""
-        with self._lock:
-            for channel, _ in self._map.values():
-                channel.close()
-            self._map.clear()
+        self._cache.close_all()

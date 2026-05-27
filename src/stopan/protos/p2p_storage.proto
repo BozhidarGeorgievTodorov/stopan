@@ -17,6 +17,7 @@ service MetadataPackService {
   rpc StoreMetadataPack(StoreMetadataPackRequest) returns (StoreMetadataPackResponse);
   rpc ListMetadataPacks(ListMetadataPacksRequest) returns (ListMetadataPacksResponse);
   rpc RetrieveMetadataPack(RetrieveMetadataPackRequest) returns (RetrieveMetadataPackResponse);
+  rpc ProbeMetadataPack(ProbeMetadataPackRequest) returns (ProbeMetadataPackResponse);
 }
 
 message ProbeMissingChunksRequest {
@@ -152,6 +153,13 @@ enum MetadataPackRetrieveStatus {
   METADATA_PACK_RETRIEVE_STATUS_ERROR = 3;
 }
 
+enum MetadataPackProbeStatus {
+  METADATA_PACK_PROBE_STATUS_UNSPECIFIED = 0;
+  METADATA_PACK_PROBE_STATUS_PRESENT = 1;
+  METADATA_PACK_PROBE_STATUS_MISSING = 2;
+  METADATA_PACK_PROBE_STATUS_ERROR = 3;
+}
+
 message StoreMetadataPackRequest {
   string cluster_token = 1;
   string owner_id = 2;
@@ -206,4 +214,21 @@ message RetrieveMetadataPackResponse {
   double stored_at_unix = 7;
   string public_key_b64 = 8;
   string signature_b64 = 9;
+}
+
+message ProbeMetadataPackRequest {
+  string cluster_token = 1;
+  string owner_id = 2;
+  string pack_hash = 3;
+}
+
+message ProbeMetadataPackResponse {
+  MetadataPackProbeStatus status = 1;
+  string detail = 2;
+  string owner_id = 3;
+  string pack_hash = 4;
+  int64 size_bytes = 5;
+  double stored_at_unix = 6;
+  string public_key_b64 = 7;
+  string signature_b64 = 8;
 }

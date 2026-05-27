@@ -29,10 +29,7 @@ from stopan.metadata.objects.store import (
 
 
 @dataclass(frozen=True, slots=True)
-class MetadataObjectGraphExportResult:
-    root_dir: Path
-    catalog_hash: str
-    state_digest: str
+class MetadataObjectGraphExportStats:
     objects_total: int
     objects_written: int
     objects_reused: int
@@ -40,6 +37,14 @@ class MetadataObjectGraphExportResult:
     snapshot_count: int
     known_chunk_count: int
     protection_record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataObjectGraphExportResult:
+    root_dir: Path
+    catalog_hash: str
+    state_digest: str
+    stats: MetadataObjectGraphExportStats
 
 
 class MetadataObjectGraphStoreService:
@@ -130,11 +135,13 @@ class MetadataObjectGraphStoreService:
             root_dir=result.root_dir,
             catalog_hash=result.catalog_hash,
             state_digest=result.state_digest,
-            objects_total=result.objects_total,
-            objects_written=result.objects_written,
-            objects_reused=result.objects_reused,
-            total_canonical_bytes=result.total_canonical_bytes,
-            snapshot_count=result.snapshot_count,
-            known_chunk_count=result.known_chunk_count,
-            protection_record_count=result.protection_record_count,
+            stats=MetadataObjectGraphExportStats(
+                objects_total=result.objects_total,
+                objects_written=result.objects_written,
+                objects_reused=result.objects_reused,
+                total_canonical_bytes=result.total_canonical_bytes,
+                snapshot_count=result.snapshot_count,
+                known_chunk_count=result.known_chunk_count,
+                protection_record_count=result.protection_record_count,
+            ),
         )

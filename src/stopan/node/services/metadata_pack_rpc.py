@@ -337,6 +337,73 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
             )
 
 
+    def ProbeMetadataPack(self, request, context):
+        """Comprueba presencia exacta de un metadata pack sin descargar el payload."""
+
+        if not self._check_token(request, context):
+            return p2p_storage_pb2.ProbeMetadataPackResponse(
+                status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_ERROR,
+                detail="cluster_token inválido",
+            )
+
+        try:
+            owner_id = validate_owner_id(request.owner_id)
+            pack_hash = validate_pack_hash(request.pack_hash)
+            path = self.store.pack_path(owner_id=owner_id, pack_hash=pack_hash)
+            if not path.exists():
+                return p2p_storage_pb2.ProbeMetadataPackResponse(
+                    status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_MISSING,
+                    detail="metadata pack no encontrado",
+                    owner_id=owner_id,
+                    pack_hash=pack_hash,
+                )
+
+            public_key_b64, signature_b64 = self.store.get_signature_record(
+                owner_id=owner_id,
+                pack_hash=pack_hash,
+            )
+            if not public_key_b64 or not signature_b64:
+                context.set_code(grpc.StatusCode.DATA_LOSS)
+                context.set_details("metadata pack sin sidecar de firma válido")
+                return p2p_storage_pb2.ProbeMetadataPackResponse(
+                    status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_ERROR,
+                    detail="metadata pack sin sidecar de firma válido",
+                    owner_id=owner_id,
+                    pack_hash=pack_hash,
+                )
+
+            st = path.stat()
+            return p2p_storage_pb2.ProbeMetadataPackResponse(
+                status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_PRESENT,
+                detail="ok",
+                owner_id=owner_id,
+                pack_hash=pack_hash,
+                size_bytes=int(st.st_size),
+                stored_at_unix=float(st.st_mtime),
+                public_key_b64=public_key_b64,
+                signature_b64=signature_b64,
+            )
+        except (TypeError, ValueError) as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return p2p_storage_pb2.ProbeMetadataPackResponse(
+                status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_ERROR,
+                detail=str(exc),
+            )
+        except OSError as exc:
+            return p2p_storage_pb2.ProbeMetadataPackResponse(
+                status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_MISSING,
+                detail=str(exc),
+            )
+        except Exception as exc:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return p2p_storage_pb2.ProbeMetadataPackResponse(
+                status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_ERROR,
+                detail=str(exc),
+            )
+
+
 def _store_response(
     *,
     status: int,

@@ -79,6 +79,8 @@ metadata:
   distributed_pack_store_dir: "/var/lib/stopan/metadata_distributed_packs"
   pack_copies: 3
   strict_pack_copies: false
+  pack_discovery_max_candidates: 10
+  cli_warning_limit: 10
   max_distributed_pack_bytes: 67108864
   max_distributed_packs_per_owner: 8
   max_distributed_pack_bytes_per_owner: 536870912

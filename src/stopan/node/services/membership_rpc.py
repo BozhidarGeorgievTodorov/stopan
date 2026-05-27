@@ -12,10 +12,9 @@ import grpc
 from stopan.protos import membership_pb2
 from stopan.protos import membership_pb2_grpc
 
-from .manager import MembershipManager
-from .validation import (
+from stopan.node.membership.manager import MembershipManager
+from stopan.node.membership.validation import (
     is_valid_nodeinfo,
-    limited_gossip,
     require_authorized_cluster_token,
 )
 
@@ -33,7 +32,7 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
         if not is_valid_nodeinfo(request.self):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "identidad del nodo join inválida")
 
-        self.manager._apply_nodeinfo(request.self, state=membership_pb2.ALIVE, source="join")
+        self.manager.apply_nodeinfo(request.self, state=membership_pb2.ALIVE, source="join")
         return membership_pb2.JoinResponse(
             members=self.manager.get_members_snapshot(eligible_only=True),
             gossip=self.manager.gossip.sample(self.manager.max_gossip_events),
@@ -46,10 +45,9 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
         if not is_valid_nodeinfo(request.from_node):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "identidad de origen de ping inválida")
 
-        self.manager._apply_nodeinfo(request.from_node, state=membership_pb2.ALIVE, source="ping")
+        self.manager.apply_nodeinfo(request.from_node, state=membership_pb2.ALIVE, source="ping")
 
-        for event in limited_gossip(request.gossip, self.manager.max_gossip_events):
-            self.manager.apply_event(event, source="ping-gossip")
+        self.manager.apply_gossip(request.gossip, source="ping-gossip")
 
         return membership_pb2.PingResponse(
             ok=True,
@@ -65,10 +63,9 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
         if not is_valid_nodeinfo(request.target):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "identidad del target pingreq inválida")
 
-        self.manager._apply_nodeinfo(request.requester, state=membership_pb2.ALIVE, source="pingreq")
+        self.manager.apply_nodeinfo(request.requester, state=membership_pb2.ALIVE, source="pingreq")
 
-        for event in limited_gossip(request.gossip, self.manager.max_gossip_events):
-            self.manager.apply_event(event, source="pingreq-gossip")
+        self.manager.apply_gossip(request.gossip, source="pingreq-gossip")
 
         ok = False
         try:
@@ -88,8 +85,7 @@ class MembershipServicer(membership_pb2_grpc.MembershipServicer):
                 timeout=float(self.manager.settings.ping_timeout_s),
             )
             ok = response.ok
-            for event in limited_gossip(response.gossip, self.manager.max_gossip_events):
-                self.manager.apply_event(event, source="pingreq-helper-ack")
+            self.manager.apply_gossip(response.gossip, source="pingreq-helper-ack")
         except (grpc.RpcError, ValueError):
             ok = False
 

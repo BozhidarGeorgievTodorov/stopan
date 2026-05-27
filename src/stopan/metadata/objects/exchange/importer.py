@@ -16,6 +16,7 @@ from stopan.metadata.objects.codec import canonical_state_digest
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.metadata.objects.store import MetadataObjectStore
 
+from .erasure_records import ErasureDataPackImportRows, load_erasure_data_pack_rows
 from .errors import MetadataObjectImportError
 from .reader import MetadataObjectReader
 from .validation import (
@@ -29,11 +30,7 @@ from .writer import MetadataDBImportWriter
 
 
 @dataclass(frozen=True, slots=True)
-class MetadataObjectGraphImportResult:
-    db_file: str
-    object_store_dir: Path
-    catalog_hash: str
-    state_digest: str
+class MetadataObjectGraphImportStats:
     objects_read: int
     total_canonical_bytes: int
     snapshots_imported: int
@@ -44,6 +41,18 @@ class MetadataObjectGraphImportResult:
     chunks_imported: int
     protection_records_imported: int
     pending_protection_records_created: int
+    erasure_data_packs_imported: int
+    erasure_pack_chunks_imported: int
+    erasure_pack_shards_imported: int
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataObjectGraphImportResult:
+    db_file: str
+    object_store_dir: Path
+    catalog_hash: str
+    state_digest: str
+    stats: MetadataObjectGraphImportStats
 
 
 class MetadataObjectGraphImporter:
@@ -76,6 +85,7 @@ class MetadataObjectGraphImporter:
         # contra el grafo alcanzable completo, aunque el caller no quiera
         # materializar filas de chunk_protection en la DB destino.
         protection_records = self._load_protection_records(catalog)
+        erasure_data_packs = self._load_erasure_data_packs(catalog)
         snapshot_entries = self._snapshot_entries(catalog)
 
         writer = MetadataDBImportWriter(
@@ -91,15 +101,25 @@ class MetadataObjectGraphImporter:
                 chunks_inserted = writer.insert_chunks(db, chunks)
                 snapshot_stats = writer.insert_snapshots(db, snapshot_entries)
 
-                if include_protection and protection_records:
-                    protection_inserted = writer.insert_protection_records(
-                        db,
-                        protection_records,
-                    )
-                    pending_created = 0
+                if include_protection:
+                    if protection_records:
+                        protection_inserted = writer.insert_protection_records(
+                            db,
+                            protection_records,
+                        )
+                        pending_created = 0
+                    else:
+                        protection_inserted = 0
+                        pending_created = writer.insert_pending_protection_for_chunks(db)
+                    erasure_packs_inserted = writer.insert_erasure_data_packs(db, erasure_data_packs)
+                    erasure_chunks_inserted = sum(item.chunk_count for item in erasure_data_packs)
+                    erasure_shards_inserted = sum(item.shard_count for item in erasure_data_packs)
                 else:
                     protection_inserted = 0
                     pending_created = writer.insert_pending_protection_for_chunks(db)
+                    erasure_packs_inserted = 0
+                    erasure_chunks_inserted = 0
+                    erasure_shards_inserted = 0
 
                 self._verify_latest_digest(
                     expected_catalog_hash=latest.catalog_hash,
@@ -115,16 +135,21 @@ class MetadataObjectGraphImporter:
             object_store_dir=self.object_store_dir,
             catalog_hash=latest.catalog_hash,
             state_digest=latest.state_digest,
-            objects_read=len(self.reader.object_hashes_read),
-            total_canonical_bytes=self.reader.total_canonical_bytes,
-            snapshots_imported=snapshot_stats.snapshots_imported,
-            complete_snapshots_imported=snapshot_stats.complete_snapshots_imported,
-            items_imported=snapshot_stats.items_imported,
-            recipes_imported=snapshot_stats.recipes_created,
-            recipes_reused=snapshot_stats.recipes_reused,
-            chunks_imported=chunks_inserted,
-            protection_records_imported=protection_inserted,
-            pending_protection_records_created=pending_created,
+            stats=MetadataObjectGraphImportStats(
+                objects_read=len(self.reader.object_hashes_read),
+                total_canonical_bytes=self.reader.total_canonical_bytes,
+                snapshots_imported=snapshot_stats.snapshots_imported,
+                complete_snapshots_imported=snapshot_stats.complete_snapshots_imported,
+                items_imported=snapshot_stats.items_imported,
+                recipes_imported=snapshot_stats.recipes_created,
+                recipes_reused=snapshot_stats.recipes_reused,
+                chunks_imported=chunks_inserted,
+                protection_records_imported=protection_inserted,
+                pending_protection_records_created=pending_created,
+                erasure_data_packs_imported=erasure_packs_inserted,
+                erasure_pack_chunks_imported=erasure_chunks_inserted,
+                erasure_pack_shards_imported=erasure_shards_inserted,
+            ),
         )
 
     def _verify_latest_digest(
@@ -263,3 +288,11 @@ class MetadataObjectGraphImporter:
                 f"protection_index total no coincide: total={expected_total} cargados={len(out)}"
             )
         return out
+
+
+    def _load_erasure_data_packs(self, catalog: dict[str, Any]) -> list[ErasureDataPackImportRows]:
+        return load_erasure_data_pack_rows(
+            reader=self.reader,
+            catalog=catalog,
+            chunk_sizes=self._chunk_sizes,
+        )

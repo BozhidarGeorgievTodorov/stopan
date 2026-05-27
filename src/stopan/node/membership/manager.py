@@ -35,6 +35,47 @@ _STOP_JOIN_MIN_TIMEOUT_S = 2.0
 _STOP_JOIN_EXTRA_TIMEOUT_S = 0.5
 
 
+def _member_event(*, node_id: str, address: str, incarnation: int, state: int) -> membership_pb2.MemberEvent:
+    return membership_pb2.MemberEvent(
+        node_id=node_id,
+        address=address,
+        incarnation=incarnation,
+        state=state,
+        ts_ms=now_ms(),
+    )
+
+
+def _new_record_from_event(event: membership_pb2.MemberEvent, *, observed_at: float) -> MemberRecord:
+    return MemberRecord(
+        node_id=event.node_id,
+        address=event.address,
+        incarnation=event.incarnation,
+        state=event.state,
+        last_seen=observed_at,
+        suspect_since=(observed_at if event.state == membership_pb2.SUSPECT else None),
+    )
+
+
+def _apply_event_to_record(
+    record: MemberRecord,
+    event: membership_pb2.MemberEvent,
+    *,
+    observed_at: float,
+    replace_incarnation: bool,
+) -> None:
+    if replace_incarnation:
+        record.incarnation = event.incarnation
+        record.address = event.address
+
+    record.state = event.state
+
+    if event.state == membership_pb2.ALIVE:
+        record.last_seen = observed_at
+        record.suspect_since = None
+    elif event.state == membership_pb2.SUSPECT:
+        record.suspect_since = observed_at
+
+
 class MembershipManager:
     """
     Gestiona membership, gossip e incarnation del nodo local.
@@ -167,9 +208,8 @@ class MembershipManager:
                     timeout=float(self.settings.rpc_timeout_s),
                 )
                 for node in response.members:
-                    self._apply_nodeinfo(node, state=membership_pb2.ALIVE, source="join")
-                for event in limited_gossip(response.gossip, self.max_gossip_events):
-                    self.apply_event(event, source="join-gossip")
+                    self.apply_nodeinfo(node, state=membership_pb2.ALIVE, source="join")
+                self.apply_gossip(response.gossip, source="join-gossip")
             except grpc.RpcError as exc:
                 details = getattr(exc, "details", lambda: str(exc))()
                 print(f"AVISO: join contra seed {seed} falló: {details}")
@@ -212,28 +252,20 @@ class MembershipManager:
 
         with self._lock:
             current = self._members.get(event.node_id)
+            observed_at = time.time()
 
             if current is None:
-                self._members[event.node_id] = MemberRecord(
-                    node_id=event.node_id,
-                    address=event.address,
-                    incarnation=event.incarnation,
-                    state=event.state,
-                    last_seen=time.time(),
-                    suspect_since=(time.time() if event.state == membership_pb2.SUSPECT else None),
-                )
+                self._members[event.node_id] = _new_record_from_event(event, observed_at=observed_at)
                 self.gossip.add(event)
                 return
 
             if event.incarnation > current.incarnation:
-                current.incarnation = event.incarnation
-                current.state = event.state
-                current.address = event.address
-                if event.state == membership_pb2.ALIVE:
-                    current.last_seen = time.time()
-                    current.suspect_since = None
-                elif event.state == membership_pb2.SUSPECT:
-                    current.suspect_since = time.time()
+                _apply_event_to_record(
+                    current,
+                    event,
+                    observed_at=observed_at,
+                    replace_incarnation=True,
+                )
                 self.gossip.add(event)
                 return
 
@@ -241,13 +273,18 @@ class MembershipManager:
                 return
 
             if STATE_ORDER.get(event.state, 0) > STATE_ORDER.get(current.state, 0):
-                current.state = event.state
-                if event.state == membership_pb2.ALIVE:
-                    current.last_seen = time.time()
-                    current.suspect_since = None
-                elif event.state == membership_pb2.SUSPECT:
-                    current.suspect_since = time.time()
+                _apply_event_to_record(
+                    current,
+                    event,
+                    observed_at=observed_at,
+                    replace_incarnation=False,
+                )
                 self.gossip.add(event)
+
+    def apply_gossip(self, events: Iterable[membership_pb2.MemberEvent], *, source: str) -> None:
+        """Aplica gossip entrante respetando el límite configurado."""
+        for event in limited_gossip(events, self.max_gossip_events):
+            self.apply_event(event, source=source)
 
     def _handle_self_event(self, event: membership_pb2.MemberEvent, *, source: str) -> None:
         """Procesa eventos sobre el propio node_id."""
@@ -267,7 +304,7 @@ class MembershipManager:
                 )
                 self._announce_alive()
 
-    def _apply_nodeinfo(self, node: membership_pb2.NodeInfo, *, state: int, source: str) -> None:
+    def apply_nodeinfo(self, node: membership_pb2.NodeInfo, *, state: int, source: str) -> None:
         """Convierte un NodeInfo entrante en MemberEvent local."""
         if not is_valid_nodeinfo(node):
             print(
@@ -276,23 +313,21 @@ class MembershipManager:
             )
             return
 
-        event = membership_pb2.MemberEvent(
+        event = _member_event(
             node_id=node.node_id,
             address=node.address,
             incarnation=node.incarnation,
             state=state,
-            ts_ms=now_ms(),
         )
         self.apply_event(event, source=source)
 
     def _announce_alive(self) -> None:
         """Publica ALIVE del nodo local con la incarnation actual."""
-        event = membership_pb2.MemberEvent(
+        event = _member_event(
             node_id=self.node_id,
             address=self.address,
             incarnation=self.incarnation,
             state=membership_pb2.ALIVE,
-            ts_ms=now_ms(),
         )
         with self._lock:
             me = self._members[self.node_id]
@@ -305,23 +340,21 @@ class MembershipManager:
 
     def _mark_suspect(self, node_id: str, address: str, incarnation: int) -> None:
         """Marca localmente un nodo como SUSPECT."""
-        event = membership_pb2.MemberEvent(
+        event = _member_event(
             node_id=node_id,
             address=address,
             incarnation=incarnation,
             state=membership_pb2.SUSPECT,
-            ts_ms=now_ms(),
         )
         self.apply_event(event, source="local-suspect")
 
     def _mark_dead(self, node_id: str, address: str, incarnation: int) -> None:
         """Marca localmente un nodo como DEAD."""
-        event = membership_pb2.MemberEvent(
+        event = _member_event(
             node_id=node_id,
             address=address,
             incarnation=incarnation,
             state=membership_pb2.DEAD,
-            ts_ms=now_ms(),
         )
         self.apply_event(event, source="local-dead")
 
@@ -391,8 +424,7 @@ class MembershipManager:
                 ),
                 timeout=float(self.settings.ping_timeout_s),
             )
-            for event in limited_gossip(response.gossip, self.max_gossip_events):
-                self.apply_event(event, source="ping-ack")
+            self.apply_gossip(response.gossip, source="ping-ack")
 
             with self._lock:
                 current = self._members.get(target.node_id)
@@ -428,8 +460,7 @@ class MembershipManager:
                 ),
                 timeout=float(self.settings.ping_timeout_s),
             )
-            for event in limited_gossip(response.gossip, self.max_gossip_events):
-                self.apply_event(event, source="pingreq-ack")
+            self.apply_gossip(response.gossip, source="pingreq-ack")
             return response.ok
         except (grpc.RpcError, ValueError):
             return False

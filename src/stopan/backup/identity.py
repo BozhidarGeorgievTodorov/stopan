@@ -14,7 +14,7 @@ from pathlib import Path
 
 from stopan.common.fs import atomic_write_bytes
 from stopan.errors import StopanConfigError
-from stopan.placement.cluster_resolver import try_cluster_view
+from stopan.cluster.resolver import try_cluster_view
 
 
 def _canonical_node_id(value: str, *, node_id_file: str) -> str:

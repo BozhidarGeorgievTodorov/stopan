@@ -20,6 +20,7 @@ from stopan.metadata.identity.files import (
     load_metadata_identity_file,
     load_metadata_private_identity_file,
 )
+from stopan.metadata.crypto.kdf import derive_hkdf_sha256_key
 from stopan.metadata.identity.keys import require_cryptography, require_x25519, validate_owner_id
 from stopan.metadata.packs.format import (
     MetadataObjectPackAuthenticationError,
@@ -43,13 +44,7 @@ def _require_raw32(name: str, value: bytes) -> bytes:
 
 
 def _hkdf_sha256(secret: bytes, *, info: bytes) -> bytes:
-    crypto = require_cryptography()
-    return crypto.HKDF(
-        algorithm=crypto.hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=info,
-    ).derive(secret)
+    return derive_hkdf_sha256_key(secret, info=info)
 
 
 def recipient_wrap_associated_data(recipient: dict[str, Any]) -> bytes:
@@ -233,7 +228,7 @@ def encrypt_pack_payload(
     identity_file: str | Path,
 ) -> tuple[bytes, str, int, int]:
     if not isinstance(plaintext, bytes):
-        raise TypeError("metadata pack plaintext debe ser bytes")
+        raise MetadataObjectPackError("metadata pack plaintext debe ser bytes")
 
     compressed = zstd.ZstdCompressor(level=3).compress(plaintext)
     data_key = os.urandom(32)

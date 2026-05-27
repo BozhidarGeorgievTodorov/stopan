@@ -51,15 +51,7 @@ class DataPackBuilder:
         return not self._chunks
 
     def add_chunk(self, *, chunk_hash: str, data: bytes) -> bool:
-        chunk_hash = require_hash64("chunk_hash", chunk_hash)
-        if not isinstance(data, bytes):
-            raise ErasureCodingError(f"chunk data debe ser bytes; recibido {type(data).__name__}")
-        calculated = hash_bytes(data)
-        if calculated != chunk_hash:
-            raise ErasureCodingError(
-                f"chunk_hash no coincide: esperado={chunk_hash} calculado={calculated}"
-            )
-
+        chunk_hash, data = _validated_chunk_payload(chunk_hash=chunk_hash, data=data)
         self._chunks.append((chunk_hash, data))
         self._current_size += len(data)
         return self._current_size >= self.target_size_bytes
@@ -93,15 +85,7 @@ def build_data_pack(
     offset = 0
 
     for ordinal, (chunk_hash, data) in enumerate(materialized):
-        chunk_hash = require_hash64("chunk_hash", chunk_hash)
-        if not isinstance(data, bytes):
-            raise ErasureCodingError(f"chunk data debe ser bytes; recibido {type(data).__name__}")
-        calculated = hash_bytes(data)
-        if calculated != chunk_hash:
-            raise ErasureCodingError(
-                f"chunk_hash no coincide: esperado={chunk_hash} calculado={calculated}"
-            )
-
+        chunk_hash, data = _validated_chunk_payload(chunk_hash=chunk_hash, data=data)
         payload_parts.append(data)
         entries.append(
             DataPackEntry(
@@ -131,17 +115,17 @@ def build_data_pack(
     )
 
 
-def manifest_from_pack(pack: EncodedDataPack) -> DataPackManifest:
-    if not isinstance(pack, EncodedDataPack):
-        raise ErasureCodingError("pack debe ser EncodedDataPack")
-    return DataPackManifest(
-        pack_hash=pack.pack_hash,
-        payload_size=pack.payload_size,
-        padded_size=pack.padded_size,
-        shard_size=pack.shard_size,
-        spec=pack.spec,
-        entries=pack.entries,
-    )
+def _validated_chunk_payload(*, chunk_hash: str, data: bytes) -> tuple[str, bytes]:
+    chunk_hash = require_hash64("chunk_hash", chunk_hash)
+    if not isinstance(data, bytes):
+        raise ErasureCodingError(f"chunk data debe ser bytes; recibido {type(data).__name__}")
+
+    calculated = hash_bytes(data)
+    if calculated != chunk_hash:
+        raise ErasureCodingError(
+            f"chunk_hash no coincide: esperado={chunk_hash} calculado={calculated}"
+        )
+    return chunk_hash, data
 
 
 def reconstruct_payload(

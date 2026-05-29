@@ -42,6 +42,7 @@ class MetadataObjectGraphExportStats:
 @dataclass(frozen=True, slots=True)
 class MetadataObjectGraphExportResult:
     root_dir: Path
+    vault_id: str
     catalog_hash: str
     state_digest: str
     stats: MetadataObjectGraphExportStats
@@ -133,6 +134,7 @@ class MetadataObjectGraphStoreService:
     ) -> MetadataObjectGraphExportResult:
         return MetadataObjectGraphExportResult(
             root_dir=result.root_dir,
+            vault_id=result.vault_id,
             catalog_hash=result.catalog_hash,
             state_digest=result.state_digest,
             stats=MetadataObjectGraphExportStats(

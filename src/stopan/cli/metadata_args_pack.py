@@ -216,7 +216,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         "--max-candidates",
         type=int,
         default=None,
-        help="Máximo de pack_hash a mostrar, ordenados por stored_at remoto. Default: metadata.pack_discovery_max_candidates.",
+        help="Máximo de pack_hash a mostrar. Default: metadata.pack_discovery_max_candidates.",
     )
     discover_parser.add_argument(
         "--show-sources",
@@ -347,22 +347,26 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         help="Ruta exacta donde guardar el pack descargado elegido.",
     )
     recover_parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Solo descarga y valida el pack elegido; no importa el object store ni reconstruye _metadata.db.",
+    )
+    recover_parser.add_argument(
         "--target-hash",
         default=None,
         help="Pack hash concreto a recuperar. Si se omite, se recupera el latest válido descubierto.",
     )
     recover_parser.add_argument(
-        "--max-candidates",
-        type=int,
+        "--vault-id",
         default=None,
-        help="Máximo de pack_hash candidatos a intentar, ordenados por stored_at remoto. Default: metadata.pack_discovery_max_candidates.",
+        help="Vault ID 32-hex a recuperar cuando el owner tiene packs de varios vaults.",
     )
     recover_parser.add_argument(
         "--no-import-db",
         dest="import_db",
         action="store_false",
         default=True,
-        help="Solo importa el pack al object store local; no reconstruye _metadata.db.",
+        help="Importa el pack recuperado al object store local, pero no reconstruye _metadata.db.",
     )
     recover_parser.add_argument(
         "--no-protection",

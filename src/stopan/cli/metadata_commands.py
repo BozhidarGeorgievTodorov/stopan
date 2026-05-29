@@ -322,6 +322,7 @@ def cmd_object_store_status(args: argparse.Namespace) -> int:
     if inspection.latest is not None:
         latest = inspection.latest
         print("Latest metadata state")
+        print(f"   vault_id: {latest.vault_id}")
         print(f"   catalog_hash: {latest.catalog_hash}")
         print(f"   state_digest: {latest.state_digest}")
         print(f"   objects: {latest.object_count}")
@@ -347,6 +348,7 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
 
     print("Metadata object graph exportado")
     print(f"   object_store: {result.root_dir}")
+    print(f"   vault_id: {result.vault_id}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
     stats = result.stats
@@ -371,6 +373,7 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
         print("Metadata object pack creado")
         print(f"   path: {pack_result.path}")
         print(f"   pack_hash: {pack_result.pack_hash}")
+        print(f"   vault_id: {pack_result.vault_id}")
         print(f"   vault_generation: {pack_result.vault_generation}")
         print(f"   pack_created_at: {format_time(pack_result.pack_created_at_unix)}")
         print(f"   catalog_hash: {pack_result.catalog_hash}")
@@ -405,6 +408,7 @@ def cmd_import_object_graph(args: argparse.Namespace) -> int:
     print("Metadata object graph importado")
     print(f"   db_file: {result.db_file}")
     print(f"   object_store: {result.object_store_dir}")
+    print(f"   vault_id: {result.vault_id}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
     stats = result.stats
@@ -619,16 +623,9 @@ def find_reusable_latest_object_pack(
             if summary.state_digest != latest.state_digest:
                 continue
 
-            try:
-                mtime = float(path.stat().st_mtime)
-            except OSError:
-                mtime = 0.0
-
             candidates.append(
                 (
                     int(summary.vault_generation),
-                    float(summary.pack_created_at_unix),
-                    mtime,
                     str(inspection.header.pack_hash),
                     path,
                     summary,
@@ -641,9 +638,9 @@ def find_reusable_latest_object_pack(
     if not candidates:
         return None
 
-    _generation, _created_at, _mtime, _pack_hash, path, summary = max(
+    _generation, _pack_hash, path, summary = max(
         candidates,
-        key=lambda item: (item[0], item[1], item[2], item[3]),
+        key=lambda item: (item[0], item[1]),
     )
     return path, summary
 
@@ -753,6 +750,7 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         print("Reutilizando metadata object pack local para distribución")
         print(f"   path: {pack_path}")
+        print(f"   vault_id: {summary.vault_id}")
         print(f"   vault_generation: {summary.vault_generation}")
         print(f"   pack_created_at: {format_time(summary.pack_created_at_unix)}")
         print(f"   catalog_hash: {summary.catalog_hash}")
@@ -774,6 +772,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     print("Metadata object pack creado para distribución")
     print(f"   path: {pack_result.path}")
     print(f"   pack_hash: {pack_result.pack_hash}")
+    print(f"   vault_id: {pack_result.vault_id}")
     print(f"   vault_generation: {pack_result.vault_generation}")
     print(f"   pack_created_at: {format_time(pack_result.pack_created_at_unix)}")
     print(f"   catalog_hash: {pack_result.catalog_hash}")
@@ -790,10 +789,22 @@ def cmd_recover(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     owner_id = owner_id_from_args(args, cfg)
     object_store_dir = args.object_store or cfg.metadata.object_store_dir
-    if not object_store_dir:
+    if not object_store_dir and not args.download_only:
         raise StopanUsageError("Se requiere --object-store o metadata.object_store_dir.")
+    if not object_store_dir and not args.pack_out and not args.download_dir:
+        raise StopanUsageError(
+            "Se requiere --pack-out, --download-dir o --object-store para guardar el pack recuperado."
+        )
 
     passphrase = passphrase_for_decrypt(args)
+
+    if args.vault_id is not None:
+        from stopan.metadata.packs.payload import require_vault_id
+
+        try:
+            require_vault_id("vault_id", args.vault_id)
+        except Exception as exc:
+            raise StopanUsageError(str(exc)) from exc
 
     from stopan.metadata.packs.recover import recover_metadata_from_network
 
@@ -816,6 +827,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         db_file=cfg.node.db_file,
         import_db=bool(args.import_db),
         include_protection=not bool(args.no_protection),
+        download_only=bool(args.download_only),
         default_desired_rf=int(
             args.default_desired_remote_copies
             if args.default_desired_remote_copies is not None
@@ -823,13 +835,16 @@ def cmd_recover(args: argparse.Namespace) -> int:
         ),
         download_dir=args.download_dir,
         pack_out=args.pack_out,
-        max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
         target_hash=args.target_hash,
+        vault_id=args.vault_id,
     )
 
     print("Metadata recover remoto completado")
     print(f"   owner_id: {result.owner_id}")
-    print(f"   object_store: {result.object_store_dir}")
+    if result.object_store_dir is not None:
+        print(f"   object_store: {result.object_store_dir}")
+    else:
+        print("   object_store: skipped (--download-only)")
     stats = result.stats
     print(f"   list_targets: {stats.list_targets_succeeded}/{stats.list_targets_attempted}")
     print(f"   candidates_seen: {stats.candidates_seen}")
@@ -837,7 +852,10 @@ def cmd_recover(args: argparse.Namespace) -> int:
     print(f"   downloads_attempted: {stats.downloads_attempted}")
     if args.target_hash:
         print(f"   target_hash: {args.target_hash}")
+    if args.vault_id:
+        print(f"   target_vault_id: {args.vault_id}")
     print(f"   recovered_pack_hash: {result.recovered_pack_hash}")
+    print(f"   vault_id: {result.vault_id}")
     print(f"   recovered_pack_path: {result.recovered_pack_path}")
     print(f"   recovered_from: {result.recovered_from_node_id[:8] or 'unknown'}@{result.recovered_from_address}")
     if result.remote_stored_at_unix:
@@ -855,11 +873,14 @@ def cmd_recover(args: argparse.Namespace) -> int:
     print(f"   protection_records: {result.pack_protection_record_count}")
 
     pack_import = result.pack_import_result
-    pack_import_stats = pack_import.stats
-    print("Imported object pack")
-    print(f"   objects_total: {pack_import_stats.objects_total}")
-    print(f"   objects_written: {pack_import_stats.objects_written}")
-    print(f"   objects_reused: {pack_import_stats.objects_reused}")
+    if pack_import is not None:
+        pack_import_stats = pack_import.stats
+        print("Imported object pack")
+        print(f"   objects_total: {pack_import_stats.objects_total}")
+        print(f"   objects_written: {pack_import_stats.objects_written}")
+        print(f"   objects_reused: {pack_import_stats.objects_reused}")
+    else:
+        print("Imported object pack: skipped (--download-only)")
 
     if result.db_import_result is not None:
         db_import = result.db_import_result
@@ -876,7 +897,8 @@ def cmd_recover(args: argparse.Namespace) -> int:
         print(f"   erasure_pack_chunks_imported: {db_import_stats.erasure_pack_chunks_imported}")
         print(f"   erasure_pack_shards_imported: {db_import_stats.erasure_pack_shards_imported}")
     else:
-        print("Rebuilt local metadata DB: skipped (--no-import-db)")
+        reason = "--download-only" if args.download_only else "--no-import-db"
+        print(f"Rebuilt local metadata DB: skipped ({reason})")
 
     warning_limit = _configured_warning_limit(cfg)
     _print_limited_items("List warnings", stats.list_errors, limit=warning_limit)
@@ -994,6 +1016,8 @@ def cmd_pack_object_graph(args: argparse.Namespace) -> int:
     print("Metadata object pack creado")
     print(f"   path: {result.path}")
     print(f"   pack_hash: {result.pack_hash}")
+    print(f"   vault_id: {result.vault_id}")
+    print(f"   vault_generation: {result.vault_generation}")
     print(f"   catalog_hash: {result.catalog_hash}")
     print(f"   state_digest: {result.state_digest}")
     stats = result.stats
@@ -1032,6 +1056,7 @@ def cmd_inspect_object_pack(args: argparse.Namespace) -> int:
     if inspection.decrypted is not None:
         summary = inspection.decrypted
         print("Decrypted pack")
+        print(f"   vault_id: {summary.vault_id}")
         print(f"   vault_generation: {summary.vault_generation}")
         print(f"   pack_created_at: {format_time(summary.pack_created_at_unix)}")
         print(f"   catalog_hash: {summary.catalog_hash}")
@@ -1060,6 +1085,7 @@ def cmd_import_object_pack(args: argparse.Namespace) -> int:
     print("Metadata object pack importado")
     print(f"   path: {result.path}")
     print(f"   pack_hash: {result.pack_hash}")
+    print(f"   vault_id: {result.vault_id}")
     print(f"   vault_generation: {result.vault_generation}")
     print(f"   pack_created_at: {format_time(result.pack_created_at_unix)}")
     print(f"   object_store: {result.object_store_dir}")

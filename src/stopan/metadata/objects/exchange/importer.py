@@ -29,6 +29,13 @@ from .validation import (
 from .writer import MetadataDBImportWriter
 
 
+
+def _require_vault_id(name: str, value: object) -> str:
+    text = require_str(name, value)
+    if len(text) != 32 or any(char not in "0123456789abcdef" for char in text):
+        raise MetadataObjectImportError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
+    return text
+
 @dataclass(frozen=True, slots=True)
 class MetadataObjectGraphImportStats:
     objects_read: int
@@ -50,6 +57,7 @@ class MetadataObjectGraphImportStats:
 class MetadataObjectGraphImportResult:
     db_file: str
     object_store_dir: Path
+    vault_id: str
     catalog_hash: str
     state_digest: str
     stats: MetadataObjectGraphImportStats
@@ -79,6 +87,11 @@ class MetadataObjectGraphImporter:
     def import_latest(self, *, include_protection: bool = True) -> MetadataObjectGraphImportResult:
         latest = self.store.read_latest_pointer()
         catalog = self.reader.payload(latest.catalog_hash, MetadataObjectType.CATALOG)
+        catalog_vault_id = _require_vault_id("catalog.vault_id", catalog.get("vault_id"))
+        if catalog_vault_id != latest.vault_id:
+            raise MetadataObjectImportError(
+                f"catalog.vault_id={catalog_vault_id} no coincide con latest.vault_id={latest.vault_id}"
+            )
 
         chunks = self._load_chunks(catalog)
         # La protección se lee siempre si existe para validar latest.state_digest
@@ -96,6 +109,7 @@ class MetadataObjectGraphImporter:
 
         db = MetadataDB(self.db_file)
         try:
+            db.set_vault_id(latest.vault_id)
             writer.require_empty_operational_db(db)
             with db.conn:
                 chunks_inserted = writer.insert_chunks(db, chunks)
@@ -133,6 +147,7 @@ class MetadataObjectGraphImporter:
         return MetadataObjectGraphImportResult(
             db_file=self.db_file,
             object_store_dir=self.object_store_dir,
+            vault_id=latest.vault_id,
             catalog_hash=latest.catalog_hash,
             state_digest=latest.state_digest,
             stats=MetadataObjectGraphImportStats(

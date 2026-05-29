@@ -219,6 +219,9 @@ Recuperar metadata desde packs remotos y reconstruir un object store local en un
 
 ```bash
 python -m stopan metadata pack recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051
+
+python -m stopan metadata pack recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --vault-id VAULT_ID
+
 python -m stopan metadata pack recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --target-hash PACK_HASH
 ```
 

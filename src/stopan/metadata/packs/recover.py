@@ -19,6 +19,7 @@ from stopan.metadata.objects.service import MetadataObjectGraphStoreService
 from stopan.metadata.packs.object_pack import MetadataObjectPackService
 from stopan.metadata.packs.discovery import discover_metadata_packs_from_network
 from stopan.metadata.packs.hashes import validate_pack_hash
+from stopan.metadata.packs.payload import require_vault_id
 from stopan.metadata.packs.remote import (
     MetadataPackSource,
     metadata_pack_target_label as _target_label,
@@ -35,6 +36,7 @@ class DownloadedMetadataPackCandidate:
     pack_hash: str
     pack_path: Path
     source: MetadataPackSource
+    vault_id: str
     vault_generation: int
     pack_created_at_unix: float
     catalog_hash: str
@@ -59,9 +61,10 @@ class MetadataPackRecoverStats:
 @dataclass(frozen=True, slots=True)
 class MetadataPackRecoverResult:
     owner_id: str
-    object_store_dir: Path
+    object_store_dir: Path | None
     stats: MetadataPackRecoverStats
     recovered_pack_hash: str
+    vault_id: str
     recovered_pack_path: Path
     recovered_from_address: str
     recovered_from_node_id: str
@@ -74,7 +77,7 @@ class MetadataPackRecoverResult:
     pack_snapshot_count: int
     pack_known_chunk_count: int
     pack_protection_record_count: int
-    pack_import_result: Any
+    pack_import_result: Any | None
     db_import_result: Any | None
 
 
@@ -83,7 +86,7 @@ def recover_metadata_from_network(
     *,
     owner_id: str,
     identity_file: str | Path,
-    object_store_dir: str | Path,
+    object_store_dir: str | Path | None,
     passphrase: str | bytes,
     membership_seed: str | None,
     self_addr: str,
@@ -100,14 +103,16 @@ def recover_metadata_from_network(
     default_desired_rf: int,
     import_db: bool = True,
     include_protection: bool = True,
+    download_only: bool = False,
     download_dir: str | Path | None = None,
     pack_out: str | Path | None = None,
-    max_candidates: int | None = None,
     target_hash: str | None = None,
+    vault_id: str | None = None,
 ) -> MetadataPackRecoverResult:
     owner = validate_owner_id(owner_id)
     requested_hash = validate_pack_hash(target_hash) if target_hash is not None else None
-    object_store_path = Path(object_store_dir).expanduser().resolve()
+    requested_vault_id = require_vault_id("vault_id", vault_id) if vault_id is not None else None
+    object_store_path = Path(object_store_dir).expanduser().resolve() if object_store_dir is not None else None
     max_message_bytes = int(max_message_bytes)
     parallelism = max(1, int(target_parallelism))
 
@@ -125,7 +130,7 @@ def recover_metadata_from_network(
             grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
             grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
             desired_copies_by_hash=None,
-            max_candidates=None if requested_hash is not None else max_candidates,
+            max_candidates=None,
         )
     except Exception as exc:
         raise MetadataPackRecoverError(str(exc)) from exc
@@ -150,7 +155,14 @@ def recover_metadata_from_network(
         selected_pack_path_base = Path(pack_out).expanduser().resolve()
         ensure_private_dir(selected_pack_path_base.parent)
     else:
-        base = Path(download_dir).expanduser().resolve() if download_dir is not None else object_store_path / "recovered_packs"
+        if download_dir is not None:
+            base = Path(download_dir).expanduser().resolve()
+        elif object_store_path is not None:
+            base = object_store_path / "recovered_packs"
+        else:
+            raise MetadataPackRecoverError(
+                "Se requiere --pack-out, --download-dir o --object-store para guardar el pack recuperado."
+            )
         ensure_private_dir(base)
         selected_pack_path_base = base / "recovered.stopanmetapack"
 
@@ -197,6 +209,7 @@ def recover_metadata_from_network(
                         pack_hash=candidate.pack_hash,
                         pack_path=pack_path,
                         source=source,
+                        vault_id=summary.vault_id,
                         vault_generation=int(summary.vault_generation),
                         pack_created_at_unix=float(summary.pack_created_at_unix),
                         catalog_hash=summary.catalog_hash,
@@ -213,16 +226,29 @@ def recover_metadata_from_network(
                 continue
 
     if valid_downloads:
-        best = sorted(
-            valid_downloads,
+        selectable_downloads = valid_downloads
+        if requested_vault_id is not None:
+            selectable_downloads = [item for item in valid_downloads if item.vault_id == requested_vault_id]
+            if not selectable_downloads:
+                raise MetadataPackRecoverError(
+                    f"No se encontró ningún metadata pack válido para vault_id={requested_vault_id}"
+                )
+        elif requested_hash is None:
+            vault_ids = sorted({item.vault_id for item in valid_downloads})
+            if len(vault_ids) > 1:
+                raise MetadataPackRecoverError(
+                    "Se encontraron metadata packs de varios vault_id para el mismo owner_id: "
+                    + ", ".join(vault_ids)
+                    + ". Usa --vault-id o --target-hash para elegir uno."
+                )
+
+        best = max(
+            selectable_downloads,
             key=lambda item: (
                 int(item.vault_generation),
-                float(item.pack_created_at_unix),
-                float(item.source.stored_at_unix),
                 item.pack_hash,
             ),
-            reverse=True,
-        )[0]
+        )
 
         if pack_out is not None and best.pack_path != selected_pack_path_base:
             try:
@@ -234,20 +260,26 @@ def recover_metadata_from_network(
         else:
             best_path = best.pack_path
 
-        pack_import_result = pack_service.import_pack(
-            best_path,
-            identity_file=identity_file,
-            object_store_dir=object_store_path,
-            passphrase=passphrase,
-        )
+        pack_import_result = None
         db_import_result = None
-        if import_db:
-            db_import_result = graph_service.import_latest_state(
+        if not download_only:
+            if object_store_path is None:
+                raise MetadataPackRecoverError(
+                    "Se requiere --object-store o metadata.object_store_dir para importar el pack recuperado."
+                )
+            pack_import_result = pack_service.import_pack(
+                best_path,
+                identity_file=identity_file,
                 object_store_dir=object_store_path,
                 passphrase=passphrase,
-                include_protection=include_protection,
-                default_desired_rf=int(default_desired_rf),
             )
+            if import_db:
+                db_import_result = graph_service.import_latest_state(
+                    object_store_dir=object_store_path,
+                    passphrase=passphrase,
+                    include_protection=include_protection,
+                    default_desired_rf=int(default_desired_rf),
+                )
 
         return MetadataPackRecoverResult(
             owner_id=owner,
@@ -262,6 +294,7 @@ def recover_metadata_from_network(
                 download_errors=tuple(download_errors),
             ),
             recovered_pack_hash=best.pack_hash,
+            vault_id=best.vault_id,
             recovered_pack_path=best_path,
             recovered_from_address=best.source.address,
             recovered_from_node_id=best.source.node_id,

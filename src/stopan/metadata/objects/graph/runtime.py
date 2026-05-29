@@ -26,6 +26,16 @@ def _require_hash64(name: str, value: object) -> str:
     return text
 
 
+def _require_vault_id(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise MetadataObjectError(f"{name} debe ser str; recibido {type(value).__name__}")
+
+    text = value.strip()
+    if len(text) != 32 or any(char not in "0123456789abcdef" for char in text):
+        raise MetadataObjectError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
+
+    return text
+
 def _require_int(name: str, value: object, *, min_value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise MetadataObjectError(f"{name} debe ser int; recibido {type(value).__name__}")
@@ -36,6 +46,7 @@ def _require_int(name: str, value: object, *, min_value: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class MetadataObjectGraph:
+    vault_id: str
     catalog_hash: str
     catalog_ref: ObjectRef
     state_digest: str
@@ -45,6 +56,7 @@ class MetadataObjectGraph:
     protection_record_count: int
 
     def __post_init__(self) -> None:
+        vault_id = _require_vault_id("metadata_graph.vault_id", self.vault_id)
         catalog_hash = _require_hash64("metadata_graph.catalog_hash", self.catalog_hash)
         state_digest = _require_hash64(
             "metadata_graph.state_digest",
@@ -76,6 +88,7 @@ class MetadataObjectGraph:
         if catalog_hash not in normalized:
             raise MetadataObjectError("metadata_graph.objects debe contener catalog_hash")
 
+        object.__setattr__(self, "vault_id", vault_id)
         object.__setattr__(self, "catalog_hash", catalog_hash)
         object.__setattr__(self, "state_digest", state_digest)
         object.__setattr__(

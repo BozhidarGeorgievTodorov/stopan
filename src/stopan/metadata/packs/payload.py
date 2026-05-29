@@ -28,6 +28,7 @@ _HEX64_ALPHABET = set("0123456789abcdef")
 
 @dataclass(frozen=True, slots=True)
 class ParsedPackPayloadBase:
+    vault_id: str
     latest: LatestMetadataPointer
     entries: list[dict[str, Any]]
     vault_generation: int
@@ -40,6 +41,15 @@ def require_metadata_hash(name: str, value: object) -> str:
     text = value.strip()
     if len(text) != 64 or any(char not in _HEX64_ALPHABET for char in text):
         raise MetadataObjectPackError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
+    return text
+
+
+def require_vault_id(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise MetadataObjectPackError(f"{name} debe ser string")
+    text = value.strip()
+    if len(text) != 32 or any(char not in _HEX64_ALPHABET for char in text):
+        raise MetadataObjectPackError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
     return text
 
 
@@ -114,6 +124,7 @@ def pack_payload(
             "format": OBJECT_PACK_PAYLOAD_FORMAT,
             "version": OBJECT_PACK_PAYLOAD_VERSION,
             "vault": {
+                "id": require_vault_id("latest.vault_id", latest.vault_id),
                 "generation": generation,
                 "created_at_unix": created_at,
             },
@@ -147,6 +158,7 @@ def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
     if not isinstance(vault_raw, dict):
         raise MetadataObjectPackError("payload de metadata pack sin sección vault válida")
 
+    vault_id = require_vault_id("vault.id", vault_raw.get("id"))
     vault_generation = require_positive_int("vault.generation", vault_raw.get("generation"))
     pack_created_at_unix = require_positive_float("vault.created_at_unix", vault_raw.get("created_at_unix"))
 
@@ -155,6 +167,7 @@ def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
         raise MetadataObjectPackError("payload de metadata pack sin sección latest válida")
 
     latest = LatestMetadataPointer(
+        vault_id=vault_id,
         catalog_hash=require_metadata_hash("latest.catalog_hash", latest_raw.get("catalog_hash")),
         state_digest=require_metadata_hash("latest.state_digest", latest_raw.get("state_digest")),
         object_count=require_non_negative_int("latest.object_count", latest_raw.get("object_count")),
@@ -180,6 +193,7 @@ def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
         )
 
     return ParsedPackPayloadBase(
+        vault_id=vault_id,
         latest=latest,
         entries=entries,
         vault_generation=vault_generation,
@@ -187,12 +201,13 @@ def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
     )
 
 
-def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, list[EncodedMetadataObject], int, float]:
+def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, list[EncodedMetadataObject], str, int, float]:
     parsed = parse_pack_payload_base(payload)
 
     objects: list[EncodedMetadataObject] = []
     seen: set[str] = set()
     total_bytes = 0
+    catalog_vault_id: str | None = None
 
     for index, entry in enumerate(parsed.entries):
         if not isinstance(entry, dict):
@@ -209,12 +224,14 @@ def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, 
             raise MetadataObjectPackError(f"tipo de objeto de metadata pack no soportado: {entry.get('object_type')!r}") from exc
 
         canonical = b64decode(f"pack object[{index}].canonical_b64", entry.get("canonical_b64"))
-        actual_type, _payload = decode_object_envelope(canonical, expected_hash=object_hash)
+        actual_type, object_payload = decode_object_envelope(canonical, expected_hash=object_hash)
 
         if actual_type != expected_type:
             raise MetadataObjectPackError(
                 f"tipo de objeto de metadata pack no coincide {object_hash}: esperado={expected_type.value} actual={actual_type.value}"
             )
+        if actual_type == MetadataObjectType.CATALOG and object_hash == parsed.latest.catalog_hash:
+            catalog_vault_id = require_vault_id("catalog.vault_id", object_payload.get("vault_id"))
 
         declared_size = require_non_negative_int(f"pack object[{index}].canonical_bytes", entry.get("canonical_bytes"))
         if declared_size != len(canonical):
@@ -235,11 +252,17 @@ def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, 
         raise MetadataObjectPackError(
             f"pack latest.total_canonical_bytes={parsed.latest.total_canonical_bytes} pero contiene {total_bytes} bytes"
         )
+    if catalog_vault_id is None:
+        raise MetadataObjectPackError("metadata pack no contiene el catalog latest")
+    if catalog_vault_id != parsed.vault_id:
+        raise MetadataObjectPackError(
+            f"catalog.vault_id={catalog_vault_id} no coincide con vault.id={parsed.vault_id}"
+        )
 
-    return parsed.latest, objects, parsed.vault_generation, parsed.pack_created_at_unix
+    return parsed.latest, objects, parsed.vault_id, parsed.vault_generation, parsed.pack_created_at_unix
 
 
-def parse_pack_payload_summary(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, int, float]:
+def parse_pack_payload_summary(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, str, int, float]:
     parsed = parse_pack_payload_base(payload)
 
     seen: set[str] = set()
@@ -269,4 +292,4 @@ def parse_pack_payload_summary(payload: dict[str, Any]) -> tuple[LatestMetadataP
             f"pack latest.total_canonical_bytes={parsed.latest.total_canonical_bytes} pero declara {total_declared_bytes} bytes"
         )
 
-    return parsed.latest, parsed.vault_generation, parsed.pack_created_at_unix
+    return parsed.latest, parsed.vault_id, parsed.vault_generation, parsed.pack_created_at_unix

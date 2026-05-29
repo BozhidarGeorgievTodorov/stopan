@@ -58,6 +58,15 @@ def _require_hash64(name: str, value: object) -> str:
     return value
 
 
+def _require_vault_id(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise MetadataObjectStoreError(f"{name} debe ser string")
+    text = value.strip()
+    if len(text) != 32 or any(char not in "0123456789abcdef" for char in text):
+        raise MetadataObjectStoreError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
+    return text
+
+
 def _require_int(name: str, value: object, *, min_value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise MetadataObjectStoreError(f"{name} debe ser entero")
@@ -68,6 +77,7 @@ def _require_int(name: str, value: object, *, min_value: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class LatestMetadataPointer:
+    vault_id: str
     catalog_hash: str
     state_digest: str
     object_count: int
@@ -77,6 +87,7 @@ class LatestMetadataPointer:
     protection_record_count: int
 
     def __post_init__(self) -> None:
+        _require_vault_id("latest.vault_id", self.vault_id)
         _require_hash64("latest.catalog_hash", self.catalog_hash)
         _require_hash64("latest.state_digest", self.state_digest)
         _require_int("latest.object_count", self.object_count, min_value=0)
@@ -93,6 +104,7 @@ class LatestMetadataPointer:
 @dataclass(frozen=True, slots=True)
 class MetadataObjectStoreWriteResult:
     root_dir: Path
+    vault_id: str
     catalog_hash: str
     state_digest: str
     objects_total: int
@@ -185,6 +197,7 @@ class MetadataObjectStore:
 
         self.write_latest_pointer(
             LatestMetadataPointer(
+                vault_id=graph.vault_id,
                 catalog_hash=graph.catalog_hash,
                 state_digest=graph.state_digest,
                 object_count=graph.object_count,
@@ -197,6 +210,7 @@ class MetadataObjectStore:
 
         return MetadataObjectStoreWriteResult(
             root_dir=self.root_dir,
+            vault_id=graph.vault_id,
             catalog_hash=graph.catalog_hash,
             state_digest=graph.state_digest,
             objects_total=graph.object_count,
@@ -359,6 +373,7 @@ class MetadataObjectStore:
             {
                 "format": LATEST_POINTER_FORMAT,
                 "version": LATEST_POINTER_VERSION,
+                "vault_id": latest.vault_id,
                 "catalog_hash": latest.catalog_hash,
                 "state_digest": latest.state_digest,
                 "object_count": latest.object_count,
@@ -435,6 +450,7 @@ class MetadataObjectStore:
             )
 
         return LatestMetadataPointer(
+            vault_id=_require_vault_id("latest.vault_id", decoded.get("vault_id")),
             catalog_hash=str(decoded["catalog_hash"]),
             state_digest=str(decoded["state_digest"]),
             object_count=int(decoded["object_count"]),

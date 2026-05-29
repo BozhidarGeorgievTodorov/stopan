@@ -72,7 +72,6 @@ def validate_metadata_args(parser: argparse.ArgumentParser, args: argparse.Names
             (
                 IntRange("target_parallelism", "--target-parallelism", 1),
                 IntRange("max_message_bytes", "--max-message-bytes", 1),
-                IntRange("max_candidates", "--max-candidates", 1),
             ),
         )
         validate_float_ranges(
@@ -81,6 +80,12 @@ def validate_metadata_args(parser: argparse.ArgumentParser, args: argparse.Names
             (FloatRange("rpc_timeout_s", "--rpc-timeout-s", 0.0, inclusive=False),),
         )
         reject_together(parser, args, Flag("pack_out", "--pack-out"), Flag("download_dir", "--download-dir"))
+        if args.download_only and not args.import_db:
+            parser.error("'--download-only' y '--no-import-db' son incompatibles")
+        if args.download_only and args.no_protection:
+            parser.error("'--download-only' y '--no-protection' son incompatibles")
+        if args.download_only and args.default_desired_remote_copies is not None:
+            parser.error("--default-desired-remote-copies requiere importar la DB")
         if not args.import_db and args.no_protection:
             parser.error("'--no-import-db' y '--no-protection' son incompatibles")
         if not args.import_db and args.default_desired_remote_copies is not None:

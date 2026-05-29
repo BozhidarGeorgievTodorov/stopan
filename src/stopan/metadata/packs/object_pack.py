@@ -18,11 +18,63 @@ from stopan.metadata.objects.graph.walk import collect_reachable_object_bytes
 from stopan.metadata.objects.store import MetadataObjectStore, object_store_lock
 from stopan.metadata.packs.crypto import decrypt_pack_payload, encrypt_pack_payload
 from stopan.metadata.packs.format import (
+    MetadataObjectPackError,
     MetadataObjectPackHeader,
     OBJECT_PACK_FILE_SUFFIX,
     read_pack_header,
 )
-from stopan.metadata.packs.payload import pack_payload, parse_pack_payload, parse_pack_payload_summary
+from stopan.metadata.packs.payload import (
+    pack_payload,
+    parse_pack_payload,
+    parse_pack_payload_summary,
+    require_vault_id,
+)
+
+
+_PACK_GENERATION_DIR = "pack-generations"
+
+
+def _pack_generation_path(object_store_dir: str | Path, vault_id: str) -> Path:
+    vault = require_vault_id("vault_id", vault_id)
+    return Path(object_store_dir).expanduser().resolve() / _PACK_GENERATION_DIR / f"{vault}.txt"
+
+
+def _read_pack_generation(object_store_dir: str | Path, vault_id: str) -> int:
+    path = _pack_generation_path(object_store_dir, vault_id)
+    if not path.exists():
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise MetadataObjectPackError(f"No se pudo leer la generación de metadata packs {path}: {exc}") from exc
+
+    try:
+        generation = int(text)
+    except ValueError as exc:
+        raise MetadataObjectPackError(f"Generación de metadata packs inválida en {path}: {text!r}") from exc
+    if generation < 0:
+        raise MetadataObjectPackError(f"Generación de metadata packs negativa en {path}: {generation}")
+    return generation
+
+
+def _write_pack_generation(object_store_dir: str | Path, vault_id: str, generation: int) -> None:
+    if generation < 0:
+        raise MetadataObjectPackError(f"Generación de metadata packs negativa: {generation}")
+    path = _pack_generation_path(object_store_dir, vault_id)
+    ensure_private_dir(path.parent)
+    atomic_write_bytes(path, f"{int(generation)}\n".encode("utf-8"), mode=0o600)
+
+
+def _next_pack_generation(object_store_dir: str | Path, vault_id: str) -> int:
+    generation = _read_pack_generation(object_store_dir, vault_id) + 1
+    _write_pack_generation(object_store_dir, vault_id, generation)
+    return generation
+
+
+def _remember_pack_generation(object_store_dir: str | Path, vault_id: str, generation: int) -> None:
+    generation = int(generation)
+    if generation > _read_pack_generation(object_store_dir, vault_id):
+        _write_pack_generation(object_store_dir, vault_id, generation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +85,7 @@ class MetadataObjectPackInspection:
 
 @dataclass(frozen=True, slots=True)
 class MetadataObjectPackSummary:
+    vault_id: str
     vault_generation: int
     pack_created_at_unix: float
     catalog_hash: str
@@ -62,6 +115,7 @@ class MetadataObjectPackExportStats:
 class MetadataObjectPackExportResult:
     path: Path
     pack_hash: str
+    vault_id: str
     vault_generation: int
     pack_created_at_unix: float
     catalog_hash: str
@@ -84,6 +138,7 @@ class MetadataObjectPackImportStats:
 class MetadataObjectPackImportResult:
     path: Path
     pack_hash: str
+    vault_id: str
     vault_generation: int
     pack_created_at_unix: float
     object_store_dir: Path
@@ -116,7 +171,7 @@ class MetadataObjectPackService:
                 read_object_bytes=lambda object_hash: store.get_object_bytes(object_hash=object_hash),
             )
             pack_created_at_unix = time.time()
-            vault_generation = time.time_ns()
+            vault_generation = _next_pack_generation(object_store_dir, latest.vault_id)
             plaintext = pack_payload(
                 latest=latest,
                 objects=objects,
@@ -145,6 +200,7 @@ class MetadataObjectPackService:
         return MetadataObjectPackExportResult(
             path=path,
             pack_hash=pack_hash,
+            vault_id=latest.vault_id,
             vault_generation=vault_generation,
             pack_created_at_unix=pack_created_at_unix,
             catalog_hash=latest.catalog_hash,
@@ -183,10 +239,11 @@ class MetadataObjectPackService:
             identity_file=identity_file,
             passphrase=passphrase,
         )
-        latest, vault_generation, pack_created_at_unix = parse_pack_payload_summary(payload)
+        latest, vault_id, vault_generation, pack_created_at_unix = parse_pack_payload_summary(payload)
         return MetadataObjectPackInspection(
             header=header,
             decrypted=MetadataObjectPackSummary(
+                vault_id=vault_id,
                 vault_generation=vault_generation,
                 pack_created_at_unix=pack_created_at_unix,
                 catalog_hash=latest.catalog_hash,
@@ -215,7 +272,7 @@ class MetadataObjectPackService:
             identity_file=identity_file,
             passphrase=passphrase,
         )
-        latest, objects, vault_generation, pack_created_at_unix = parse_pack_payload(payload)
+        latest, objects, vault_id, vault_generation, pack_created_at_unix = parse_pack_payload(payload)
 
         with object_store_lock(object_store_dir):
             store = MetadataObjectStore.open_or_create(
@@ -225,10 +282,12 @@ class MetadataObjectPackService:
             )
             written, reused = store.put_objects_batch(objects)
             store.write_latest_pointer(latest)
+            _remember_pack_generation(object_store_dir, vault_id, vault_generation)
 
         return MetadataObjectPackImportResult(
             path=pack_path,
             pack_hash=header.pack_hash,
+            vault_id=vault_id,
             vault_generation=vault_generation,
             pack_created_at_unix=pack_created_at_unix,
             object_store_dir=store.root_dir,

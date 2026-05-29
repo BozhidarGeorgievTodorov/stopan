@@ -116,7 +116,7 @@ class MembershipManager:
                 address=self.address,
                 incarnation=self.incarnation,
                 state=membership_pb2.ALIVE,
-                last_seen=time.time(),
+                last_seen=time.monotonic(),
             )
         }
 
@@ -252,7 +252,7 @@ class MembershipManager:
 
         with self._lock:
             current = self._members.get(event.node_id)
-            observed_at = time.time()
+            observed_at = time.monotonic()
 
             if current is None:
                 self._members[event.node_id] = _new_record_from_event(event, observed_at=observed_at)
@@ -334,7 +334,7 @@ class MembershipManager:
             me.incarnation = self.incarnation
             me.state = membership_pb2.ALIVE
             me.address = self.address
-            me.last_seen = time.time()
+            me.last_seen = time.monotonic()
             me.suspect_since = None
         self.gossip.add(event)
 
@@ -392,7 +392,7 @@ class MembershipManager:
 
     def _expire_suspects(self) -> None:
         """Promueve SUSPECT a DEAD al superar suspect_timeout_s."""
-        now = time.time()
+        now = time.monotonic()
         expired = []
 
         with self._lock:
@@ -429,7 +429,7 @@ class MembershipManager:
             with self._lock:
                 current = self._members.get(target.node_id)
                 if current and current.state == membership_pb2.ALIVE:
-                    current.last_seen = time.time()
+                    current.last_seen = time.monotonic()
 
             return response.ok
         except (grpc.RpcError, ValueError):

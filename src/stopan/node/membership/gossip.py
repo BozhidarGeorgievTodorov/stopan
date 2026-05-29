@@ -29,7 +29,7 @@ class GossipBuffer:
             return
 
         with self._lock:
-            self._events.append((time.time(), event))
+            self._events.append((time.monotonic(), event))
             self._gc_locked()
 
     def sample(self, limit: int) -> list[membership_pb2.MemberEvent]:
@@ -40,5 +40,5 @@ class GossipBuffer:
 
     def _gc_locked(self) -> None:
         """Elimina eventos que superan el TTL. Requiere _lock adquirido."""
-        cutoff = time.time() - self._ttl_s
+        cutoff = time.monotonic() - self._ttl_s
         self._events = [(ts, event) for ts, event in self._events if ts >= cutoff]

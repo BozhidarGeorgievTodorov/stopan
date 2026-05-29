@@ -46,7 +46,7 @@ python -m stopan backup test_data --safe
 | `metadata pack push` | pack distribuido | identity/passphrase, membership seed/config | `--pack-in`, `--object-store`, `--pack-out`, `--pack-dir`, `--pack-copies`, `--strict-pack-copies`, `--target-parallelism` | `--pack-in` con `--object-store`, `--pack-out` o `--pack-dir`; `--pack-out` con `--pack-dir` | `--pack-copies` son copias remotas del metadata pack, separadas de la política de chunks. |
 | `metadata pack discover` | inventario remoto | owner/identity, membership seed/config | `--max-candidates`, `--show-sources` | flags de descarga/importación | Lista packs remotos del owner. Muestra `presence_state` solo si existe publicación local con copias esperadas; si no, `UNKNOWN`. |
 | `metadata pack verify` | auditoría remota | owner/identity, membership seed/config | `--pack-hash`, `--all`, `--max-candidates`, `--show-sources` | `--pack-hash` con `--all` | Verifica presencia remota contra publicaciones locales persistidas. Con `--pack-hash` usa `ProbeMetadataPack`; sin hash usa discovery. Si no conoce la intención, muestra `UNKNOWN`. |
-| `metadata pack recover` / `metadata graph import` | reconstrucción metadata | según comando | `--target-hash`, `--default-desired-remote-copies` | flags de `push`/EC | `recover` elige el latest válido si no hay `--target-hash`; con hash fijo recupera solo ese pack. |
+| `metadata pack recover` / `metadata graph import` | reconstrucción metadata | según comando | `--target-hash`, `--vault-id`, `--download-only`, `--no-import-db`, `--default-desired-remote-copies` | flags de `push`/EC | `recover` elige el latest válido si no hay selector; puede limitarse a descargar el pack, dejarlo preparado en el object store o reconstruir la DB. |
 
 ## 3. Contrato general de flags
 
@@ -66,7 +66,7 @@ Los límites operativos de descubrimiento de metadata packs siguen la configurac
 - `metadata.cli_warning_limit` define cuántos warnings/errores repetitivos imprime la CLI de metadata antes de resumir el resto.
 - `--max-candidates` puede sobrescribir el límite de candidatos en una ejecución concreta.
 - `metadata pack discover` y `metadata pack verify` usan la publicación local persistida por `metadata pack push` para conocer las copias esperadas. Si no existe publicación local, imprimen `desired_copies: unknown` y `presence_state: UNKNOWN`.
-- `metadata pack verify` comprueba presencia distribuida. `metadata pack recover` descarga el pack elegido y valida firma/hash antes de importarlo.
+- `metadata pack verify` comprueba presencia distribuida. `metadata pack recover` descarga el pack elegido y valida firma/hash antes de importarlo. Si el owner tiene packs de varios vaults, la recuperación automática requiere `--vault-id` o `--target-hash`.
 
 También se rechazan combinaciones que dejarían flags ignorados:
 
@@ -75,7 +75,8 @@ También se rechazan combinaciones que dejarían flags ignorados:
 - `metadata pack create --out` y `--pack-dir` son incompatibles.
 - `metadata pack inspect --passphrase-file` o `--identity-file` requieren `--decrypt`.
 - `metadata pack verify --pack-hash` y `--all` son incompatibles.
-- `metadata pack recover --pack-out` y `--download-dir` son incompatibles; `--target-hash` limita la recuperación a un pack concreto.
+- `metadata pack recover --pack-out` y `--download-dir` son incompatibles; `--target-hash` limita la recuperación a un pack concreto y `--vault-id` limita la selección automática a un vault.
+- `metadata pack recover --download-only` es incompatible con `--no-import-db`, `--no-protection` y `--default-desired-remote-copies`.
 - `metadata pack recover --no-import-db` es incompatible con `--no-protection` y con `--default-desired-remote-copies`.
 
 Se mantienen tres precedencias explícitas: `backup --safe` desactiva fast-path aunque se pase `--fast` o `--fast-remote`; `metadata pack push --pack-copies 0` puede combinarse con `--membership-seed` aunque no envíe el pack; y `metadata pack list --pack-dir` tiene prioridad sobre `--object-store`.
@@ -311,6 +312,13 @@ python -m stopan metadata pack verify \
 **Recuperar un metadata pack distribuido concreto:**
 
 ```bash
+python -m stopan metadata pack recover \
+  --object-store metadata_object_store_imported \
+  --passphrase-file metadata.passphrase \
+  --identity-file metadata_identity.json \
+  --membership-seed localhost:50051 \
+  --vault-id VAULT_ID
+
 python -m stopan metadata pack recover \
   --object-store metadata_object_store_imported \
   --passphrase-file metadata.passphrase \

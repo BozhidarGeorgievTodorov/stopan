@@ -73,6 +73,7 @@ class MetadataObjectGraphExporter:
         self._objects = {}
         self._recipe_ref_cache = {}
 
+        vault_id = self.db.get_or_create_vault_id()
         snapshot_index_ref, snapshot_count = self._export_snapshot_index()
         known_chunk_index_ref, known_chunk_count = self._export_known_chunk_index()
         protection_index_ref = None
@@ -92,6 +93,7 @@ class MetadataObjectGraphExporter:
             ) = self._export_erasure_data_pack_index()
 
         catalog = CatalogObject(
+            vault_id=vault_id,
             snapshot_index=snapshot_index_ref,
             known_chunk_index=known_chunk_index_ref,
             protection_index=protection_index_ref,
@@ -110,6 +112,7 @@ class MetadataObjectGraphExporter:
         )
 
         return MetadataObjectGraph(
+            vault_id=vault_id,
             catalog_hash=catalog_ref.object_hash,
             catalog_ref=catalog_ref,
             state_digest=state_digest,

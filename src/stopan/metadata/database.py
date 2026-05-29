@@ -134,6 +134,13 @@ class MetadataDB:
         cursor = self.conn.cursor()
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS metadata_vault (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uuid TEXT NOT NULL UNIQUE,
@@ -323,6 +330,49 @@ class MetadataDB:
         """)
 
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Vault identity
+    # ------------------------------------------------------------------
+
+    def get_or_create_vault_id(self) -> str:
+        row = self.conn.execute(
+            "SELECT value FROM metadata_vault WHERE key = 'vault_id' LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return _require_vault_id("vault_id", row["value"])
+
+        vault_id = uuid.uuid4().hex
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
+                (vault_id,),
+            )
+        row = self.conn.execute(
+            "SELECT value FROM metadata_vault WHERE key = 'vault_id' LIMIT 1"
+        ).fetchone()
+        if row is None:
+            raise MetadataDatabaseError("no se pudo crear vault_id en metadata DB")
+        return _require_vault_id("vault_id", row["value"])
+
+    def set_vault_id(self, vault_id: str) -> None:
+        value = _require_vault_id("vault_id", vault_id)
+        row = self.conn.execute(
+            "SELECT value FROM metadata_vault WHERE key = 'vault_id' LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            current = _require_vault_id("vault_id", row["value"])
+            if current != value:
+                raise MetadataDatabaseError(
+                    f"metadata DB pertenece a vault_id={current}; no se puede importar vault_id={value}"
+                )
+            return
+
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
+                (value,),
+            )
 
     # ------------------------------------------------------------------
     # Metadata pack publications
@@ -2360,6 +2410,15 @@ _HASH64_ALPHABET = set("0123456789abcdef")
 
 def _unique_hashes(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_require_hash64("hash", value) for value in values))
+
+
+def _require_vault_id(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise MetadataDatabaseValueError(f"{name} debe ser str")
+    text = value.strip()
+    if len(text) != 32 or any(char not in "0123456789abcdef" for char in text):
+        raise MetadataDatabaseValueError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
+    return text
 
 
 def _require_hash64(name: str, value: object) -> str:

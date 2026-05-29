@@ -130,6 +130,7 @@ class MetadataObjectGarbageCollector:
             )
             pack_stats = _sweep_packs(
                 pack_dir=resolved_pack_dir,
+                latest_vault_id=latest.vault_id,
                 latest_catalog_hash=latest.catalog_hash,
                 latest_state_digest=latest.state_digest,
                 identity_file=identity_file,
@@ -194,6 +195,7 @@ class _ReadablePack:
     path: Path
     stat_result: os.stat_result
     pack_hash: str
+    vault_id: str
     catalog_hash: str
     state_digest: str
     vault_generation: int
@@ -256,6 +258,7 @@ def _sweep_objects(
 def _sweep_packs(
     *,
     pack_dir: Path,
+    latest_vault_id: str,
     latest_catalog_hash: str,
     latest_state_digest: str,
     identity_file: str | Path,
@@ -273,6 +276,7 @@ def _sweep_packs(
         errors.append(f"pack_dir no es un directorio: {pack_dir}")
         return stats
 
+    latest_vault_id = _require_vault_id("latest_vault_id", latest_vault_id)
     latest_catalog_hash = _require_hash64("latest_catalog_hash", latest_catalog_hash)
     latest_state_digest = _require_hash64("latest_state_digest", latest_state_digest)
     service = MetadataObjectPackService(scrypt_cost=scrypt_cost)
@@ -301,6 +305,7 @@ def _sweep_packs(
                     path=path,
                     stat_result=stat_result,
                     pack_hash=_require_hash64("pack_hash", inspection.header.pack_hash),
+                    vault_id=_require_vault_id("pack.vault_id", summary.vault_id),
                     catalog_hash=_require_hash64("pack.catalog_hash", summary.catalog_hash),
                     state_digest=_require_hash64("pack.state_digest", summary.state_digest),
                     vault_generation=int(summary.vault_generation),
@@ -316,7 +321,8 @@ def _sweep_packs(
         pack
         for pack in readable_packs
         if (
-            pack.catalog_hash == latest_catalog_hash
+            pack.vault_id == latest_vault_id
+            and pack.catalog_hash == latest_catalog_hash
             and pack.state_digest == latest_state_digest
         )
     ]
@@ -326,8 +332,6 @@ def _sweep_packs(
             current_candidates,
             key=lambda pack: (
                 int(pack.vault_generation),
-                float(pack.pack_created_at_unix),
-                float(pack.stat_result.st_mtime),
                 pack.pack_hash,
             ),
         )
@@ -375,6 +379,17 @@ def _require_non_negative_int(name: str, value: object) -> int:
         raise MetadataObjectGarbageCollectionError(f"{name} debe ser >= 0")
     return value
 
+
+
+def _require_vault_id(name: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise MetadataObjectGarbageCollectionError(f"{name} debe ser string")
+    text = value.strip()
+    if len(text) != 32 or any(char not in "0123456789abcdef" for char in text):
+        raise MetadataObjectGarbageCollectionError(
+            f"{name} debe tener 32 caracteres hexadecimales lowercase"
+        )
+    return text
 
 def _require_hash64(name: str, value: object) -> str:
     if not isinstance(value, str):

@@ -106,11 +106,10 @@ def group_metadata_pack_sources(
     for pack_hash, pack_sources in grouped.items():
         ordered = sorted(
             pack_sources,
-            key=lambda item: (float(item.stored_at_unix), int(item.size_bytes), item.address),
-            reverse=True,
+            key=lambda item: (item.address, item.node_id, item.pack_hash),
         )
-        newest = ordered[0]
-        oldest = ordered[-1]
+        newest = max(ordered, key=lambda item: (float(item.stored_at_unix), item.address))
+        oldest = min(ordered, key=lambda item: (float(item.stored_at_unix), item.address))
         copies_seen = len(ordered)
         desired_copies = desired_map.get(pack_hash)
         entries.append(
@@ -130,10 +129,7 @@ def group_metadata_pack_sources(
             )
         )
 
-    entries.sort(
-        key=lambda item: (float(item.newest_stored_at_unix), int(item.size_bytes), item.pack_hash),
-        reverse=True,
-    )
+    entries.sort(key=lambda item: item.pack_hash)
     if max_candidates is not None and int(max_candidates) > 0:
         entries = entries[: int(max_candidates)]
     return entries

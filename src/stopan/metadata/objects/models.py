@@ -89,6 +89,13 @@ def _require_node_id(name: str, value: object) -> str:
     return text
 
 
+def _require_vault_id(name: str, value: object) -> str:
+    text = _require_str(name, value)
+    if not _NODE_ID_RE.fullmatch(text):
+        raise MetadataObjectError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
+    return text
+
+
 def _require_uuid(name: str, value: object) -> str:
     text = _require_str(name, value)
     if not _UUID_RE.fullmatch(text):
@@ -707,6 +714,7 @@ class ErasureDataPackIndexObject:
 
 @dataclass(frozen=True, slots=True)
 class CatalogObject:
+    vault_id: str
     snapshot_index: ObjectRef
     known_chunk_index: ObjectRef
     protection_index: ObjectRef | None
@@ -721,6 +729,7 @@ class CatalogObject:
     object_type: MetadataObjectType = field(init=False, default=MetadataObjectType.CATALOG)
 
     def __post_init__(self) -> None:
+        _require_vault_id("catalog.vault_id", self.vault_id)
         if not isinstance(self.snapshot_index, ObjectRef):
             raise MetadataObjectError("catalog.snapshot_index debe ser ObjectRef")
         if self.snapshot_index.object_type != MetadataObjectType.SNAPSHOT_INDEX:

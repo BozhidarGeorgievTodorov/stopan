@@ -93,9 +93,11 @@ Es la fuente de verdad persistida y recuperable:
 - `packs/`: empaquetado, cifrado, firma, discovery, verificación de presencia y distribución de metadata packs;
 - `crypto/`: primitivas KDF comunes del dominio metadata.
 
-Metadata packs y EC data packs son subdominios distintos: comparten la palabra “pack”, pero tienen semántica, persistencia y cuotas distintas.
+Metadata packs y EC data packs son subdominios distintos: comparten la palabra “pack”, pero no las mismas reglas de persistencia, cuotas ni recuperación.
 
-El ciclo remoto de metadata packs se divide en cuatro operaciones. `push` publica copias y guarda localmente la intención (`owner_id`, `pack_hash`, copias deseadas y resultados por target) en la DB de metadata. `discover` lista packs remotos del owner y calcula `presence_state` cuando conoce esa intención local; si no, muestra `UNKNOWN`. `verify` audita presencia remota mediante `ProbeMetadataPack` para un pack concreto o `ListMetadataPacks` para candidatos descubiertos. `recover` descarga e importa el pack elegido por la política de latest o por un `--target-hash` explícito.
+Cada metadata DB tiene un `vault_id` estable. Los metadata packs guardan ese `vault_id` y una `vault_generation` que solo se compara dentro del mismo vault. Esto permite que un mismo owner publique varios vaults sin mezclar sus líneas de latest.
+
+El ciclo remoto de metadata packs se divide en cuatro operaciones. `push` publica copias y guarda localmente la intención (`owner_id`, `pack_hash`, copias deseadas y resultados por target) en la DB de metadata. `discover` lista packs remotos del owner y calcula `presence_state` cuando conoce esa intención local; si no, muestra `UNKNOWN`. `verify` audita presencia remota mediante `ProbeMetadataPack` para un pack concreto o `ListMetadataPacks` para candidatos descubiertos. `recover` descarga e importa el pack elegido por `vault_id` + `vault_generation`, por `--vault-id` o por un `--target-hash` explícito.
 
 `metadata pack verify` audita presencia del plano de control. No descarga packs ni recalcula el payload completo. Los packs están firmados y cifrados; cualquier manipulación se detecta en `recover`, que descarga, valida firma/hash y descifra el pack antes de importarlo. Esta separación evita usar una verificación rutinaria cara sobre metadata packs grandes.
 

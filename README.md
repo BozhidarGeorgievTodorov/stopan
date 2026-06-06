@@ -252,3 +252,9 @@ Ejecución agrupada de los GC configurados:
 ```bash
 python -m stopan gc all --config configs/node1.yaml --passphrase-file pass.txt --identity-file id.json --dry-run
 ```
+
+## Operación Linux y empaquetado
+
+Stopan incluye una propuesta de operación con usuario de sistema, unidades
+systemd y jobs periódicos para backup, protección, metadata, verificación y GC.
+Consulta [`docs/operations.md`](docs/operations.md).

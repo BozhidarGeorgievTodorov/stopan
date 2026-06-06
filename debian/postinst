@@ -1,0 +1,50 @@
+#!/bin/sh
+set -e
+
+if ! getent group stopan >/dev/null; then
+    addgroup --system stopan >/dev/null
+fi
+
+if ! getent passwd stopan >/dev/null; then
+    adduser \
+        --system \
+        --ingroup stopan \
+        --home /var/lib/stopan \
+        --no-create-home \
+        --disabled-login \
+        --gecos "Stopan service user" \
+        stopan >/dev/null
+fi
+
+install -d -o root -g stopan -m 0750 /etc/stopan
+install -d -o root -g stopan -m 0750 /etc/stopan/jobs
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan
+install -d -o stopan -g stopan -m 0750 /var/log/stopan
+
+
+install_if_missing() {
+    src="$1"
+    dst="$2"
+    mode="$3"
+    owner="$4"
+    group="$5"
+
+    if [ -f "$src" ] && [ ! -e "$dst" ]; then
+        install -o "$owner" -g "$group" -m "$mode" "$src" "$dst"
+    fi
+}
+
+install_if_missing "/usr/share/doc/stopan/examples/configs/node.yaml" "/etc/stopan/node.yaml" 0640 root stopan
+install_if_missing "/usr/share/doc/stopan/examples/configs/client.yaml" "/etc/stopan/client.yaml" 0640 root stopan
+
+for script in /usr/share/doc/stopan/examples/jobs/*.sh; do
+    [ -f "$script" ] || continue
+    install_if_missing "$script" "/etc/stopan/jobs/$(basename "$script")" 0750 root stopan
+done
+
+for env_file in /usr/share/doc/stopan/examples/jobs/*.env; do
+    [ -f "$env_file" ] || continue
+    install_if_missing "$env_file" "/etc/stopan/jobs/$(basename "$env_file")" 0640 root stopan
+done
+
+#DEBHELPER#

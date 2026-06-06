@@ -1,0 +1,27 @@
+[Unit]
+Description=Stopan storage and membership node
+Documentation=file:/usr/share/doc/stopan/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stopan
+Group=stopan
+Environment=STOPAN_CONFIG=/etc/stopan/node.yaml
+EnvironmentFile=-/etc/stopan/node.env
+WorkingDirectory=/var/lib/stopan
+ExecStart=/usr/bin/stopan node --config ${STOPAN_CONFIG}
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=stopan
+StateDirectory=stopan
+LogsDirectory=stopan
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/stopan /var/lib/stopan /var/log/stopan /run/stopan
+
+[Install]
+WantedBy=multi-user.target

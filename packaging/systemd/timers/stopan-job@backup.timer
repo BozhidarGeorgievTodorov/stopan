@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Stopan backup periodically
+Documentation=file:/usr/share/doc/stopan/operations.md
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10m
+Unit=stopan-job@backup.service
+
+[Install]
+WantedBy=timers.target

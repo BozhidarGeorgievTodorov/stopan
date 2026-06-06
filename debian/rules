@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	rm -rf build .pybuild *.egg-info src/*.egg-info src/stopan.egg-info debian/stopan/opt/stopan/venv
+
+override_dh_auto_configure:
+	# Stopan se empaqueta como aplicación autocontenida en /opt/stopan.
+	# No usamos la configuración automática Python/distutils de debhelper.
+
+override_dh_auto_build:
+	# La instalación real de Python se realiza en override_dh_auto_install.
+
+override_dh_auto_install:
+	python3 -m venv debian/stopan/opt/stopan/venv
+	debian/stopan/opt/stopan/venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+	debian/stopan/opt/stopan/venv/bin/python -m pip install --no-cache-dir -r requirements.txt .
+	find debian/stopan/opt/stopan/venv -type d -name __pycache__ -prune -exec rm -rf {} +
+	find debian/stopan/opt/stopan/venv -type f -name '*.pyc' -delete
+
+override_dh_auto_test:
+	# Los tests de integración se ejecutan mediante los E2E del repositorio.
+	# Evitamos unittest discover implícito durante la construcción del .deb.
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start

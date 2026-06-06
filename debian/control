@@ -1,0 +1,27 @@
+Source: stopan
+Section: utils
+Priority: optional
+Maintainer: Bozhidar Georgiev <bozhidargeorgiev82@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ python3-dev,
+ python3-pip,
+ python3-setuptools,
+ python3-venv,
+ python3-wheel
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: stopan
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ adduser,
+ ca-certificates,
+ python3 (>= 3.11),
+ systemd,
+ util-linux
+Description: sistema de backup distribuido content-addressed
+ Stopan divide archivos en chunks, almacena contenido de forma deduplicada y
+ permite proteger datos mediante replicación o erasure coding entre nodos.

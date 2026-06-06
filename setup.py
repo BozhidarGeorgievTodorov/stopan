@@ -38,6 +38,7 @@ setup(
         "PyYAML>=6.0.0",
         "zstandard>=0.25.0",
         "cryptography>=42.0.0",
+        "zfec>=1.6.0.0",
     ],
     extras_require={
         "dev": [

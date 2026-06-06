@@ -1,0 +1,12 @@
+[Unit]
+Description=Push Stopan metadata pack periodically
+Documentation=file:/usr/share/doc/stopan/operations.md
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=stopan-job@metadata-pack-push.service
+
+[Install]
+WantedBy=timers.target

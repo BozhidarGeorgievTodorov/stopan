@@ -1,0 +1,22 @@
+[Unit]
+Description=Stopan scheduled job: %i
+Documentation=file:/usr/share/doc/stopan/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=stopan
+Group=stopan
+WorkingDirectory=/var/lib/stopan
+RuntimeDirectory=stopan
+StateDirectory=stopan
+LogsDirectory=stopan
+Environment=STOPAN_CONFIG=/etc/stopan/client.yaml
+EnvironmentFile=-/etc/stopan/jobs/%i.env
+ExecStart=/usr/bin/flock -n /run/stopan/%i.lock /etc/stopan/jobs/%i.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/stopan /var/lib/stopan /var/log/stopan /run/stopan

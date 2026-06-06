@@ -1,0 +1,8 @@
+packaging/bin/stopan usr/bin/
+packaging/systemd/stopan-node.service lib/systemd/system/
+packaging/systemd/stopan-job@.service lib/systemd/system/
+packaging/systemd/timers/*.timer lib/systemd/system/
+packaging/jobs/*.sh usr/share/doc/stopan/examples/jobs/
+packaging/examples/*.env usr/share/doc/stopan/examples/jobs/
+docs/operations.md usr/share/doc/stopan/
+packaging/examples/*.yaml usr/share/doc/stopan/examples/configs/

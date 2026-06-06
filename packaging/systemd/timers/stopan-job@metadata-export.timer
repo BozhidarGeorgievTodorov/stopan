@@ -1,0 +1,12 @@
+[Unit]
+Description=Export Stopan metadata graph periodically
+Documentation=file:/usr/share/doc/stopan/operations.md
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=stopan-job@metadata-export.service
+
+[Install]
+WantedBy=timers.target

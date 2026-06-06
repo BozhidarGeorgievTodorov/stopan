@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Stopan local GC periodically
+Documentation=file:/usr/share/doc/stopan/operations.md
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=30m
+Unit=stopan-job@gc.service
+
+[Install]
+WantedBy=timers.target

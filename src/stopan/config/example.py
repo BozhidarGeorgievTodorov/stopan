@@ -23,6 +23,10 @@ cluster:
 protection:
   remote_copies: 3
   strict_remote_copies: true
+  ec_pack_size_bytes: 8388608
+
+backup:
+  workers: 4
 
 grpc:
   max_message_bytes: 8388608
@@ -31,7 +35,7 @@ storage:
   rpc_workers: 64
   commit_workers: 16
   commit_queue_items: 256
-  max_chunk_size: 1048576
+  max_chunk_size: 8388608
 
 replication:
   target_parallelism: 4
@@ -80,6 +84,8 @@ metadata:
   pack_copies: 3
   strict_pack_copies: false
   pack_discovery_max_candidates: 10
+  pack_target_parallelism: 4
+  pack_rpc_timeout_s: 60.0
   cli_warning_limit: 10
   max_distributed_pack_bytes: 67108864
   max_distributed_packs_per_owner: 8

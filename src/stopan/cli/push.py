@@ -18,8 +18,6 @@ from stopan.cli.validation import (
     validate_float_ranges,
     validate_int_ranges,
 )
-from stopan.config.defaults import DEFAULT_EC_PACK_SIZE_BYTES
-
 PROTECTION_SCOPE_CHOICES = ("pending", "snapshot", "all-reachable", "all-known-chunks")
 
 
@@ -41,7 +39,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-copies", type=int, default=None, help="Copias remotas completas requeridas por chunk en modo replication. La copia local no cuenta.")
     parser.add_argument("--ec-k", type=int, default=None, help="Número de data shards por data pack EC.")
     parser.add_argument("--ec-m", type=int, default=None, help="Número de parity shards por data pack EC.")
-    parser.add_argument("--ec-pack-size-bytes", type=int, default=None, help="Tamaño objetivo máximo del payload de cada data pack EC.")
+    parser.add_argument(
+        "--ec-pack-size-bytes",
+        type=int,
+        default=None,
+        help="Tamaño objetivo máximo del payload de cada data pack EC. Default: protection.ec_pack_size_bytes.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución.")
     parser.add_argument(
         "--scope",
@@ -118,7 +121,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
         require_present(parser, args, Flag("ec_k", "--ec-k"), "--ec-k es obligatorio en --protection-mode ec")
         require_present(parser, args, Flag("ec_m", "--ec-m"), "--ec-m es obligatorio en --protection-mode ec")
-        args.ec_pack_size_bytes = DEFAULT_EC_PACK_SIZE_BYTES if args.ec_pack_size_bytes is None else args.ec_pack_size_bytes
         validate_int_ranges(
             parser,
             args,
@@ -174,7 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             snapshot_id=args.snapshot_id,
             ec_k=args.ec_k,
             ec_m=args.ec_m,
-            ec_pack_size_bytes=args.ec_pack_size_bytes,
+            ec_pack_size_bytes=int(choose(args.ec_pack_size_bytes, cfg.protection.ec_pack_size_bytes)),
             stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
             max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
             commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),

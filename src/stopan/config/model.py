@@ -6,6 +6,7 @@ from typing import Any
 from stopan.errors import StopanConfigTypeError, StopanConfigValueError
 
 from stopan.config.defaults import (
+    DEFAULT_BACKUP_WORKERS,
     DEFAULT_CLUSTER_SEEDS,
     DEFAULT_CLUSTER_TOKEN,
     DEFAULT_GC_DISTRIBUTED_PACK_MAX_AGE_DAYS,
@@ -14,6 +15,7 @@ from stopan.config.defaults import (
     DEFAULT_GC_METADATA_OBJECT_STORE_GRACE_HOURS,
     DEFAULT_GC_NODE_CAS_MAX_AGE_DAYS,
     DEFAULT_GC_RESTORE_OUTPUT_MAX_AGE_DAYS,
+    DEFAULT_EC_PACK_SIZE_BYTES,
     DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS,
     DEFAULT_GRPC_KEEPALIVE_TIME_MS,
     DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS,
@@ -40,6 +42,8 @@ from stopan.config.defaults import (
     DEFAULT_METADATA_OWNER_ID,
     DEFAULT_METADATA_PACK_COPIES,
     DEFAULT_METADATA_PACK_DISCOVERY_MAX_CANDIDATES,
+    DEFAULT_METADATA_PACK_TARGET_PARALLELISM,
+    DEFAULT_METADATA_PACK_RPC_TIMEOUT_S,
     DEFAULT_METADATA_CLI_WARNING_LIMIT,
     DEFAULT_METADATA_PASSPHRASE_FILE,
     DEFAULT_METADATA_SCRYPT_N,
@@ -146,10 +150,20 @@ class ClusterConfig:
 class ProtectionConfig:
     remote_copies: int = DEFAULT_PROTECTION_REMOTE_COPIES
     strict_remote_copies: bool = DEFAULT_PROTECTION_STRICT_REMOTE_COPIES
+    ec_pack_size_bytes: int = DEFAULT_EC_PACK_SIZE_BYTES
 
     def __post_init__(self) -> None:
         _require_int("protection.remote_copies", self.remote_copies, min_value=0)
         _require_bool("protection.strict_remote_copies", self.strict_remote_copies)
+        _require_int("protection.ec_pack_size_bytes", self.ec_pack_size_bytes, min_value=1)
+
+
+@dataclass(frozen=True)
+class BackupConfig:
+    workers: int = DEFAULT_BACKUP_WORKERS
+
+    def __post_init__(self) -> None:
+        _require_int("backup.workers", self.workers, min_value=1)
 
 
 @dataclass(frozen=True)
@@ -256,6 +270,8 @@ class MetadataConfig:
     pack_copies: int = DEFAULT_METADATA_PACK_COPIES
     strict_pack_copies: bool = DEFAULT_METADATA_STRICT_PACK_COPIES
     pack_discovery_max_candidates: int = DEFAULT_METADATA_PACK_DISCOVERY_MAX_CANDIDATES
+    pack_target_parallelism: int = DEFAULT_METADATA_PACK_TARGET_PARALLELISM
+    pack_rpc_timeout_s: float = DEFAULT_METADATA_PACK_RPC_TIMEOUT_S
     cli_warning_limit: int = DEFAULT_METADATA_CLI_WARNING_LIMIT
     max_distributed_pack_bytes: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACK_BYTES
     max_distributed_packs_per_owner: int = DEFAULT_METADATA_MAX_DISTRIBUTED_PACKS_PER_OWNER
@@ -281,6 +297,8 @@ class MetadataConfig:
         _require_int("metadata.pack_copies", self.pack_copies, min_value=0)
         _require_bool("metadata.strict_pack_copies", self.strict_pack_copies)
         _require_int("metadata.pack_discovery_max_candidates", self.pack_discovery_max_candidates, min_value=1)
+        _require_int("metadata.pack_target_parallelism", self.pack_target_parallelism, min_value=1)
+        _require_float("metadata.pack_rpc_timeout_s", self.pack_rpc_timeout_s, min_value=0.0)
         _require_int("metadata.cli_warning_limit", self.cli_warning_limit, min_value=1)
         _require_int("metadata.max_distributed_pack_bytes", self.max_distributed_pack_bytes, min_value=1)
         _require_int("metadata.max_distributed_packs_per_owner", self.max_distributed_packs_per_owner, min_value=1)
@@ -346,6 +364,7 @@ class StopanConfig:
     node: NodeConfig = field(default_factory=NodeConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     protection: ProtectionConfig = field(default_factory=ProtectionConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     grpc: GrpcConfig = field(default_factory=GrpcConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     replication: ReplicationConfig = field(default_factory=ReplicationConfig)

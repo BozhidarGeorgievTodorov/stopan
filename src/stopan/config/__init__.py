@@ -1,5 +1,6 @@
 from stopan.config.loader import load_config
 from stopan.config.model import (
+    BackupConfig,
     ClusterConfig,
     GcConfig,
     GrpcConfig,
@@ -16,6 +17,7 @@ from stopan.config.model import (
 
 __all__ = [
     "load_config",
+    "BackupConfig",
     "ClusterConfig",
     "GcConfig",
     "GrpcConfig",

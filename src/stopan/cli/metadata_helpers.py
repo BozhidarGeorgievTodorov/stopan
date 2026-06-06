@@ -4,7 +4,7 @@ import getpass
 import os
 import stat
 from argparse import Namespace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -118,7 +118,7 @@ def format_bytes(value: int) -> str:
 
 
 def format_time(ts: float) -> str:
-    return datetime.fromtimestamp(float(ts)).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def mode_octal(path: Path) -> str:

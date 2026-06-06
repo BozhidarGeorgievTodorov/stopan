@@ -8,6 +8,7 @@ import yaml
 
 from stopan.errors import StopanConfigError
 from stopan.config.model import (
+    BackupConfig,
     ClusterConfig,
     GcConfig,
     GrpcConfig,
@@ -26,6 +27,7 @@ _SECTION_TYPES = {
     "node": NodeConfig,
     "cluster": ClusterConfig,
     "protection": ProtectionConfig,
+    "backup": BackupConfig,
     "grpc": GrpcConfig,
     "storage": StorageConfig,
     "replication": ReplicationConfig,
@@ -190,6 +192,10 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
     "protection": {
         "remote_copies": _as_int,
         "strict_remote_copies": _as_bool,
+        "ec_pack_size_bytes": _as_int,
+    },
+    "backup": {
+        "workers": _as_int,
     },
     "grpc": {
         "max_message_bytes": _as_int,
@@ -243,6 +249,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
         "pack_copies": _as_int,
         "strict_pack_copies": _as_bool,
         "pack_discovery_max_candidates": _as_int,
+        "pack_target_parallelism": _as_int,
+        "pack_rpc_timeout_s": _as_float,
         "cli_warning_limit": _as_int,
         "max_distributed_pack_bytes": _as_int,
         "max_distributed_packs_per_owner": _as_int,

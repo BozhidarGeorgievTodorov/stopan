@@ -12,8 +12,6 @@ from stopan.cli.metadata_auto_export import (
     build_metadata_object_graph_auto_export,
 )
 
-_DEFAULT_WORKERS = 4
-
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -28,8 +26,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "workers",
         nargs="?",
         type=int,
-        default=_DEFAULT_WORKERS,
-        help="Número de hilos de trabajo",
+        default=None,
+        help="Número de hilos de trabajo. Default: backup.workers.",
     )
     parser.add_argument(
         "--fast",
@@ -97,11 +95,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         fast_local_enabled = True
         print("'--fast-remote' activa implícitamente '--fast'.")
 
-    max_workers = os.cpu_count() or _DEFAULT_WORKERS
-    workers = max(1, min(int(args.workers), max_workers))
-    if args.workers > max_workers:
+    requested_workers = int(choose(args.workers, cfg.backup.workers))
+    max_workers = os.cpu_count() or requested_workers
+    workers = max(1, min(requested_workers, max_workers))
+    if requested_workers > max_workers:
         print(
-            f"Pediste {args.workers} hilos, pero la CPU expone {max_workers}. "
+            f"Pediste {requested_workers} hilos, pero la CPU expone {max_workers}. "
             f"Usando {workers}."
         )
 

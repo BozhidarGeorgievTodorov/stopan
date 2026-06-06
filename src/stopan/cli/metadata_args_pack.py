@@ -8,6 +8,41 @@ from stopan.cli.metadata_args_common import (
     add_scrypt_override_args,
 )
 
+_OWNER_ID_HELP = "Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file."
+_IDENTITY_FILE_HELP = "Ruta de identity file. Default: metadata.identity_file."
+_PACK_STORE_HELP = "Directorio local de packs distribuidos. Default: metadata.distributed_pack_store_dir."
+_MEMBERSHIP_DISCOVERY_HELP = "Seed de membership para descubrir nodos remotos. Default: cluster.seeds[0]."
+_PACK_TARGET_PARALLELISM_HELP = (
+    "Número de nodos remotos consultados en paralelo. Default: metadata.pack_target_parallelism."
+)
+_PACK_MAX_MESSAGE_HELP = "Límite gRPC de mensaje. Default: grpc.max_message_bytes."
+
+
+def _add_owner_identity_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--owner-id", default=None, help=_OWNER_ID_HELP)
+    parser.add_argument("--identity-file", default=None, help=_IDENTITY_FILE_HELP)
+
+
+def _add_pack_store_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--pack-store", default=None, help=_PACK_STORE_HELP)
+
+
+def _add_metadata_pack_query_args(
+    parser: argparse.ArgumentParser,
+    *,
+    rpc_timeout_help: str,
+    max_message_help: str = _PACK_MAX_MESSAGE_HELP,
+) -> None:
+    parser.add_argument("--membership-seed", default=None, help=_MEMBERSHIP_DISCOVERY_HELP)
+    parser.add_argument(
+        "--target-parallelism",
+        type=int,
+        default=None,
+        help=_PACK_TARGET_PARALLELISM_HELP,
+    )
+    parser.add_argument("--rpc-timeout-s", type=float, default=None, help=rpc_timeout_help)
+    parser.add_argument("--max-message-bytes", type=int, default=None, help=max_message_help)
+
 
 def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     pack_parser = subparsers.add_parser(
@@ -159,16 +194,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
             "Default: metadata.object_pack_dir o <object-store>/packs."
         ),
     )
-    push_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    push_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
+    _add_owner_identity_args(push_parser)
     add_scrypt_override_args(push_parser)
     add_metadata_pack_push_args(push_parser)
 
@@ -179,38 +205,10 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     )
     discover_parser.set_defaults(command="pack.discover")
     add_config_args(discover_parser)
-    discover_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    discover_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
-    discover_parser.add_argument(
-        "--membership-seed",
-        default=None,
-        help="Seed de membership para descubrir nodos remotos. Default: cluster.seeds[0].",
-    )
-    discover_parser.add_argument(
-        "--target-parallelism",
-        type=int,
-        default=None,
-        help="Número de nodos remotos consultados en paralelo. Default: replication.target_parallelism.",
-    )
-    discover_parser.add_argument(
-        "--rpc-timeout-s",
-        type=float,
-        default=None,
-        help="Timeout del RPC ListMetadataPacks en segundos. Default: replication.stream_timeout_s.",
-    )
-    discover_parser.add_argument(
-        "--max-message-bytes",
-        type=int,
-        default=None,
-        help="Límite gRPC de mensaje. Default: grpc.max_message_bytes.",
+    _add_owner_identity_args(discover_parser)
+    _add_metadata_pack_query_args(
+        discover_parser,
+        rpc_timeout_help="Timeout del RPC ListMetadataPacks en segundos. Default: metadata.pack_rpc_timeout_s.",
     )
     discover_parser.add_argument(
         "--max-candidates",
@@ -231,20 +229,10 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     )
     verify_parser.set_defaults(command="pack.verify")
     add_config_args(verify_parser)
-    verify_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    verify_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
-    verify_parser.add_argument(
-        "--membership-seed",
-        default=None,
-        help="Seed de membership para descubrir nodos remotos. Default: cluster.seeds[0].",
+    _add_owner_identity_args(verify_parser)
+    _add_metadata_pack_query_args(
+        verify_parser,
+        rpc_timeout_help="Timeout del RPC ListMetadataPacks en segundos. Default: metadata.pack_rpc_timeout_s.",
     )
     verify_parser.add_argument(
         "--pack-hash",
@@ -255,24 +243,6 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         "--all",
         action="store_true",
         help="Verifica todos los packs descubiertos hasta --max-candidates.",
-    )
-    verify_parser.add_argument(
-        "--target-parallelism",
-        type=int,
-        default=None,
-        help="Número de nodos remotos consultados en paralelo. Default: replication.target_parallelism.",
-    )
-    verify_parser.add_argument(
-        "--rpc-timeout-s",
-        type=float,
-        default=None,
-        help="Timeout del RPC ListMetadataPacks en segundos. Default: replication.stream_timeout_s.",
-    )
-    verify_parser.add_argument(
-        "--max-message-bytes",
-        type=int,
-        default=None,
-        help="Límite gRPC de mensaje. Default: grpc.max_message_bytes.",
     )
     verify_parser.add_argument(
         "--max-candidates",
@@ -293,16 +263,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     )
     recover_parser.set_defaults(command="pack.recover")
     add_config_args(recover_parser)
-    recover_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    recover_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
+    _add_owner_identity_args(recover_parser)
     recover_parser.add_argument(
         "--object-store",
         default=None,
@@ -313,28 +274,10 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         default=None,
         help="Lee la passphrase para descifrar packs y el object store local.",
     )
-    recover_parser.add_argument(
-        "--membership-seed",
-        default=None,
-        help="Seed de membership para descubrir nodos remotos. Default: cluster.seeds[0].",
-    )
-    recover_parser.add_argument(
-        "--target-parallelism",
-        type=int,
-        default=None,
-        help="Número de nodos remotos consultados en paralelo. Default: replication.target_parallelism.",
-    )
-    recover_parser.add_argument(
-        "--rpc-timeout-s",
-        type=float,
-        default=None,
-        help="Timeout de RPC List/RetrieveMetadataPack. Default: replication.stream_timeout_s.",
-    )
-    recover_parser.add_argument(
-        "--max-message-bytes",
-        type=int,
-        default=None,
-        help="Límite gRPC de mensaje para descargar packs. Default: grpc.max_message_bytes.",
+    _add_metadata_pack_query_args(
+        recover_parser,
+        rpc_timeout_help="Timeout de RPC List/RetrieveMetadataPack. Default: metadata.pack_rpc_timeout_s.",
+        max_message_help="Límite gRPC de mensaje para descargar packs. Default: grpc.max_message_bytes.",
     )
     recover_parser.add_argument(
         "--download-dir",
@@ -392,21 +335,8 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     local_store_parser.set_defaults(command="pack.local-store")
     add_config_args(local_store_parser)
     local_store_parser.add_argument("path", help="Ruta del fichero .stopanmetapack")
-    local_store_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    local_store_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
-    local_store_parser.add_argument(
-        "--pack-store",
-        default=None,
-        help="Directorio local de packs distribuidos. Default: metadata.distributed_pack_store_dir.",
-    )
+    _add_owner_identity_args(local_store_parser)
+    _add_pack_store_arg(local_store_parser)
     local_store_parser.add_argument(
         "--expected-pack-hash",
         default=None,
@@ -425,21 +355,8 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     )
     local_list_parser.set_defaults(command="pack.local-list")
     add_config_args(local_list_parser)
-    local_list_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    local_list_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
-    local_list_parser.add_argument(
-        "--pack-store",
-        default=None,
-        help="Directorio local de packs distribuidos. Default: metadata.distributed_pack_store_dir.",
-    )
+    _add_owner_identity_args(local_list_parser)
+    _add_pack_store_arg(local_list_parser)
 
     local_retrieve_parser = pack_subparsers.add_parser(
         "local-retrieve",
@@ -448,16 +365,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     )
     local_retrieve_parser.set_defaults(command="pack.local-retrieve")
     add_config_args(local_retrieve_parser)
-    local_retrieve_parser.add_argument(
-        "--owner-id",
-        default=None,
-        help="Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file.",
-    )
-    local_retrieve_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Ruta de identity file. Default: metadata.identity_file.",
-    )
+    _add_owner_identity_args(local_retrieve_parser)
     local_retrieve_parser.add_argument(
         "--pack-hash",
         required=True,
@@ -468,9 +376,5 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         required=True,
         help="Ruta exacta donde escribir el .stopanmetapack recuperado.",
     )
-    local_retrieve_parser.add_argument(
-        "--pack-store",
-        default=None,
-        help="Directorio local de packs distribuidos. Default: metadata.distributed_pack_store_dir.",
-    )
+    _add_pack_store_arg(local_retrieve_parser)
 

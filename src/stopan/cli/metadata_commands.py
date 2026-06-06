@@ -40,6 +40,30 @@ def _configured_warning_limit(cfg) -> int:
     return max(1, int(cfg.metadata.cli_warning_limit))
 
 
+def _metadata_pack_network_kwargs(args: argparse.Namespace, cfg) -> dict[str, object]:
+    return {
+        "membership_seed": args.membership_seed or first_seed(cfg),
+        "self_addr": cfg.node.advertise_addr,
+        "cluster_token": cfg.cluster.token,
+        "membership_timeout_s": float(cfg.membership.rpc_timeout_s),
+        "rpc_timeout_s": float(choose(args.rpc_timeout_s, cfg.metadata.pack_rpc_timeout_s)),
+        "target_parallelism": int(choose(args.target_parallelism, cfg.metadata.pack_target_parallelism)),
+        "max_message_bytes": int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+        "grpc_keepalive_time_ms": int(cfg.grpc.keepalive_time_ms),
+        "grpc_keepalive_timeout_ms": int(cfg.grpc.keepalive_timeout_ms),
+        "grpc_keepalive_permit_without_calls": bool(cfg.grpc.keepalive_permit_without_calls),
+    }
+
+
+def _metadata_pack_push_kwargs(args: argparse.Namespace, cfg) -> dict[str, object]:
+    values = _metadata_pack_network_kwargs(args, cfg)
+    values.update(
+        rf=int(choose(args.pack_copies, cfg.metadata.pack_copies)),
+        strict_rf=bool(choose(args.strict_pack_copies, cfg.metadata.strict_pack_copies)),
+    )
+    return values
+
+
 def _print_limited_items(title: str, items, *, limit: int) -> None:
     values = tuple(items or ())
     if not values:
@@ -55,6 +79,12 @@ def _format_desired_copies(value: int | None) -> str:
     return str(int(value)) if value is not None else "unknown"
 
 
+def _print_local_pushed_at(local_pushed_at_by_hash, pack_hash: str) -> None:
+    pushed_at = local_pushed_at_by_hash.get(pack_hash) if local_pushed_at_by_hash else None
+    if pushed_at is not None:
+        print(f"      local_pushed_at: {format_time(pushed_at)}")
+
+
 def _print_metadata_pack_sources(sources) -> None:
     for source in sources:
         node = source.node_id[:8] or "unknown"
@@ -62,7 +92,12 @@ def _print_metadata_pack_sources(sources) -> None:
         print(f"         - {node}@{source.address} stored_at={stored_at} size={format_bytes(source.size_bytes)}")
 
 
-def _print_metadata_pack_discovery_entries(entries, *, show_sources: bool) -> None:
+def _print_metadata_pack_discovery_entries(
+    entries,
+    *,
+    show_sources: bool,
+    local_pushed_at_by_hash=None,
+) -> None:
     for entry in entries:
         print(f"   pack_hash: {entry.pack_hash}")
         print("      check: presence")
@@ -72,6 +107,7 @@ def _print_metadata_pack_discovery_entries(entries, *, show_sources: bool) -> No
         if entry.desired_copies is None:
             print("      note: no hay publicación local con copias esperadas; estado UNKNOWN")
         print(f"      size: {format_bytes(entry.size_bytes)}")
+        _print_local_pushed_at(local_pushed_at_by_hash, entry.pack_hash)
         if entry.newest_stored_at_unix:
             print(f"      newest_stored_at: {format_time(entry.newest_stored_at_unix)}")
         if entry.oldest_stored_at_unix and entry.oldest_stored_at_unix != entry.newest_stored_at_unix:
@@ -81,7 +117,12 @@ def _print_metadata_pack_discovery_entries(entries, *, show_sources: bool) -> No
             _print_metadata_pack_sources(entry.sources)
 
 
-def _print_metadata_pack_verification_results(results, *, show_sources: bool) -> None:
+def _print_metadata_pack_verification_results(
+    results,
+    *,
+    show_sources: bool,
+    local_pushed_at_by_hash=None,
+) -> None:
     for result in results:
         print(f"   pack_hash: {result.pack_hash}")
         print(f"      check: {result.details.check_kind}")
@@ -92,6 +133,7 @@ def _print_metadata_pack_verification_results(results, *, show_sources: bool) ->
             print(f"      reason: {result.details.reason}")
         if result.size_bytes:
             print(f"      size: {format_bytes(result.size_bytes)}")
+        _print_local_pushed_at(local_pushed_at_by_hash, result.pack_hash)
         if result.newest_stored_at_unix:
             print(f"      newest_stored_at: {format_time(result.newest_stored_at_unix)}")
         if result.oldest_stored_at_unix and result.oldest_stored_at_unix != result.newest_stored_at_unix:
@@ -645,13 +687,14 @@ def find_reusable_latest_object_pack(
     return path, summary
 
 
-def metadata_pack_publication_map(cfg, *, owner_id: str) -> dict[str, int]:
+def metadata_pack_publication_maps(cfg, *, owner_id: str) -> tuple[dict[str, int], dict[str, float]]:
     db = MetadataDB(cfg.node.db_file)
     try:
-        return {
-            record.pack_hash: int(record.desired_copies)
-            for record in db.get_metadata_pack_publications(owner_id=owner_id)
-        }
+        publications = db.get_metadata_pack_publications(owner_id=owner_id)
+        return (
+            {publication.pack_hash: int(publication.desired_copies) for publication in publications},
+            {publication.pack_hash: float(publication.pushed_at) for publication in publications},
+        )
     finally:
         db.close()
 
@@ -691,18 +734,7 @@ def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str 
         owner_id=owner_id,
         identity_file=identity_file,
         identity_passphrase=identity_passphrase,
-        membership_seed=args.membership_seed or first_seed(cfg),
-        rf=int(choose(args.pack_copies, cfg.metadata.pack_copies)),
-        strict_rf=bool(choose(args.strict_pack_copies, cfg.metadata.strict_pack_copies)),
-        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
-        rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
-        membership_timeout_s=float(cfg.membership.rpc_timeout_s),
-        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-        grpc_keepalive_time_ms=int(cfg.grpc.keepalive_time_ms),
-        grpc_keepalive_timeout_ms=int(cfg.grpc.keepalive_timeout_ms),
-        grpc_keepalive_permit_without_calls=bool(cfg.grpc.keepalive_permit_without_calls),
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
+        **_metadata_pack_push_kwargs(args, cfg),
     )
     record_metadata_pack_publication(cfg, result)
     return result
@@ -813,16 +845,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         identity_file=identity_file_from_args(args, cfg),
         object_store_dir=object_store_dir,
         passphrase=passphrase,
-        membership_seed=args.membership_seed or first_seed(cfg),
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=float(cfg.membership.rpc_timeout_s),
-        rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
-        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
-        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-        grpc_keepalive_time_ms=int(cfg.grpc.keepalive_time_ms),
-        grpc_keepalive_timeout_ms=int(cfg.grpc.keepalive_timeout_ms),
-        grpc_keepalive_permit_without_calls=bool(cfg.grpc.keepalive_permit_without_calls),
+        **_metadata_pack_network_kwargs(args, cfg),
         scrypt_cost=scrypt_cost_from_args(args, cfg),
         db_file=cfg.node.db_file,
         import_db=bool(args.import_db),
@@ -914,20 +937,14 @@ def cmd_discover_metadata_packs(args: argparse.Namespace) -> int:
 
     from stopan.metadata.packs.discovery import discover_metadata_packs_from_network
 
-    desired_copies_by_hash = metadata_pack_publication_map(cfg, owner_id=owner_id)
+    desired_copies_by_hash, local_pushed_at_by_hash = metadata_pack_publication_maps(
+        cfg,
+        owner_id=owner_id,
+    )
 
     result = discover_metadata_packs_from_network(
         owner_id=owner_id,
-        membership_seed=args.membership_seed or first_seed(cfg),
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=float(cfg.membership.rpc_timeout_s),
-        rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
-        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
-        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-        grpc_keepalive_time_ms=int(cfg.grpc.keepalive_time_ms),
-        grpc_keepalive_timeout_ms=int(cfg.grpc.keepalive_timeout_ms),
-        grpc_keepalive_permit_without_calls=bool(cfg.grpc.keepalive_permit_without_calls),
+        **_metadata_pack_network_kwargs(args, cfg),
         desired_copies_by_hash=desired_copies_by_hash,
         max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
     )
@@ -944,7 +961,11 @@ def cmd_discover_metadata_packs(args: argparse.Namespace) -> int:
         print("   packs: (none)")
     else:
         print("Packs")
-        _print_metadata_pack_discovery_entries(result.entries, show_sources=bool(args.show_sources))
+        _print_metadata_pack_discovery_entries(
+            result.entries,
+            show_sources=bool(args.show_sources),
+            local_pushed_at_by_hash=local_pushed_at_by_hash,
+        )
 
     _print_limited_items("List warnings", stats.list_errors, limit=_configured_warning_limit(cfg))
 
@@ -957,20 +978,14 @@ def cmd_verify_metadata_packs(args: argparse.Namespace) -> int:
 
     from stopan.metadata.packs.verifier import verify_metadata_packs_from_network
 
-    desired_copies_by_hash = metadata_pack_publication_map(cfg, owner_id=owner_id)
+    desired_copies_by_hash, local_pushed_at_by_hash = metadata_pack_publication_maps(
+        cfg,
+        owner_id=owner_id,
+    )
 
     result = verify_metadata_packs_from_network(
         owner_id=owner_id,
-        membership_seed=args.membership_seed or first_seed(cfg),
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=float(cfg.membership.rpc_timeout_s),
-        rpc_timeout_s=float(choose(args.rpc_timeout_s, cfg.replication.stream_timeout_s)),
-        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
-        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-        grpc_keepalive_time_ms=int(cfg.grpc.keepalive_time_ms),
-        grpc_keepalive_timeout_ms=int(cfg.grpc.keepalive_timeout_ms),
-        grpc_keepalive_permit_without_calls=bool(cfg.grpc.keepalive_permit_without_calls),
+        **_metadata_pack_network_kwargs(args, cfg),
         desired_copies_by_hash=desired_copies_by_hash,
         pack_hash=args.pack_hash,
         verify_all=bool(args.all),
@@ -994,7 +1009,11 @@ def cmd_verify_metadata_packs(args: argparse.Namespace) -> int:
         print("   packs: (none)")
     else:
         print("Packs")
-        _print_metadata_pack_verification_results(result.results, show_sources=bool(args.show_sources))
+        _print_metadata_pack_verification_results(
+            result.results,
+            show_sources=bool(args.show_sources),
+            local_pushed_at_by_hash=local_pushed_at_by_hash,
+        )
 
     _print_limited_items("List warnings", stats.list_errors, limit=_configured_warning_limit(cfg))
 

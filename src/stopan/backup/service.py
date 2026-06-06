@@ -24,9 +24,10 @@ from stopan.metadata.objects.graph.auto_export import (
 )
 from stopan.scanning.scanner import TreeWalker
 from stopan.errors import StopanStorageError, StopanUsageError
+from stopan.config.defaults import DEFAULT_BACKUP_WORKERS
 
 
-_DEFAULT_WORKERS_FALLBACK = 4
+_DEFAULT_WORKERS_FALLBACK = DEFAULT_BACKUP_WORKERS
 
 
 def backup_directory(

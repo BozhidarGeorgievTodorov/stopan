@@ -13,10 +13,13 @@ import yaml
 from stopan.cli.validation import IntRange, validate_int_ranges
 from stopan.errors import StopanStorageError, StopanUsageError
 from stopan.config.defaults import (
+    DEFAULT_CLUSTER_TOKEN,
+    DEFAULT_NODE_BIND_ADDR,
     DEFAULT_NODE_CONFIG,
     DEFAULT_SYSTEM_DB_FILE,
     DEFAULT_SYSTEM_LOCAL_SHARD_DIR,
     DEFAULT_SYSTEM_REPO_STORE_DIR,
+    DEFAULT_PROTECTION_REMOTE_COPIES,
 )
 from stopan.config.loader import load_config
 from stopan.config.model import StopanConfig
@@ -49,12 +52,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     node.add_argument(
         "--bind-addr",
-        default="[::]:50051",
-        help="Dirección local de escucha gRPC. Por defecto: [::]:50051.",
+        default=DEFAULT_NODE_BIND_ADDR,
+        help=f"Dirección local de escucha gRPC. Por defecto: {DEFAULT_NODE_BIND_ADDR}.",
     )
     node.add_argument(
         "--token",
-        default="",
+        default=DEFAULT_CLUSTER_TOKEN,
         help="Token lógico del cluster. Si se omite, queda vacío.",
     )
     node.add_argument(
@@ -78,7 +81,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_SYSTEM_DB_FILE,
         help=f"Ruta de metadata local. Por defecto: {DEFAULT_SYSTEM_DB_FILE}.",
     )
-    node.add_argument("--remote-copies", type=int, default=3, help="Copias remotas completas por chunk. Por defecto: 3.")
+    node.add_argument(
+        "--remote-copies",
+        type=int,
+        default=DEFAULT_PROTECTION_REMOTE_COPIES,
+        help=f"Copias remotas completas por chunk. Por defecto: {DEFAULT_PROTECTION_REMOTE_COPIES}.",
+    )
     node.add_argument(
         "--strict-remote-copies",
         action="store_true",

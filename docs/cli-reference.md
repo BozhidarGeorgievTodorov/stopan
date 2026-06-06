@@ -4,7 +4,7 @@ Este documento detalla los flujos avanzados, opciones de rendimiento y comandos 
 
 ## 1. Opciones avanzadas de Backup Local
 
-Stopan permite alterar el comportamiento del recorrido y la generación de chunks durante el backup:
+Stopan permite alterar el comportamiento del recorrido y la generación de chunks durante el backup. Si no se pasa el argumento posicional `workers`, se usa `backup.workers` del YAML:
 
 **Procesamiento multihilo:**
 
@@ -55,14 +55,15 @@ Los flags largos se escriben completos. Stopan rechaza prefijos implícitos para
 Las validaciones de rango se hacen antes de iniciar trabajo real:
 
 - valores `>= 0`: copias deseadas que permiten modo local-only, `ec_m`, edades de GC y periodos de gracia.
-- valores `>= 1`: workers, `snapshot_id`, límites, paralelismos, tamaños de mensaje, ventanas de restore, `ec_k`, `commit_every`, `max_candidates`, `metadata.pack_discovery_max_candidates`, `metadata.cli_warning_limit`, `metadata pack push --pack-copies` y parámetros scrypt `r/p`.
-- valores `> 0`: timeouts RPC/probe/stream.
+- valores `>= 1`: workers, `backup.workers`, `snapshot_id`, límites, paralelismos, tamaños de mensaje, ventanas de restore, `ec_k`, `protection.ec_pack_size_bytes`, `commit_every`, `max_candidates`, `metadata.pack_discovery_max_candidates`, `metadata.pack_target_parallelism`, `metadata.cli_warning_limit`, `metadata pack push --pack-copies` y parámetros scrypt `r/p`.
+- valores `> 0`: timeouts RPC/probe/stream y `metadata.pack_rpc_timeout_s`.
 - `--scrypt-n` debe ser `>= 2` y potencia de dos; `--metadata-key-length` debe ser `>= 32`.
 
 
 Los límites operativos de descubrimiento de metadata packs siguen la configuración efectiva:
 
 - `metadata.pack_discovery_max_candidates` define el límite por defecto para `metadata pack discover`, `metadata pack verify` sin `--pack-hash` y `metadata pack recover` automático.
+- `metadata.pack_target_parallelism` y `metadata.pack_rpc_timeout_s` definen los defaults de paralelismo y timeout de RPC para push/discover/verify/recover de metadata packs.
 - `metadata.cli_warning_limit` define cuántos warnings/errores repetitivos imprime la CLI de metadata antes de resumir el resto.
 - `--max-candidates` puede sobrescribir el límite de candidatos en una ejecución concreta.
 - `metadata pack discover` y `metadata pack verify` usan la publicación local persistida por `metadata pack push` para conocer las copias esperadas. Si no existe publicación local, imprimen `desired_copies: unknown` y `presence_state: UNKNOWN`.
@@ -144,7 +145,7 @@ python -m stopan push \
   --ec-m 1
 ```
 
-El tamaño objetivo máximo del payload de cada data pack se puede ajustar con `--ec-pack-size-bytes`:
+El tamaño objetivo máximo del payload de cada data pack se toma de `protection.ec_pack_size_bytes` y se puede sobrescribir con `--ec-pack-size-bytes`:
 
 ```bash
 python -m stopan push \

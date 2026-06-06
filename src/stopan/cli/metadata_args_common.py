@@ -36,13 +36,13 @@ def add_metadata_pack_push_args(parser: argparse.ArgumentParser) -> None:
         "--target-parallelism",
         type=int,
         default=None,
-        help="Número de targets remotos procesados en paralelo. Default: replication.target_parallelism.",
+        help="Número de targets remotos procesados en paralelo. Default: metadata.pack_target_parallelism.",
     )
     parser.add_argument(
         "--rpc-timeout-s",
         type=float,
         default=None,
-        help="Timeout del RPC StoreMetadataPack en segundos. Default: replication.stream_timeout_s.",
+        help="Timeout del RPC StoreMetadataPack en segundos. Default: metadata.pack_rpc_timeout_s.",
     )
     parser.add_argument(
         "--max-message-bytes",

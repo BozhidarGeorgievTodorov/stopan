@@ -9,12 +9,14 @@ from stopan.config.defaults import (
     DEFAULT_BACKUP_WORKERS,
     DEFAULT_CLUSTER_SEEDS,
     DEFAULT_CLUSTER_TOKEN,
-    DEFAULT_GC_DISTRIBUTED_PACK_MAX_AGE_DAYS,
-    DEFAULT_GC_LOCAL_CAS_GRACE_HOURS,
-    DEFAULT_GC_METADATA_OBJECT_PACK_GRACE_HOURS,
-    DEFAULT_GC_METADATA_OBJECT_STORE_GRACE_HOURS,
-    DEFAULT_GC_NODE_CAS_MAX_AGE_DAYS,
-    DEFAULT_GC_RESTORE_OUTPUT_MAX_AGE_DAYS,
+    DEFAULT_GC_GENERATED_CHUNK_GRACE_HOURS,
+    DEFAULT_GC_GENERATED_EC_GRACE_HOURS,
+    DEFAULT_GC_GENERATED_METADATA_GRAPH_GRACE_HOURS,
+    DEFAULT_GC_GENERATED_METADATA_PACK_GRACE_HOURS,
+    DEFAULT_GC_RECEIVED_CHUNK_MAX_AGE_DAYS,
+    DEFAULT_GC_RECEIVED_EC_MAX_AGE_DAYS,
+    DEFAULT_GC_RECEIVED_METADATA_PACK_MAX_AGE_DAYS,
+    DEFAULT_GC_RECOVERED_METADATA_PACK_MAX_AGE_DAYS,
     DEFAULT_EC_PACK_SIZE_BYTES,
     DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS,
     DEFAULT_GRPC_KEEPALIVE_TIME_MS,
@@ -333,30 +335,52 @@ class MetadataConfig:
 
 @dataclass(frozen=True)
 class GcConfig:
-    local_cas_grace_hours: float = DEFAULT_GC_LOCAL_CAS_GRACE_HOURS
-    restore_output_max_age_days: int = DEFAULT_GC_RESTORE_OUTPUT_MAX_AGE_DAYS
-    node_cas_max_age_days: int = DEFAULT_GC_NODE_CAS_MAX_AGE_DAYS
-    metadata_object_store_grace_hours: float = DEFAULT_GC_METADATA_OBJECT_STORE_GRACE_HOURS
-    metadata_object_pack_grace_hours: float = DEFAULT_GC_METADATA_OBJECT_PACK_GRACE_HOURS
-    distributed_pack_max_age_days: int = DEFAULT_GC_DISTRIBUTED_PACK_MAX_AGE_DAYS
+    generated_chunk_grace_hours: float = DEFAULT_GC_GENERATED_CHUNK_GRACE_HOURS
+    received_chunk_max_age_days: int = DEFAULT_GC_RECEIVED_CHUNK_MAX_AGE_DAYS
+    generated_ec_grace_hours: float = DEFAULT_GC_GENERATED_EC_GRACE_HOURS
+    received_ec_max_age_days: int = DEFAULT_GC_RECEIVED_EC_MAX_AGE_DAYS
+    generated_metadata_graph_grace_hours: float = DEFAULT_GC_GENERATED_METADATA_GRAPH_GRACE_HOURS
+    generated_metadata_pack_grace_hours: float = DEFAULT_GC_GENERATED_METADATA_PACK_GRACE_HOURS
+    received_metadata_pack_max_age_days: int = DEFAULT_GC_RECEIVED_METADATA_PACK_MAX_AGE_DAYS
+    recovered_metadata_pack_max_age_days: int = DEFAULT_GC_RECOVERED_METADATA_PACK_MAX_AGE_DAYS
 
     def __post_init__(self) -> None:
-        _require_float("gc.local_cas_grace_hours", self.local_cas_grace_hours, min_value=0.0, inclusive=True)
-        _require_int("gc.restore_output_max_age_days", self.restore_output_max_age_days, min_value=0)
-        _require_int("gc.node_cas_max_age_days", self.node_cas_max_age_days, min_value=0)
         _require_float(
-            "gc.metadata_object_store_grace_hours",
-            self.metadata_object_store_grace_hours,
+            "gc.generated_chunk_grace_hours",
+            self.generated_chunk_grace_hours,
+            min_value=0.0,
+            inclusive=True,
+        )
+        _require_int("gc.received_chunk_max_age_days", self.received_chunk_max_age_days, min_value=0)
+        _require_float(
+            "gc.generated_ec_grace_hours",
+            self.generated_ec_grace_hours,
+            min_value=0.0,
+            inclusive=True,
+        )
+        _require_int("gc.received_ec_max_age_days", self.received_ec_max_age_days, min_value=0)
+        _require_float(
+            "gc.generated_metadata_graph_grace_hours",
+            self.generated_metadata_graph_grace_hours,
             min_value=0.0,
             inclusive=True,
         )
         _require_float(
-            "gc.metadata_object_pack_grace_hours",
-            self.metadata_object_pack_grace_hours,
+            "gc.generated_metadata_pack_grace_hours",
+            self.generated_metadata_pack_grace_hours,
             min_value=0.0,
             inclusive=True,
         )
-        _require_int("gc.distributed_pack_max_age_days", self.distributed_pack_max_age_days, min_value=0)
+        _require_int(
+            "gc.received_metadata_pack_max_age_days",
+            self.received_metadata_pack_max_age_days,
+            min_value=0,
+        )
+        _require_int(
+            "gc.recovered_metadata_pack_max_age_days",
+            self.recovered_metadata_pack_max_age_days,
+            min_value=0,
+        )
 
 
 @dataclass(frozen=True)

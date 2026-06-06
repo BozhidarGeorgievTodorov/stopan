@@ -241,7 +241,7 @@ python -m stopan restore 1 \
 
 Aunque `backup` puede actualizar y empaquetar el grafo automáticamente, el flujo se puede descomponer en pasos manuales para auditoría o recuperación granular.
 
-El metadata object graph usa `--passphrase-file`. Los metadata packs usan `--passphrase-file` y `--identity-file`. `metadata graph export` y `metadata graph import` no necesitan identidad; `metadata pack create`, `metadata pack import`, `metadata pack push`, `metadata pack recover`, `metadata pack inspect --decrypt` y `metadata graph gc` sí la usan cuando trabajan con packs.
+El metadata object graph usa `--passphrase-file`. Los metadata packs usan `--passphrase-file` y `--identity-file`. `metadata graph export` y `metadata graph import` no necesitan identidad; `metadata pack create`, `metadata pack import`, `metadata pack push`, `metadata pack recover`, `metadata pack inspect --decrypt` y `gc generated-metadata-packs` sí la usan cuando trabajan con packs.
 
 **Exportar el grafo de metadata desde SQLite a un object store local:**
 
@@ -338,35 +338,35 @@ python -m stopan metadata graph import \
 
 ## 6. Garbage Collection
 
-Stopan permite limpiar objetos y packs de metadata que ya no forman parte del estado vivo. `metadata graph gc` recibe también `--identity-file` porque el collector puede necesitar inspeccionar packs de metadata.
+Stopan centraliza el garbage collection local en `python -m stopan gc ...`. No hay comunicación con otros nodos: cada target limpia únicamente los directorios locales configurados o indicados por CLI.
 
-**Limpieza de objetos sueltos exclusivamente (modo seguro/dry-run):**
+**Limpieza de objetos del metadata graph generado localmente (modo seguro/dry-run):**
 
 ```bash
-python -m stopan metadata graph gc \
+python -m stopan gc generated-metadata-graph \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json \
-  --objects-only \
   --dry-run
 ```
 
-**Limpieza de packs exclusivamente (modo seguro/dry-run):**
+**Limpieza de metadata packs generados localmente:**
 
 ```bash
-python -m stopan metadata graph gc \
+python -m stopan gc generated-metadata-packs \
   --object-store metadata_object_store \
   --passphrase-file metadata.passphrase \
   --identity-file metadata_identity.json \
-  --packs-only \
+  --dry-run
+```
+
+**Limpieza del store distribuido de metadata packs recibidos:**
+
+```bash
+python -m stopan gc received-metadata-packs \
+  --config configs/node1.yaml \
   --dry-run
 ```
 
 **Aplicar los borrados de forma permanente:**
-Sustituir `--dry-run` por `--apply` en cualquiera de los comandos anteriores. Para el store distribuido P2P:
-
-```bash
-python -m stopan metadata-store-gc \
-  --config configs/node1.yaml \
-  --apply
-```
+Sustituir `--dry-run` por `--apply` en cualquiera de los comandos anteriores.

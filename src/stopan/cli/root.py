@@ -52,9 +52,9 @@ COMMANDS: dict[str, CommandSpec] = {
         module_name="stopan.cli.metadata",
         description="Gestiona metadata cifrada local",
     ),
-    "metadata-store-gc": CommandSpec(
-        module_name="stopan.cli.metadata_store_gc",
-        description="Limpia el distributed metadata pack store",
+    "gc": CommandSpec(
+        module_name="stopan.cli.gc",
+        description="Ejecuta GC local sobre almacenes de Stopan",
     ),
 }
 

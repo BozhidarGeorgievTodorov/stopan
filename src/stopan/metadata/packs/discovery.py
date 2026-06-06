@@ -9,12 +9,13 @@ política de protección.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import StrEnum
 
 from stopan.cluster.resolver import require_cluster_view
+from stopan.cluster.view import ClusterMember
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.packs.remote import (
@@ -135,6 +136,46 @@ def group_metadata_pack_sources(
     return entries
 
 
+def collect_metadata_pack_sources(
+    *,
+    membership_seed: str | None,
+    self_addr: str,
+    cluster_token: str,
+    membership_timeout_s: float,
+    target_parallelism: int,
+    max_message_bytes: int,
+    error_cls: type[Exception] = MetadataPackDiscoveryError,
+    query_target: Callable[[ClusterMember], tuple[Sequence[MetadataPackSource], str | None]],
+) -> tuple[list[ClusterMember], list[MetadataPackSource], tuple[str, ...]]:
+    try:
+        resolved = require_cluster_view(
+            membership_seed=membership_seed,
+            self_addr=self_addr,
+            cluster_token=cluster_token,
+            timeout_s=membership_timeout_s,
+            max_message_bytes=int(max_message_bytes),
+            missing_seed_message="Falta membership seed en la configuración.",
+        )
+    except Exception as exc:
+        raise error_cls(str(exc)) from exc
+
+    targets = [member for member in resolved.cluster.members if str(member.address or "").strip()]
+    if not targets:
+        raise error_cls("Membership no devolvió miembros elegibles del cluster.")
+
+    parallelism = max(1, int(target_parallelism))
+    sources: list[MetadataPackSource] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(parallelism, len(targets))) as executor:
+        futures = [executor.submit(query_target, target) for target in targets]
+        for future in as_completed(futures):
+            records, error = future.result()
+            sources.extend(records)
+            if error:
+                errors.append(error)
+    return targets, sources, tuple(errors)
+
+
 def discover_metadata_packs_from_network(
     *,
     owner_id: str,
@@ -152,47 +193,25 @@ def discover_metadata_packs_from_network(
     max_candidates: int | None = None,
 ) -> MetadataPackDiscoveryResult:
     owner = validate_owner_id(owner_id)
-    parallelism = max(1, int(target_parallelism))
-
-    try:
-        resolved = require_cluster_view(
-            membership_seed=membership_seed,
-            self_addr=self_addr,
+    targets, all_sources, list_errors = collect_metadata_pack_sources(
+        membership_seed=membership_seed,
+        self_addr=self_addr,
+        cluster_token=cluster_token,
+        membership_timeout_s=membership_timeout_s,
+        target_parallelism=target_parallelism,
+        max_message_bytes=max_message_bytes,
+        error_cls=MetadataPackDiscoveryError,
+        query_target=lambda target: _list_packs_from_target(
+            target,
+            owner_id=owner,
             cluster_token=cluster_token,
-            timeout_s=membership_timeout_s,
+            timeout_s=rpc_timeout_s,
             max_message_bytes=int(max_message_bytes),
-            missing_seed_message="Falta membership seed en la configuración.",
-        )
-    except Exception as exc:
-        raise MetadataPackDiscoveryError(str(exc)) from exc
-
-    cluster = resolved.cluster
-    targets = [member for member in cluster.members if str(getattr(member, "address", "") or "").strip()]
-    if not targets:
-        raise MetadataPackDiscoveryError("Membership no devolvió miembros elegibles del cluster.")
-
-    all_sources: list[MetadataPackSource] = []
-    list_errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(parallelism, len(targets))) as executor:
-        futures = [
-            executor.submit(
-                _list_packs_from_target,
-                target,
-                owner_id=owner,
-                cluster_token=cluster_token,
-                timeout_s=rpc_timeout_s,
-                max_message_bytes=int(max_message_bytes),
-                grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-                grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-                grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-            )
-            for target in targets
-        ]
-        for future in as_completed(futures):
-            records, error = future.result()
-            all_sources.extend(records)
-            if error:
-                list_errors.append(error)
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        ),
+    )
 
     desired_map = dict(desired_copies_by_hash or {})
     entries = group_metadata_pack_sources(
@@ -208,7 +227,7 @@ def discover_metadata_packs_from_network(
             list_targets_attempted=len(targets),
             list_targets_succeeded=len(targets) - len(list_errors),
             publications_known=sum(1 for entry in entries if entry.desired_copies is not None),
-            list_errors=tuple(list_errors),
+            list_errors=list_errors,
         ),
         entries=tuple(entries),
     )

@@ -77,7 +77,10 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     export_parser.add_argument(
         "--pack-dir",
         default=None,
-        help="Directorio de salida del pack si se usa --pack y se omite --pack-out. Default: <object-store>/packs.",
+        help=(
+            "Directorio de salida del pack si se usa --pack y se omite --pack-out. "
+            "Default: metadata.object_pack_dir o <object-store>/packs."
+        ),
     )
     add_scrypt_override_args(export_parser)
 
@@ -112,73 +115,3 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
             "o no hay protection_index. Puede ser 0. Default: protection.remote_copies."
         ),
     )
-
-    gc_parser = graph_subparsers.add_parser(
-        "gc",
-        allow_abbrev=False,
-        help="[avanzado] Ejecuta Mark & Sweep sobre el metadata object store cifrado.",
-    )
-    gc_parser.set_defaults(command="graph.gc")
-    add_config_args(gc_parser)
-    gc_parser.add_argument(
-        "--object-store",
-        default=None,
-        help="Directorio del metadata object store cifrado. Default: metadata.object_store_dir.",
-    )
-    gc_parser.add_argument(
-        "--passphrase-file",
-        default=None,
-        help="Lee la passphrase desde un fichero privado. Evita pasar secretos por argv.",
-    )
-    gc_parser.add_argument(
-        "--identity-file",
-        default=None,
-        help="Identity file usado para descifrar packs locales durante GC. Default: metadata.identity_file.",
-    )
-    gc_parser.add_argument(
-        "--object-grace-hours",
-        type=float,
-        default=None,
-        help=(
-            "Periodo de gracia antes de borrar objetos cifrados no alcanzables. "
-            "Default: gc.metadata_object_store_grace_hours."
-        ),
-    )
-    gc_parser.add_argument(
-        "--pack-grace-hours",
-        type=float,
-        default=None,
-        help=(
-            "Periodo de gracia antes de borrar .stopanmetapack locales obsoletos. "
-            "Default: gc.metadata_object_pack_grace_hours."
-        ),
-    )
-    gc_apply_group = gc_parser.add_mutually_exclusive_group()
-    gc_apply_group.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=True,
-        help="Muestra lo que se borraría sin borrar nada. Es el default.",
-    )
-    gc_apply_group.add_argument(
-        "--apply",
-        dest="dry_run",
-        action="store_false",
-        help="Ejecuta el borrado real.",
-    )
-    gc_parser.add_argument(
-        "--objects-only",
-        action="store_true",
-        help="Solo recolecta objetos huérfanos; no toca packs.",
-    )
-    gc_parser.add_argument(
-        "--packs-only",
-        action="store_true",
-        help="Solo recolecta packs obsoletos; no toca objetos.",
-    )
-    gc_parser.add_argument(
-        "--pack-dir",
-        default=None,
-        help="Directorio de packs a limpiar. Default: <object-store>/packs.",
-    )
-

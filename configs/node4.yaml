@@ -47,7 +47,14 @@ metadata:
   max_distributed_pack_store_bytes: 1073741824
 
 gc:
-  distributed_pack_max_age_days: 0
+  generated_chunk_grace_hours: 48.0
+  received_chunk_max_age_days: 0
+  generated_ec_grace_hours: 48.0
+  received_ec_max_age_days: 0
+  generated_metadata_graph_grace_hours: 48.0
+  generated_metadata_pack_grace_hours: 48.0
+  received_metadata_pack_max_age_days: 0
+  recovered_metadata_pack_max_age_days: 0
 
 verify:
   target_parallelism: 4

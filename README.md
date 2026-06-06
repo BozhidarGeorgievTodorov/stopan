@@ -225,20 +225,30 @@ python -m stopan metadata pack recover --object-store recovered_store --passphra
 python -m stopan metadata pack recover --object-store recovered_store --passphrase-file pass.txt --identity-file id.json --membership-seed localhost:50051 --target-hash PACK_HASH
 ```
 
-## GC de metadata
+## GC
 
-Stopan incluye comandos de garbage collection para limpiar objetos y packs de metadata que ya no son necesarios (se recomienda usar `--dry-run` primero para verificar qué se eliminará sin modificar el store).
+Stopan centraliza el garbage collection local en `python -m stopan gc ...`. Por defecto los comandos son `--dry-run`; para borrar de verdad se usa `--apply`.
 
-Limpieza local del object store (detecta objetos o packs que no forman parte del estado vivo):
-
-```bash
-python -m stopan metadata graph gc --object-store meta_store --passphrase-file pass.txt --identity-file id.json --dry-run
-```
-
-Limpieza del store distribuido de packs (se ejecuta en el nodo que mantiene el store remoto):
+Limpieza de objetos del metadata graph generado localmente:
 
 ```bash
-python -m stopan metadata-store-gc --config configs/node1.yaml --dry-run
+python -m stopan gc generated-metadata-graph --object-store meta_store --passphrase-file pass.txt --identity-file id.json --dry-run
 ```
 
-*(Para aplicar la limpieza de forma definitiva, se sustituye el flag `--dry-run` por `--apply`).*
+Limpieza del store distribuido de metadata packs recibidos por un nodo:
+
+```bash
+python -m stopan gc received-metadata-packs --config configs/node1.yaml --dry-run
+```
+
+Limpieza de metadata packs descargados durante recover:
+
+```bash
+python -m stopan gc recovered-metadata-packs --object-store recovered_store --dry-run
+```
+
+Ejecución agrupada de los GC configurados:
+
+```bash
+python -m stopan gc all --config configs/node1.yaml --passphrase-file pass.txt --identity-file id.json --dry-run
+```

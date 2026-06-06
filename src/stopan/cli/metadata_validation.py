@@ -110,15 +110,4 @@ def validate_metadata_args(parser: argparse.ArgumentParser, args: argparse.Names
     if args.command == "pack.verify":
         reject_together(parser, args, Flag("pack_hash", "--pack-hash"), Flag("all", "--all"))
 
-    if args.command == "graph.gc":
-        validate_float_ranges(
-            parser,
-            args,
-            (
-                FloatRange("object_grace_hours", "--object-grace-hours", 0.0),
-                FloatRange("pack_grace_hours", "--pack-grace-hours", 0.0),
-            ),
-        )
-        reject_together(parser, args, Flag("objects_only", "--objects-only"), Flag("packs_only", "--packs-only"))
-
 

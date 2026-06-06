@@ -13,10 +13,8 @@ UNKNOWN y se muestran las copias observadas.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from stopan.cluster.resolver import require_cluster_view
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.packs.discovery import (
@@ -25,6 +23,7 @@ from stopan.metadata.packs.discovery import (
     discover_metadata_packs_from_network,
     group_metadata_pack_sources,
     metadata_pack_presence_state,
+    collect_metadata_pack_sources,
 )
 from stopan.metadata.packs.hashes import validate_pack_hash
 from stopan.metadata.packs.remote import MetadataPackSource, probe_metadata_pack_from_target
@@ -184,47 +183,30 @@ def _probe_pack_from_network(
     grpc_keepalive_permit_without_calls: bool,
     desired_copies: int | None,
 ) -> tuple[MetadataPackVerificationResult, MetadataPackVerificationStats]:
-    try:
-        resolved = require_cluster_view(
-            membership_seed=membership_seed,
-            self_addr=self_addr,
+    def probe_target(target) -> tuple[list[MetadataPackSource], str | None]:
+        source, error = probe_metadata_pack_from_target(
+            target,
+            owner_id=owner_id,
+            pack_hash=pack_hash,
             cluster_token=cluster_token,
-            timeout_s=membership_timeout_s,
+            timeout_s=rpc_timeout_s,
             max_message_bytes=int(max_message_bytes),
-            missing_seed_message="Falta membership seed en la configuración.",
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
         )
-    except Exception as exc:
-        raise MetadataPackVerificationError(str(exc)) from exc
+        return ([source] if source is not None else []), error
 
-    targets = [member for member in resolved.cluster.members if str(getattr(member, "address", "") or "").strip()]
-    if not targets:
-        raise MetadataPackVerificationError("Membership no devolvió miembros elegibles del cluster.")
-
-    parallelism = max(1, int(target_parallelism))
-    sources: list[MetadataPackSource] = []
-    errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(parallelism, len(targets))) as executor:
-        futures = [
-            executor.submit(
-                probe_metadata_pack_from_target,
-                target,
-                owner_id=owner_id,
-                pack_hash=pack_hash,
-                cluster_token=cluster_token,
-                timeout_s=rpc_timeout_s,
-                max_message_bytes=int(max_message_bytes),
-                grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-                grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-                grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-            )
-            for target in targets
-        ]
-        for future in as_completed(futures):
-            source, error = future.result()
-            if source is not None:
-                sources.append(source)
-            if error:
-                errors.append(error)
+    targets, sources, errors = collect_metadata_pack_sources(
+        membership_seed=membership_seed,
+        self_addr=self_addr,
+        cluster_token=cluster_token,
+        membership_timeout_s=membership_timeout_s,
+        target_parallelism=target_parallelism,
+        max_message_bytes=max_message_bytes,
+        error_cls=MetadataPackVerificationError,
+        query_target=probe_target,
+    )
 
     desired_map = {pack_hash: int(desired_copies)} if desired_copies is not None else {}
     entries = group_metadata_pack_sources(sources, desired_copies_by_hash=desired_map, max_candidates=None)
@@ -247,7 +229,7 @@ def _probe_pack_from_network(
         list_targets_succeeded=len(targets) - len(errors),
         sources_seen=len(sources),
         publications_known=1 if desired_copies is not None else 0,
-        list_errors=tuple(errors),
+        list_errors=errors,
     )
     return result, stats
 

@@ -12,7 +12,6 @@ MetadataCommandHandler = Callable[[object], int]
 def _command_handlers() -> dict[str, MetadataCommandHandler]:
     from stopan.cli.metadata_commands_graph import (
         cmd_export_object_graph,
-        cmd_gc_object_store,
         cmd_import_object_graph,
         cmd_object_store_status,
     )
@@ -42,7 +41,6 @@ def _command_handlers() -> dict[str, MetadataCommandHandler]:
         "graph.status": cmd_object_store_status,
         "graph.export": cmd_export_object_graph,
         "graph.import": cmd_import_object_graph,
-        "graph.gc": cmd_gc_object_store,
         "pack.create": cmd_pack_object_graph,
         "pack.inspect": cmd_inspect_object_pack,
         "pack.list": cmd_list_object_packs,

@@ -22,7 +22,6 @@ from stopan.cli.metadata_helpers import (
     passphrase_for_export,
     passphrase_for_object_store_export,
     scrypt_cost_from_args,
-    scrypt_cost_from_config,
 )
 from stopan.metadata.identity import (
     create_metadata_identity_file,
@@ -30,7 +29,6 @@ from stopan.metadata.identity import (
     sign_metadata_pack_hash,
     validate_owner_id,
 )
-from stopan.metadata.objects.gc import MetadataObjectGarbageCollector
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
 from stopan.metadata.packs.object_pack import MetadataObjectPackService
 from stopan.metadata.database import MetadataDB
@@ -181,12 +179,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"   max_distributed_pack_bytes_per_owner: {format_bytes(int(cfg.metadata.max_distributed_pack_bytes_per_owner))}")
     print(f"   max_distributed_pack_store_bytes: {format_bytes(int(cfg.metadata.max_distributed_pack_store_bytes))}")
 
-    print("Metadata object store GC policy")
-    print(f"   object_grace_hours: {cfg.gc.metadata_object_store_grace_hours}")
-    print(f"   pack_grace_hours: {cfg.gc.metadata_object_pack_grace_hours}")
+    print("Metadata graph GC policy")
+    print(f"   generated_graph_grace_hours: {cfg.gc.generated_metadata_graph_grace_hours}")
+    print(f"   generated_pack_grace_hours: {cfg.gc.generated_metadata_pack_grace_hours}")
 
-    print("Distributed metadata pack store GC policy")
-    print(f"   max_age_days: {cfg.gc.distributed_pack_max_age_days}")
+    print("Received metadata pack store GC policy")
+    print(f"   max_age_days: {cfg.gc.received_metadata_pack_max_age_days}")
+
+    print("Recovered metadata pack GC policy")
+    print(f"   max_age_days: {cfg.gc.recovered_metadata_pack_max_age_days}")
 
     print("\nHow backup/push/verify decide whether to update the metadata vault:")
     print("   1. --metadata-object-store implies object graph export for that command")
@@ -404,12 +405,13 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
 
     if bool(args.pack):
         pack_service = object_pack_service_from_config(args, cfg)
+        pack_dir = args.pack_dir or cfg.metadata.object_pack_dir or None
         pack_result = pack_service.export_latest_pack(
             object_store_dir=object_store_dir,
             passphrase=passphrase,
             identity_file=identity_file_from_args(args, cfg),
             out_path=args.pack_out,
-            pack_dir=args.pack_dir,
+            pack_dir=pack_dir,
         )
 
         print("Metadata object pack creado")
@@ -515,68 +517,6 @@ def cmd_list_object_packs(args: argparse.Namespace) -> int:
             print(f"- {path.name}")
             print(f"   path: {path}")
             print(f"   error: {exc}")
-
-    return 0
-
-
-def cmd_gc_object_store(args: argparse.Namespace) -> int:
-    if args.objects_only and args.packs_only:
-        raise StopanUsageError("'--objects-only' y '--packs-only' son incompatibles.")
-
-    cfg = load_runtime_config(args)
-    object_store_dir = object_store_dir_from_args(args, cfg)
-
-    object_grace_hours = float(
-        choose(args.object_grace_hours, cfg.gc.metadata_object_store_grace_hours)
-    )
-    pack_grace_hours = float(
-        choose(args.pack_grace_hours, cfg.gc.metadata_object_pack_grace_hours)
-    )
-
-    collector = MetadataObjectGarbageCollector(
-        scrypt_cost=scrypt_cost_from_config(cfg)
-    )
-    result = collector.collect(
-        object_store_dir=object_store_dir,
-        identity_file=identity_file_from_args(args, cfg),
-        passphrase=passphrase_for_decrypt(args),
-        object_grace_seconds=int(max(object_grace_hours, 0.0) * 3600),
-        pack_grace_seconds=int(max(pack_grace_hours, 0.0) * 3600),
-        dry_run=bool(args.dry_run),
-        include_objects=not bool(args.packs_only),
-        include_packs=not bool(args.objects_only),
-        pack_dir=args.pack_dir,
-    )
-
-    print("Metadata object store GC")
-    print(f"   object_store: {result.root_dir}")
-    print(f"   catalog_hash: {result.catalog_hash}")
-    print(f"   dry_run: {result.dry_run}")
-    print(f"   object_grace_seconds: {result.object_grace_seconds}")
-    print(f"   pack_grace_seconds: {result.pack_grace_seconds}")
-    print("Objects")
-    print(f"   live_objects: {result.live_objects}")
-    print(f"   object_files_seen: {result.object_files_seen}")
-    print(f"   object_files_live: {result.object_files_live}")
-    print(f"   object_files_collectable: {result.object_files_collectable}")
-    print(f"   object_files_deleted: {result.object_files_deleted}")
-    print(f"   object_files_skipped_by_grace: {result.object_files_skipped_by_grace}")
-    print(f"   object_files_malformed: {result.object_files_malformed}")
-    print(f"   object_bytes_deleted: {format_bytes(result.object_bytes_deleted)}")
-    print("Packs")
-    print(f"   pack_dir: {result.pack_dir}")
-    print(f"   pack_files_seen: {result.pack_files_seen}")
-    print(f"   pack_files_latest: {result.pack_files_latest}")
-    print(f"   pack_files_collectable: {result.pack_files_collectable}")
-    print(f"   pack_files_deleted: {result.pack_files_deleted}")
-    print(f"   pack_files_skipped_by_grace: {result.pack_files_skipped_by_grace}")
-    print(f"   pack_files_unreadable: {result.pack_files_unreadable}")
-    print(f"   pack_bytes_deleted: {format_bytes(result.pack_bytes_deleted)}")
-
-    _print_limited_items("Errors / skipped items", result.errors, limit=_configured_warning_limit(cfg))
-
-    if result.dry_run:
-        print("\nDry-run activo: no se borró nada. Usa --apply para ejecutar el borrado real.")
 
     return 0
 

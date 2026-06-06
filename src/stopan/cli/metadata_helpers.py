@@ -180,5 +180,5 @@ def distributed_pack_store_from_args(args: Namespace, cfg: Any) -> MetadataPackS
         max_packs_per_owner=int(cfg.metadata.max_distributed_packs_per_owner),
         max_total_bytes_per_owner=int(cfg.metadata.max_distributed_pack_bytes_per_owner),
         max_total_store_bytes=int(cfg.metadata.max_distributed_pack_store_bytes),
-        max_age_days=int(cfg.gc.distributed_pack_max_age_days),
+        max_age_days=int(cfg.gc.received_metadata_pack_max_age_days),
     )

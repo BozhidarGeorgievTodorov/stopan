@@ -9,8 +9,10 @@ en un directorio .incomplete y cada archivo pasa primero por un .tmp.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 
+from stopan.cli.output import format_duration, format_speed
 from stopan.metadata.database import MetadataDB
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.models import RestoreRunStats
@@ -18,6 +20,9 @@ from stopan.restore.paths import RestorePaths, safe_restore_path
 from stopan.restore.prefetcher import OrderedBatchChunkPrefetcher
 from stopan.errors import StopanStorageError
 from stopan.restore.errors import RestoreDataError
+
+
+RESTORE_PROGRESS_EVERY_ITEMS = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +70,7 @@ class SnapshotRestorer:
         Si el directorio final ya existe, no sobrescribe. Si existe el directorio
         .incomplete, continúa trabajando sobre él para permitir reintentos.
         """
+        started_at = time.perf_counter()
         stats = self.fetch_service.stats
 
         status, error = self.db.get_snapshot_status(snapshot_id)
@@ -158,7 +164,9 @@ class SnapshotRestorer:
                     stats.files_failed += 1
                     continue
 
-                print(f"Restaurando (item {stats.processed_items}): {item['path']}")
+                if stats.processed_items % RESTORE_PROGRESS_EVERY_ITEMS == 0:
+                    self._print_progress(stats)
+
                 current_tmp_path = full_path + ".tmp"
                 success_file = True
 
@@ -239,6 +247,7 @@ class SnapshotRestorer:
                 print("-" * 40)
                 print(f"Restauración completa del Snapshot {snapshot_id}.")
                 print(f"Directorio final: {paths.final_dir}")
+                self._print_summary(stats, elapsed=time.perf_counter() - started_at)
                 return RestoreResult(
                     snapshot_id=snapshot_id,
                     completed=True,
@@ -263,6 +272,7 @@ class SnapshotRestorer:
         print("-" * 40)
         print(f"Restauración incompleta: {stats.successful_items}/{stats.processed_items} ítems.")
         print(f"Carpeta de trabajo: {paths.incomplete_dir}")
+        self._print_summary(stats, elapsed=time.perf_counter() - started_at)
         return RestoreResult(
             snapshot_id=snapshot_id,
             completed=False,
@@ -271,6 +281,40 @@ class SnapshotRestorer:
             work_dir=paths.incomplete_dir,
             error=f"restore incompleto: {stats.successful_items}/{stats.processed_items} items",
             stats=stats,
+        )
+
+    @staticmethod
+    def _print_progress(stats: RestoreRunStats) -> None:
+        print(
+            "   progreso: "
+            f"ítems={stats.processed_items} "
+            f"archivos={stats.files_restored} "
+            f"directorios={stats.directories_created} "
+            f"fallidos={stats.files_failed} "
+            f"bytes={stats.bytes_written}"
+        )
+
+    @staticmethod
+    def _print_summary(stats: RestoreRunStats, *, elapsed: float | None = None) -> None:
+        print(
+            "Resumen: "
+            f"ítems={stats.successful_items}/{stats.processed_items} | "
+            f"archivos={stats.files_restored} | "
+            f"directorios={stats.directories_created} | "
+            f"archivos_fallidos={stats.files_failed} | "
+            f"bytes={stats.bytes_written}"
+        )
+        if elapsed is not None:
+            print(f"Tiempo: {format_duration(elapsed)}")
+            print(f"Velocidad: {format_speed(stats.bytes_written, elapsed)}")
+        print(
+            "Chunks: "
+            f"requested={stats.chunks_requested} | "
+            f"local_cas={stats.chunks_from_local_cas} | "
+            f"local_p2p_cas={stats.chunks_from_local_p2p_cas} | "
+            f"remote_replication={stats.chunks_from_remote_replication} | "
+            f"ec={stats.chunks_from_ec} | "
+            f"failed={stats.chunks_failed}"
         )
 
     @staticmethod
@@ -286,3 +330,4 @@ class SnapshotRestorer:
             os.utime(path, (item["mtime"], item["mtime"]))
         except OSError:
             print(f"   No se pudieron restaurar permisos/fechas de {kind}: {item['path']}")
+

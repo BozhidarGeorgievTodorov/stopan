@@ -10,7 +10,7 @@ from stopan.cluster.view import ClusterView
 
 
 DEFAULT_REMOTE_PROTECTION_MISSING_SEED_MESSAGE = (
-    "Falta membership seed. Usa '--membership-seed' o define cluster.seeds en node.yaml."
+    "Falta membership seed. Usa '--membership-seed' o define cluster.seeds en stopan.yaml."
 )
 
 

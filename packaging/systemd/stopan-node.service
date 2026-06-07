@@ -8,10 +8,8 @@ Wants=network-online.target
 Type=simple
 User=stopan
 Group=stopan
-Environment=STOPAN_CONFIG=/etc/stopan/node.yaml
-EnvironmentFile=-/etc/stopan/node.env
 WorkingDirectory=/var/lib/stopan
-ExecStart=/usr/bin/stopan node --config ${STOPAN_CONFIG}
+ExecStart=/usr/bin/stopan node
 Restart=on-failure
 RestartSec=5s
 RuntimeDirectory=stopan

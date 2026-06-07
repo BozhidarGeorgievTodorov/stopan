@@ -1,7 +1,4 @@
-from __future__ import annotations
-
-
-EXAMPLE_CONFIG = """# Configuración principal de Stopan para una máquina instalada.
+# Configuración principal de Stopan para una máquina instalada.
 #
 # Este fichero se instala como /etc/stopan/stopan.yaml.
 # Stopan aplica primero los defaults internos y después sobrescribe con este YAML.
@@ -102,4 +99,3 @@ gc:
   generated_metadata_pack_grace_hours: 48.0
   received_metadata_pack_max_age_days: 0
   recovered_metadata_pack_max_age_days: 0
-"""

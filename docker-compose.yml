@@ -1,55 +1,74 @@
 x-node-common: &node-common
   build: .
-  command: ["python", "-m", "stopan", "node"]
+  command:
+    - sh
+    - -lc
+    - |
+      set -eu
+      mkdir -p /etc/stopan/jobs /etc/stopan/profiles
+      if [ ! -e /etc/stopan/.docker_bootstrap_done ]; then
+        cp /run/stopan-bootstrap.yaml /etc/stopan/stopan.yaml
+        chmod 0640 /etc/stopan/stopan.yaml || true
+        touch /etc/stopan/.docker_bootstrap_done
+      fi
+      exec stopan node
 
 services:
   node1:
     <<: *node-common
-    container_name: p2p_node_1
+    container_name: node_1
     ports:
       - "50051:50051"
     volumes:
-      - ./configs/node1.yaml:/etc/stopan/node.yaml:ro
-      - node1_data:/app/node_store
-      - node1_state:/app/state
-      - ./test_data:/app/test_data:ro
+      - ./configs/node1.yaml:/run/stopan-bootstrap.yaml:ro
+      - node1_config:/etc/stopan
+      - node1_data:/var/lib/stopan
+      - node1_logs:/var/log/stopan
+      - ./test_data:/srv/stopan/test_data:ro
 
   node2:
     <<: *node-common
-    container_name: p2p_node_2
+    container_name: node_2
     ports:
       - "50052:50051"
     volumes:
-      - ./configs/node2.yaml:/etc/stopan/node.yaml:ro
-      - node2_data:/app/node_store
-      - node2_state:/app/state
+      - ./configs/node2.yaml:/run/stopan-bootstrap.yaml:ro
+      - node2_config:/etc/stopan
+      - node2_data:/var/lib/stopan
+      - node2_logs:/var/log/stopan
 
   node3:
     <<: *node-common
-    container_name: p2p_node_3
+    container_name: node_3
     ports:
       - "50053:50051"
     volumes:
-      - ./configs/node3.yaml:/etc/stopan/node.yaml:ro
-      - node3_data:/app/node_store
-      - node3_state:/app/state
+      - ./configs/node3.yaml:/run/stopan-bootstrap.yaml:ro
+      - node3_config:/etc/stopan
+      - node3_data:/var/lib/stopan
+      - node3_logs:/var/log/stopan
 
   node4:
     <<: *node-common
-    container_name: p2p_node_4
+    container_name: node_4
     ports:
       - "50054:50051"
     volumes:
-      - ./configs/node4.yaml:/etc/stopan/node.yaml:ro
-      - node4_data:/app/node_store
-      - node4_state:/app/state
+      - ./configs/node4.yaml:/run/stopan-bootstrap.yaml:ro
+      - node4_config:/etc/stopan
+      - node4_data:/var/lib/stopan
+      - node4_logs:/var/log/stopan
 
 volumes:
+  node1_config: {}
+  node2_config: {}
+  node3_config: {}
+  node4_config: {}
   node1_data: {}
   node2_data: {}
   node3_data: {}
   node4_data: {}
-  node1_state: {}
-  node2_state: {}
-  node3_state: {}
-  node4_state: {}
+  node1_logs: {}
+  node2_logs: {}
+  node3_logs: {}
+  node4_logs: {}

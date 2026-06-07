@@ -1,0 +1,39 @@
+#!/bin/sh
+set -eu
+
+JOBS_DIR=${STOPAN_JOBS_DIR:-/etc/stopan/jobs}
+LIB_DIR=${STOPAN_JOB_LIB_DIR:-/usr/lib/stopan/jobs}
+
+. "$LIB_DIR/common.sh"
+
+job_name=${1:-}
+[ -n "$job_name" ] || stopan_job_die "uso: run-job <perfil>"
+
+case "$job_name" in
+    *[!A-Za-z0-9_.@-]*|'')
+        stopan_job_die "nombre de perfil no válido: $job_name"
+        ;;
+esac
+
+profile_file="$JOBS_DIR/$job_name.env"
+[ -f "$profile_file" ] || stopan_job_die "no existe el perfil $profile_file"
+
+set -a
+# shellcheck disable=SC1090
+. "$profile_file"
+set +a
+
+kind=${STOPAN_JOB_KIND:-}
+case "$kind" in
+    backup|data-push|data-restore|data-verify|metadata-graph|metadata-pack|gc)
+        ;;
+    '')
+        stopan_job_die "STOPAN_JOB_KIND es obligatorio en $profile_file"
+        ;;
+    *)
+        stopan_job_die "STOPAN_JOB_KIND no soportado: $kind"
+        ;;
+esac
+
+export STOPAN_JOB_NAME="$job_name"
+exec "$LIB_DIR/$kind.sh"

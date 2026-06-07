@@ -18,9 +18,9 @@ fi
 
 install -d -o root -g stopan -m 0750 /etc/stopan
 install -d -o root -g stopan -m 0750 /etc/stopan/jobs
+install -d -o root -g stopan -m 0750 /etc/stopan/profiles
 install -d -o stopan -g stopan -m 0750 /var/lib/stopan
 install -d -o stopan -g stopan -m 0750 /var/log/stopan
-
 
 install_if_missing() {
     src="$1"
@@ -34,17 +34,15 @@ install_if_missing() {
     fi
 }
 
-install_if_missing "/usr/share/doc/stopan/examples/configs/node.yaml" "/etc/stopan/node.yaml" 0640 root stopan
-install_if_missing "/usr/share/doc/stopan/examples/configs/client.yaml" "/etc/stopan/client.yaml" 0640 root stopan
+install_if_missing \
+    "/usr/share/doc/stopan/examples/configs/stopan.yaml" \
+    "/etc/stopan/stopan.yaml" \
+    0640 \
+    root \
+    stopan
 
-for script in /usr/share/doc/stopan/examples/jobs/*.sh; do
-    [ -f "$script" ] || continue
-    install_if_missing "$script" "/etc/stopan/jobs/$(basename "$script")" 0750 root stopan
-done
-
-for env_file in /usr/share/doc/stopan/examples/jobs/*.env; do
-    [ -f "$env_file" ] || continue
-    install_if_missing "$env_file" "/etc/stopan/jobs/$(basename "$env_file")" 0640 root stopan
-done
+# Los perfiles de jobs no se copian automáticamente a /etc/stopan/jobs.
+# El sysadmin puede copiarlos desde /usr/share/doc/stopan/examples/jobs/ y
+# crear tantas instancias como necesite: stopan-job@nombre.service/timer.
 
 #DEBHELPER#

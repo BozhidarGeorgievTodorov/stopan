@@ -46,6 +46,7 @@ class ErasurePushStats:
     stored_shards: int = 0
     already_present_shards: int = 0
     failed_shards: int = 0
+    processed_bytes: int = 0
     insufficient_remote_targets: bool = False
     remote_candidates: int = 0
     required_remote_targets: int = 0
@@ -193,6 +194,7 @@ def push_erasure_data_packs_to_network(
                 continue
 
             stats.packed_chunks += 1
+            stats.processed_bytes += len(data)
             if must_flush:
                 _flush_and_push_pack(
                     builder=builder,
@@ -345,6 +347,7 @@ def _retry_existing_pack(
         return chunk_count, False
 
     stats.packed_chunks += len(pack.entries)
+    stats.processed_bytes += sum(len(data) for _, data in materialized_chunks)
     _push_pack(
         pack=pack,
         db=db,
@@ -475,6 +478,7 @@ class _MutableErasurePushStats:
     stored_shards: int = 0
     already_present_shards: int = 0
     failed_shards: int = 0
+    processed_bytes: int = 0
     remote_candidates: int = 0
     required_remote_targets: int = 0
 
@@ -493,6 +497,7 @@ class _MutableErasurePushStats:
             stored_shards=self.stored_shards,
             already_present_shards=self.already_present_shards,
             failed_shards=self.failed_shards,
+            processed_bytes=self.processed_bytes,
             remote_candidates=self.remote_candidates,
             required_remote_targets=self.required_remote_targets,
             interrupted=interrupted,

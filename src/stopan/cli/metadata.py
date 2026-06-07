@@ -16,7 +16,6 @@ def _command_handlers() -> dict[str, MetadataCommandHandler]:
         cmd_object_store_status,
     )
     from stopan.cli.metadata_commands_identity import (
-        cmd_identity_create,
         cmd_identity_show,
         cmd_status,
     )
@@ -36,7 +35,6 @@ def _command_handlers() -> dict[str, MetadataCommandHandler]:
 
     return {
         "status": cmd_status,
-        "identity-create": cmd_identity_create,
         "identity-show": cmd_identity_show,
         "graph.status": cmd_object_store_status,
         "graph.export": cmd_export_object_graph,

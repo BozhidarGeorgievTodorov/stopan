@@ -18,7 +18,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     sub = parser.add_subparsers(dest="action", required=True)
 
-    example = sub.add_parser("example", allow_abbrev=False, help="Imprime o escribe un node.yaml de ejemplo.")
+    example = sub.add_parser("example", allow_abbrev=False, help="Imprime o escribe un stopan.yaml de ejemplo.")
     example.add_argument("--out", default=None, help="Ruta donde escribir el ejemplo. Si se omite, imprime stdout.")
 
     validate = sub.add_parser("validate", allow_abbrev=False, help="Valida un fichero de configuración.")
@@ -50,6 +50,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"   db_file={cfg.node.db_file}")
         print(f"   repo_store_dir={cfg.node.repo_store_dir}")
         print(f"   remote_copies={cfg.protection.remote_copies}")
+        print(f"   ec_k={cfg.protection.ec_k}")
+        print(f"   ec_m={cfg.protection.ec_m}")
         print(f"   seeds={list(cfg.cluster.seeds)}")
         return 0
 

@@ -17,26 +17,13 @@ from stopan.cli.validation import (
 def validate_metadata_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     validate_scrypt_overrides(parser, args)
 
-    if args.command == "graph.status":
-        require_dependency(
-            parser,
-            args,
-            Flag("passphrase_file", "--passphrase-file"),
-            Flag("decrypt_latest", "--decrypt-latest"),
-        )
-
     if args.command == "graph.export":
         require_dependency(parser, args, Flag("pack_out", "--pack-out"), Flag("pack", "--pack"))
         require_dependency(parser, args, Flag("pack_dir", "--pack-dir"), Flag("pack", "--pack"))
-        require_dependency(parser, args, Flag("identity_file", "--identity-file"), Flag("pack", "--pack"))
         reject_together(parser, args, Flag("pack_out", "--pack-out"), Flag("pack_dir", "--pack-dir"))
 
     if args.command == "pack.create":
         reject_together(parser, args, Flag("out", "--out"), Flag("pack_dir", "--pack-dir"))
-
-    if args.command == "pack.inspect":
-        require_dependency(parser, args, Flag("passphrase_file", "--passphrase-file"), Flag("decrypt", "--decrypt"))
-        require_dependency(parser, args, Flag("identity_file", "--identity-file"), Flag("decrypt", "--decrypt"))
 
     if args.command == "pack.push":
         reject_together(parser, args, Flag("pack_in", "--pack-in"), Flag("object_store", "--object-store"))

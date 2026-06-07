@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from stopan.config.defaults import DEFAULT_NODE_CONFIG
+from stopan.config.defaults import DEFAULT_STOPAN_CONFIG
 from stopan.errors import StopanConfigError
 from stopan.config.loader import load_config
 from stopan.config.model import StopanConfig
@@ -13,7 +13,7 @@ from stopan.config.model import StopanConfig
 def add_config_args(
     parser: argparse.ArgumentParser,
     *,
-    default_config: str | None = None,
+    default_config: str | None = DEFAULT_STOPAN_CONFIG,
     required: bool = False,
 ) -> None:
     help_text = "Ruta al fichero YAML de configuración Stopan."
@@ -30,10 +30,10 @@ def add_config_args(
 
 def load_runtime_config(args: argparse.Namespace) -> StopanConfig:
     config_path = getattr(args, "config", None)
-    if config_path == DEFAULT_NODE_CONFIG and not Path(config_path).exists():
+    if config_path == DEFAULT_STOPAN_CONFIG and not Path(config_path).exists():
         raise StopanConfigError(
-            f"No existe el fichero de configuración por defecto: {DEFAULT_NODE_CONFIG}. "
-            "Inicializa el nodo con: sudo python -m stopan init node "
+            f"No existe el fichero de configuración por defecto: {DEFAULT_STOPAN_CONFIG}. "
+            "Crea la configuración permanente con: sudo stopan init node "
             "--advertise-addr HOST:50051 [--token TOKEN] [--seed HOST:50051]"
         )
     return load_config(config_path)

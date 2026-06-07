@@ -137,7 +137,7 @@ def load_identity_json(path: str | Path) -> tuple[Path, dict[str, Any]]:
     if raw.get("version") != METADATA_IDENTITY_VERSION:
         raise MetadataIdentityError(
             f"Versión de identidad de metadata no soportada en {identity_path}: {raw.get('version')!r}. "
-            "Crea una identidad nueva con 'stopan metadata identity-create'."
+            "Inicializa metadata con 'sudo stopan init metadata'."
         )
     if raw.get("algorithm") != IDENTITY_ALGORITHM_ED25519_X25519:
         raise MetadataIdentityError(f"Algoritmo de identidad de metadata no soportado: {raw.get('algorithm')!r}")

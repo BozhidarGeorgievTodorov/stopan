@@ -1,49 +1,44 @@
-FROM python:3.11-slim AS builder
+FROM debian:bookworm AS deb-builder
 
-WORKDIR /app
+WORKDIR /src
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
+    debhelper \
+    dpkg-dev \
+    python3-dev \
+    python3-pip \
+    python3-setuptools \
+    python3-venv \
+    python3-wheel \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-COPY requirements-build.txt /app/requirements-build.txt
+COPY . /src
 
-RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
-    && python -m pip install --no-cache-dir -r /app/requirements-build.txt
-
-COPY src/ /app/src/
-COPY setup_fast_rabin.py /app/setup_fast_rabin.py
-
-RUN python -m grpc_tools.protoc \
-    -I/app/src \
-    --python_out=/app/src \
-    --grpc_python_out=/app/src \
-    /app/src/stopan/protos/p2p_storage.proto \
-    /app/src/stopan/protos/membership.proto
-
-RUN python setup_fast_rabin.py build_ext --inplace \
-    && rm -rf build/
+RUN dpkg-buildpackage -us -uc -b \
+    && mkdir -p /dist \
+    && cp /stopan_*.deb /dist/
 
 
-FROM python:3.11-slim AS runtime
+FROM debian:bookworm AS runtime
 
-WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    systemd \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY --from=deb-builder /dist/stopan_*.deb /tmp/
 
-RUN python -m pip install --no-cache-dir -r /app/requirements.txt
-
-COPY --from=builder /app/src /app/src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/stopan_*.deb \
+    && rm -f /tmp/stopan_*.deb \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 50051
 
-CMD ["python", "-m", "stopan", "node"]
+CMD ["stopan", "node"]

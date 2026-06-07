@@ -77,7 +77,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     create_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase desde un fichero privado. Evita pasar secretos por argv.",
+        help="Lee la passphrase desde un fichero privado. Default: metadata.passphrase_file si existe; si no, prompt interactivo.",
     )
     create_parser.add_argument(
         "--identity-file",
@@ -102,7 +102,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     inspect_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase desde un fichero privado para --decrypt.",
+        help="Lee la passphrase desde un fichero privado para --decrypt. Default: metadata.passphrase_file si existe.",
     )
     inspect_parser.add_argument(
         "--identity-file",
@@ -144,7 +144,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     import_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase desde un fichero privado. Evita pasar secretos por argv.",
+        help="Lee la passphrase desde un fichero privado. Default: metadata.passphrase_file si existe; si no, prompt interactivo.",
     )
     import_parser.add_argument(
         "--identity-file",
@@ -178,7 +178,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         default=None,
         help=(
             "Lee la passphrase para crear el pack latest o firmar un pack existente. "
-            "Default: prompt interactivo."
+            "Default: metadata.passphrase_file si existe; si no, prompt interactivo."
         ),
     )
     push_parser.add_argument(
@@ -272,7 +272,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     recover_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase para descifrar packs y el object store local.",
+        help="Lee la passphrase para descifrar packs y el object store local. Default: metadata.passphrase_file si existe.",
     )
     _add_metadata_pack_query_args(
         recover_parser,
@@ -345,7 +345,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     local_store_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase para firmar el metadata pack con la identity private key.",
+        help="Lee la passphrase para firmar el metadata pack con la identity private key. Default: metadata.passphrase_file si existe.",
     )
 
     local_list_parser = pack_subparsers.add_parser(

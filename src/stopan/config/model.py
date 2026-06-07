@@ -57,6 +57,8 @@ from stopan.config.defaults import (
     DEFAULT_NODE_DB_FILE,
     DEFAULT_NODE_LOCAL_SHARD_DIR,
     DEFAULT_NODE_REPO_STORE_DIR,
+    DEFAULT_PROTECTION_EC_K,
+    DEFAULT_PROTECTION_EC_M,
     DEFAULT_PROTECTION_REMOTE_COPIES,
     DEFAULT_PROTECTION_STRICT_REMOTE_COPIES,
     DEFAULT_REPLICATION_COMMIT_EVERY,
@@ -152,11 +154,15 @@ class ClusterConfig:
 class ProtectionConfig:
     remote_copies: int = DEFAULT_PROTECTION_REMOTE_COPIES
     strict_remote_copies: bool = DEFAULT_PROTECTION_STRICT_REMOTE_COPIES
+    ec_k: int = DEFAULT_PROTECTION_EC_K
+    ec_m: int = DEFAULT_PROTECTION_EC_M
     ec_pack_size_bytes: int = DEFAULT_EC_PACK_SIZE_BYTES
 
     def __post_init__(self) -> None:
         _require_int("protection.remote_copies", self.remote_copies, min_value=0)
         _require_bool("protection.strict_remote_copies", self.strict_remote_copies)
+        _require_int("protection.ec_k", self.ec_k, min_value=1)
+        _require_int("protection.ec_m", self.ec_m, min_value=0)
         _require_int("protection.ec_pack_size_bytes", self.ec_pack_size_bytes, min_value=1)
 
 

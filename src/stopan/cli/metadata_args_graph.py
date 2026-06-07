@@ -34,7 +34,7 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     status_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase desde un fichero privado para --decrypt-latest.",
+        help="Lee la passphrase desde un fichero privado para --decrypt-latest. Default: metadata.passphrase_file si existe.",
     )
 
     export_parser = graph_subparsers.add_parser(
@@ -52,7 +52,7 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     export_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase desde un fichero privado. Evita pasar secretos por argv.",
+        help="Lee la passphrase desde un fichero privado. Default: metadata.passphrase_file si existe; si no, prompt interactivo.",
     )
     export_parser.add_argument(
         "--identity-file",
@@ -99,7 +99,7 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     import_parser.add_argument(
         "--passphrase-file",
         default=None,
-        help="Lee la passphrase desde un fichero privado. Evita pasar secretos por argv.",
+        help="Lee la passphrase desde un fichero privado. Default: metadata.passphrase_file si existe; si no, prompt interactivo.",
     )
     import_parser.add_argument(
         "--no-protection",

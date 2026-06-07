@@ -19,12 +19,10 @@ from stopan.cli.metadata_helpers import (
     object_store_dir_from_args,
     owner_id_from_args,
     passphrase_for_decrypt,
-    passphrase_for_export,
     passphrase_for_object_store_export,
     scrypt_cost_from_args,
 )
 from stopan.metadata.identity import (
-    create_metadata_identity_file,
     load_metadata_identity_file,
     sign_metadata_pack_hash,
     validate_owner_id,
@@ -164,8 +162,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"p={cfg.metadata.scrypt_p} key_length={cfg.metadata.key_length}"
     )
 
+    identity_owner_id = None
+    identity_owner_error = None
+    if cfg.metadata.identity_file:
+        identity_path = Path(cfg.metadata.identity_file).expanduser()
+        if identity_path.is_file():
+            try:
+                identity_owner_id = load_metadata_identity_file(identity_path).owner_id
+            except Exception as exc:
+                identity_owner_error = str(exc)
+
+    effective_owner_id = cfg.metadata.owner_id or identity_owner_id or ""
+
     print("Metadata identity / distribution")
-    print(f"   owner_id: {cfg.metadata.owner_id or '(not configured in config)'}")
+    print(f"   owner_id: {effective_owner_id or '(not configured)'}")
+    print(f"   owner_id_source: {'metadata.owner_id' if cfg.metadata.owner_id else ('identity_file' if identity_owner_id else 'missing')}")
+    if cfg.metadata.owner_id and identity_owner_id and cfg.metadata.owner_id != identity_owner_id:
+        print(f"   owner_id_warning: metadata.owner_id no coincide con identity_file ({identity_owner_id})")
+    if identity_owner_error:
+        print(f"   identity_owner_id_error: {identity_owner_error}")
     print(f"   identity_file: {cfg.metadata.identity_file or '(not configured)'}")
     print(f"   identity_file_status: {file_status(cfg.metadata.identity_file)}")
     print(f"   distributed_pack_store_dir: {cfg.metadata.distributed_pack_store_dir}")
@@ -200,28 +215,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("   3. --metadata-object-pack-dir implies pack creation")
     print("   4. otherwise metadata.object_graph_auto_pack decides")
     return 0
-
-def cmd_identity_create(args: argparse.Namespace) -> int:
-    cfg = load_runtime_config(args)
-    identity_file = identity_file_from_args(args, cfg)
-    identity = create_metadata_identity_file(
-        identity_file,
-        passphrase=passphrase_for_export(args),
-        scrypt_cost=scrypt_cost_from_args(args, cfg),
-        force=bool(args.force),
-    )
-
-    print("Metadata identity criptográfica creada")
-    print(f"   path: {identity.path}")
-    print(f"   algorithm: {identity.algorithm}")
-    print(f"   owner_id: {identity.owner_id}")
-    print(f"   signing_public_key_b64: {identity.signing_public_key_b64}")
-    print(f"   encryption_public_key_b64: {identity.encryption_public_key_b64}")
-    print(f"   private_keys: encrypted")
-    print(f"   created_at: {identity.created_at}")
-    print("   note: owner_id = BLAKE3(signing_public_key); no es secreto y sirve para descubrir packs.")
-    return 0
-
 
 def cmd_identity_show(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
@@ -270,7 +263,7 @@ def cmd_local_store_pack(args: argparse.Namespace) -> int:
         )
     signed_owner_id, public_key_b64, signature_b64 = sign_metadata_pack_hash(
         identity_file=identity_file,
-        passphrase=passphrase_for_decrypt(args),
+        passphrase=passphrase_for_decrypt(args, cfg),
         pack_hash=calculated_pack_hash,
         expected_owner_id=owner_id,
     )
@@ -347,7 +340,7 @@ def cmd_object_store_status(args: argparse.Namespace) -> int:
     service = object_graph_service_from_config_defaults(cfg)
     inspection = service.inspect_store(
         object_store_dir=object_store_dir,
-        passphrase=(passphrase_for_decrypt(args) if args.decrypt_latest else None),
+        passphrase=(passphrase_for_decrypt(args, cfg) if args.decrypt_latest else None),
         decrypt_latest=bool(args.decrypt_latest),
     )
 
@@ -380,7 +373,7 @@ def cmd_object_store_status(args: argparse.Namespace) -> int:
 def cmd_export_object_graph(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     object_store_dir = object_store_dir_from_args(args, cfg)
-    passphrase = passphrase_for_object_store_export(args, object_store_dir=object_store_dir)
+    passphrase = passphrase_for_object_store_export(args, object_store_dir=object_store_dir, cfg=cfg)
 
     service = object_graph_service_from_config(args, cfg)
     result = service.export_current_state(
@@ -440,7 +433,7 @@ def cmd_import_object_graph(args: argparse.Namespace) -> int:
     service = object_graph_service_from_config_defaults(cfg)
     result = service.import_latest_state(
         object_store_dir=object_store_dir,
-        passphrase=passphrase_for_decrypt(args),
+        passphrase=passphrase_for_decrypt(args, cfg),
         include_protection=not bool(args.no_protection),
         default_desired_rf=int(
             args.default_desired_remote_copies
@@ -665,7 +658,7 @@ def record_metadata_pack_publication(cfg, result) -> None:
 def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str | Path):
     owner_id = owner_id_from_args(args, cfg)
     identity_file = identity_file_from_args(args, cfg)
-    identity_passphrase = passphrase_for_decrypt(args)
+    identity_passphrase = passphrase_for_decrypt(args, cfg)
 
     from stopan.metadata.packs.pusher import push_metadata_pack_to_network
 
@@ -701,7 +694,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     if not object_store_dir:
         raise StopanUsageError("Se requiere --object-store o metadata.object_store_dir.")
 
-    passphrase = passphrase_for_decrypt(args)
+    passphrase = passphrase_for_decrypt(args, cfg)
     identity_file = identity_file_from_args(args, cfg)
     pack_service = object_pack_service_from_config(args, cfg)
     pack_dir = args.pack_dir or cfg.metadata.object_pack_dir or None
@@ -768,7 +761,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
             "Se requiere --pack-out, --download-dir o --object-store para guardar el pack recuperado."
         )
 
-    passphrase = passphrase_for_decrypt(args)
+    passphrase = passphrase_for_decrypt(args, cfg)
 
     if args.vault_id is not None:
         from stopan.metadata.packs.payload import require_vault_id
@@ -966,7 +959,7 @@ def cmd_pack_object_graph(args: argparse.Namespace) -> int:
     service = object_pack_service_from_config(args, cfg)
     result = service.export_latest_pack(
         object_store_dir=object_store_dir,
-        passphrase=passphrase_for_decrypt(args),
+        passphrase=passphrase_for_decrypt(args, cfg),
         identity_file=identity_file_from_args(args, cfg),
         out_path=args.out,
         pack_dir=args.pack_dir,
@@ -997,7 +990,7 @@ def cmd_inspect_object_pack(args: argparse.Namespace) -> int:
     inspection = service.inspect_pack(
         args.path,
         identity_file=(identity_file_from_args(args, cfg) if args.decrypt else None),
-        passphrase=(passphrase_for_decrypt(args) if args.decrypt else None),
+        passphrase=(passphrase_for_decrypt(args, cfg) if args.decrypt else None),
         decrypt=bool(args.decrypt),
     )
 
@@ -1038,7 +1031,7 @@ def cmd_import_object_pack(args: argparse.Namespace) -> int:
         args.path,
         object_store_dir=object_store_dir_from_args(args, cfg),
         identity_file=identity_file_from_args(args, cfg),
-        passphrase=passphrase_for_decrypt(args),
+        passphrase=passphrase_for_decrypt(args, cfg),
     )
 
     print("Metadata object pack importado")

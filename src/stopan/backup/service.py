@@ -12,6 +12,7 @@ import concurrent.futures
 import os
 import time
 
+from stopan.cli.output import format_speed
 from .identity import resolve_origin_node_id
 from .models import BackupRunStats
 from .policy import build_backup_fast_path_policy
@@ -221,7 +222,7 @@ def backup_directory(
         db.close()
 
     elapsed = time.perf_counter() - started_at
-    speed = _format_speed(totals.size, elapsed)
+    speed = format_speed(totals.size, elapsed)
 
     print(f"Backup completado: snapshot {snapshot_id}")
     print(f"Archivos: {totals.files}")
@@ -283,10 +284,3 @@ def _normalize_worker_count(workers: int) -> int:
 
     return max(1, min(requested, cpu_count))
 
-
-def _format_speed(total_size: int, elapsed: float) -> str:
-    if elapsed <= 0:
-        return "n/a"
-
-    mb_per_second = total_size / (1024 * 1024) / elapsed
-    return f"{mb_per_second:.2f} MB/s"

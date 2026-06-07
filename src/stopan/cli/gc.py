@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from stopan.cli.config_utils import add_config_args, choose, load_runtime_config
+from stopan.cli.output import format_bytes
 from stopan.cli.validation import FloatRange, IntRange, validate_float_ranges, validate_int_ranges
 from stopan.errors import StopanUsageError
 from stopan.gc.models import LocalFileGarbageCollectionResult
@@ -349,16 +350,27 @@ def _cmd_received_ec(args: argparse.Namespace) -> int:
 
 
 def _cmd_metadata_object_store(args: argparse.Namespace) -> int:
+    cfg = load_runtime_config(args)
+    object_store_dir = getattr(args, "object_store", None) or cfg.metadata.object_store_dir
+    if not object_store_dir:
+        raise StopanUsageError("Se requiere --object-store o metadata.object_store_dir.")
+
+    object_store_root = Path(object_store_dir).expanduser().resolve()
+    if not (object_store_root / "store.json").is_file():
+        _print_metadata_object_gc_skipped(
+            args.command,
+            object_store_root,
+            reason="metadata object store no inicializado: falta store.json",
+        )
+        return 0
+
     from stopan.cli.metadata_helpers import (
         identity_file_from_args,
-        object_store_dir_from_args,
         passphrase_for_decrypt,
         scrypt_cost_from_config,
     )
     from stopan.metadata.objects.gc import MetadataObjectGarbageCollector
 
-    cfg = load_runtime_config(args)
-    object_store_dir = object_store_dir_from_args(args, cfg)
     include_objects = bool(args.include_objects)
     include_packs = bool(args.include_packs)
     pack_dir = (getattr(args, "pack_dir", None) or cfg.metadata.object_pack_dir or None) if include_packs else None
@@ -371,9 +383,9 @@ def _cmd_metadata_object_store(args: argparse.Namespace) -> int:
 
     collector = MetadataObjectGarbageCollector(scrypt_cost=scrypt_cost_from_config(cfg))
     result = collector.collect(
-        object_store_dir=object_store_dir,
+        object_store_dir=object_store_root,
         identity_file=identity_file,
-        passphrase=passphrase_for_decrypt(args),
+        passphrase=passphrase_for_decrypt(args, cfg),
         object_grace_seconds=int(max(object_grace_hours, 0.0) * _SECONDS_PER_HOUR),
         pack_grace_seconds=int(max(pack_grace_hours, 0.0) * _SECONDS_PER_HOUR),
         dry_run=bool(args.dry_run),
@@ -480,6 +492,13 @@ def _print_local_file_result(result: LocalFileGarbageCollectionResult) -> None:
     _print_dry_run_hint(result.dry_run)
 
 
+def _print_metadata_object_gc_skipped(target: str, object_store_dir: Path, *, reason: str) -> None:
+    print(f"GC {target}")
+    print(f"   object_store: {object_store_dir}")
+    print("   skipped: True")
+    print(f"   reason: {reason}")
+
+
 def _print_metadata_object_gc_result(target: str, result) -> None:
     print(f"GC {target}")
     print(f"   object_store: {result.root_dir}")
@@ -530,15 +549,6 @@ def _print_received_metadata_pack_result(result, *, cfg) -> None:
     print(f"   pruned_bytes: {format_bytes(result.pruned_bytes)}")
     _print_dry_run_hint(result.dry_run)
 
-
-def format_bytes(value: int) -> str:
-    if value < 1024:
-        return f"{value} B"
-    if value < 1024 * 1024:
-        return f"{value / 1024:.2f} KiB"
-    if value < 1024 * 1024 * 1024:
-        return f"{value / (1024 * 1024):.2f} MiB"
-    return f"{value / (1024 * 1024 * 1024):.2f} GiB"
 
 
 def format_time(ts: float) -> str:

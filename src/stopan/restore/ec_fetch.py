@@ -87,6 +87,8 @@ class ErasureChunkRecoveryService:
                         )
                     continue
 
+                self._cache_reconstructed_pack_chunks(job.pack_hash, recovered)
+
                 for chunk_hash in job.wanted_hashes:
                     value = recovered.get(chunk_hash)
                     if value is None:
@@ -94,12 +96,6 @@ class ErasureChunkRecoveryService:
                             f"Data pack EC {job.pack_hash[:8]} no devolvió chunk {chunk_hash[:8]}"
                         )
                         continue
-
-                    try:
-                        self.repo.put(chunk_hash, value)
-                    except Exception as exc:
-                        # El chunk ya está validado por hash; si el cache falla, el restore puede continuar.
-                        print(f"   EC restore: no pude cachear {chunk_hash[:8]} en CAS local: {exc}")
 
                     result_map[chunk_hash] = value
 
@@ -178,11 +174,33 @@ class ErasureChunkRecoveryService:
         )
         payload = reconstruct_payload(manifest=job.manifest, shards=shards)
 
-        return extract_pack_chunks(
-            payload=payload,
-            manifest=job.manifest,
-            wanted_hashes=set(job.wanted_hashes),
-        )
+        # La reconstrucción EC trabaja a nivel de data pack completo. Aunque la
+        # ventana actual del restore solo haya pedido unos pocos chunks, extraer
+        # el pack entero permite cachear todos sus chunks en el CAS local y evita
+        # descargar/reconstruir el mismo pack una vez por ventana de prefetch.
+        return extract_pack_chunks(payload=payload, manifest=job.manifest)
+
+    def _cache_reconstructed_pack_chunks(
+        self,
+        pack_hash: str,
+        recovered_chunks: dict[str, bytes],
+    ) -> None:
+        failed_cache = 0
+        first_error: Exception | None = None
+
+        for chunk_hash, data in recovered_chunks.items():
+            try:
+                self.repo.put(chunk_hash, data)
+            except Exception as exc:
+                failed_cache += 1
+                if first_error is None:
+                    first_error = exc
+
+        if failed_cache:
+            print(
+                f"   EC restore: no pude cachear {failed_cache} chunks del data pack "
+                f"{pack_hash[:8]} en CAS local: {first_error}"
+            )
 
     def _retrieve_pack_shards(
         self,

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import time
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.output import print_timing_summary
 from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
@@ -14,7 +16,6 @@ from stopan.cli.validation import (
     FloatRange,
     IntRange,
     reject_present,
-    require_present,
     validate_float_ranges,
     validate_int_ranges,
 )
@@ -37,8 +38,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Modo de protección remota: replication mantiene copias completas por chunk; ec usa data packs con erasure coding.",
     )
     parser.add_argument("--remote-copies", type=int, default=None, help="Copias remotas completas requeridas por chunk en modo replication. La copia local no cuenta.")
-    parser.add_argument("--ec-k", type=int, default=None, help="Número de data shards por data pack EC.")
-    parser.add_argument("--ec-m", type=int, default=None, help="Número de parity shards por data pack EC.")
+    parser.add_argument("--ec-k", type=int, default=None, help="Número de data shards por data pack EC. Default: protection.ec_k.")
+    parser.add_argument("--ec-m", type=int, default=None, help="Número de parity shards por data pack EC. Default: protection.ec_m.")
     parser.add_argument(
         "--ec-pack-size-bytes",
         type=int,
@@ -119,8 +120,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             (Flag("strict_remote_copies", "--strict-remote-copies/--no-strict-remote-copies"),),
             "{flag} solo aplica a --protection-mode replication",
         )
-        require_present(parser, args, Flag("ec_k", "--ec-k"), "--ec-k es obligatorio en --protection-mode ec")
-        require_present(parser, args, Flag("ec_m", "--ec-m"), "--ec-m es obligatorio en --protection-mode ec")
         validate_int_ranges(
             parser,
             args,
@@ -165,6 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = load_runtime_config(args)
     metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+    started_at = time.perf_counter()
 
     if args.protection_mode == "ec":
         from stopan.protection.ec.pusher import push_erasure_data_packs_to_network
@@ -174,8 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             scope=args.scope,
             snapshot_id=args.snapshot_id,
-            ec_k=args.ec_k,
-            ec_m=args.ec_m,
+            ec_k=int(choose(args.ec_k, cfg.protection.ec_k)),
+            ec_m=int(choose(args.ec_m, cfg.protection.ec_m)),
             ec_pack_size_bytes=int(choose(args.ec_pack_size_bytes, cfg.protection.ec_pack_size_bytes)),
             stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
             max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
@@ -196,6 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"stored_shards={stats.stored_shards} | "
             f"already_present_shards={stats.already_present_shards}"
         )
+        print_timing_summary(processed_bytes=int(getattr(stats, "processed_bytes", 0)), elapsed=time.perf_counter() - started_at)
 
         if getattr(stats, "interrupted", False):
             print(f"Push EC interrumpido. Progreso persistido hasta packs={stats.attempted_packs}.")
@@ -248,6 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"fallidos={stats.failed} | stored_remote={stats.stored_remote} | "
         f"already_present_remote={stats.already_present_remote}"
     )
+    print_timing_summary(processed_bytes=int(getattr(stats, "processed_bytes", 0)), elapsed=time.perf_counter() - started_at)
 
     if getattr(stats, "interrupted", False):
         print(f"Push interrumpido. Progreso persistido hasta attempted={stats.attempted}.")
@@ -262,3 +264,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     degraded = int(getattr(stats, "degraded", 0))
     return 0 if int(stats.failed) == 0 and degraded == 0 else 2
+

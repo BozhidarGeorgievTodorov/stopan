@@ -1,5 +1,5 @@
 [Unit]
-Description=Stopan scheduled job: %i
+Description=Stopan scheduled job profile: %i
 Documentation=file:/usr/share/doc/stopan/operations.md
 After=network-online.target
 Wants=network-online.target
@@ -12,9 +12,7 @@ WorkingDirectory=/var/lib/stopan
 RuntimeDirectory=stopan
 StateDirectory=stopan
 LogsDirectory=stopan
-Environment=STOPAN_CONFIG=/etc/stopan/client.yaml
-EnvironmentFile=-/etc/stopan/jobs/%i.env
-ExecStart=/usr/bin/flock -n /run/stopan/%i.lock /etc/stopan/jobs/%i.sh
+ExecStart=/usr/bin/flock -n /run/stopan/%i.lock /usr/lib/stopan/jobs/run-job %i
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

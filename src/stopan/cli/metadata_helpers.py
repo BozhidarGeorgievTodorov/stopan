@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from stopan.cli.config_utils import choose
+from stopan.cli.output import format_bytes
 from stopan.errors import StopanUsageError
 from stopan.metadata.identity import resolve_owner_id
 from stopan.metadata.identity.passphrase import ScryptCost, read_passphrase_file
@@ -34,21 +35,45 @@ def prompt_existing_passphrase() -> str:
     return value
 
 
-def passphrase_for_export(args: Namespace) -> str | bytes:
+def _configured_passphrase_file(cfg: Any | None) -> str | None:
+    if cfg is None:
+        return None
+    value = getattr(getattr(cfg, "metadata", None), "passphrase_file", None)
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    return str(path) if path.is_file() else None
+
+
+def passphrase_for_export(args: Namespace, cfg: Any | None = None) -> str | bytes:
     if getattr(args, "passphrase_file", None):
         return read_passphrase_file(args.passphrase_file)
+    configured_file = _configured_passphrase_file(cfg)
+    if configured_file:
+        return read_passphrase_file(configured_file)
     return prompt_new_passphrase()
 
 
-def passphrase_for_decrypt(args: Namespace) -> str | bytes:
+def passphrase_for_decrypt(args: Namespace, cfg: Any | None = None) -> str | bytes:
     if getattr(args, "passphrase_file", None):
         return read_passphrase_file(args.passphrase_file)
+    configured_file = _configured_passphrase_file(cfg)
+    if configured_file:
+        return read_passphrase_file(configured_file)
     return prompt_existing_passphrase()
 
 
-def passphrase_for_object_store_export(args: Namespace, *, object_store_dir: str) -> str | bytes:
+def passphrase_for_object_store_export(
+    args: Namespace,
+    *,
+    object_store_dir: str,
+    cfg: Any | None = None,
+) -> str | bytes:
     if getattr(args, "passphrase_file", None):
         return read_passphrase_file(args.passphrase_file)
+    configured_file = _configured_passphrase_file(cfg)
+    if configured_file:
+        return read_passphrase_file(configured_file)
 
     store_json = Path(object_store_dir).expanduser() / "store.json"
     if store_json.exists():
@@ -107,15 +132,6 @@ def object_pack_service_from_config_defaults(cfg: Any) -> MetadataObjectPackServ
     )
 
 
-def format_bytes(value: int) -> str:
-    if value < 1024:
-        return f"{value} B"
-    if value < 1024 * 1024:
-        return f"{value / 1024:.2f} KiB"
-    if value < 1024 * 1024 * 1024:
-        return f"{value / (1024 * 1024):.2f} MiB"
-    return f"{value / (1024 * 1024 * 1024):.2f} GiB"
-
 
 def format_time(ts: float) -> str:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -138,7 +154,7 @@ def file_status(path_text: str) -> str:
         return f"not a file ({path})"
     mode = mode_octal(path)
     readable = os.access(path, os.R_OK)
-    secure_hint = "ok" if mode in {"0o600", "0o400"} else "check permissions"
+    secure_hint = "ok" if mode in {"0o600", "0o400", "0o640", "0o440"} else "check permissions"
     return f"present mode={mode} readable={readable} {secure_hint}"
 
 

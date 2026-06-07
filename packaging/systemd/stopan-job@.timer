@@ -1,12 +1,11 @@
 [Unit]
-Description=Verify Stopan replicated chunks periodically
+Description=Run Stopan scheduled job profile periodically: %i
 Documentation=file:/usr/share/doc/stopan/operations.md
 
 [Timer]
-OnCalendar=*-*-* 03:00:00
+OnCalendar=daily
 Persistent=true
 RandomizedDelaySec=10m
-Unit=stopan-job@verify-replication.service
 
 [Install]
 WantedBy=timers.target

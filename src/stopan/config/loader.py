@@ -192,6 +192,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
     "protection": {
         "remote_copies": _as_int,
         "strict_remote_copies": _as_bool,
+        "ec_k": _as_int,
+        "ec_m": _as_int,
         "ec_pack_size_bytes": _as_int,
     },
     "backup": {

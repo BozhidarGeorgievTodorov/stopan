@@ -2,7 +2,7 @@
 
 Este documento describe el procedimiento completo para recuperar la base de datos de una máquina perdida o reemplazada. Cubre la preparación del nuevo nodo, la recuperación de metadata, la restauración de datos y las comprobaciones posteriores.
 
-No explica en detalle el formato de metadata object graph ni de `.stopanmetapack`. Ese dominio está en `docs/metadata-recovery.md`.
+No explica en detalle el formato de metadata object graph ni de `.stopanmetapack`. Ese dominio está en [`docs/metadata-recovery.md`](metadata-recovery.md).
 
 ## Alcance
 
@@ -152,7 +152,7 @@ Después recupera la metadata:
 stopan metadata pack recover
 ```
 
-Los casos de recuperación manual con parámetros explícitos, selección por vault, descarga sin importación o reconstrucción sin protección previa están documentados en `docs/metadata-recovery.md`.
+Los casos de recuperación manual con parámetros explícitos, selección por vault, descarga sin importación o reconstrucción sin protección previa están documentados en [`docs/metadata-recovery.md`](metadata-recovery.md).
 
 ## Comprobar la metadata recuperada
 

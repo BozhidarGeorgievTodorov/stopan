@@ -359,4 +359,4 @@ gc:
 
 `owner_id` identifica al propietario de metadata packs, pero no permite descifrarlos. Para crear, validar o recuperar packs hacen falta la identidad de metadata y la passphrase asociada.
 
-Para ejemplos completos de configuración en varios nodos, consulta `docs/local-network-deployment.md`.
+Para ejemplos completos de configuración en varios nodos, consulta [`docs/local-network-deployment.md`](local-network-deployment.md).

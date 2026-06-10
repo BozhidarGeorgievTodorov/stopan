@@ -1,6 +1,6 @@
 # Recuperación de metadata
 
-Este documento cubre únicamente la protección y recuperación de metadata. La recuperación completa de una máquina perdida se describe en `docs/disaster-recovery.md`.
+Este documento cubre únicamente la protección y recuperación de metadata. La recuperación completa de una máquina perdida se describe en [`docs/disaster-recovery.md`](disaster-recovery.md).
 
 La metadata es crítica para reconstruir un respaldo. Sin `_metadata.db` no basta con conservar los chunks en disco, porque faltan snapshots, rutas originales, recipes de reconstrucción y estado de protección.
 
@@ -173,7 +173,7 @@ La verificación de metadata packs comprueba presencia remota. No reconstruye la
 
 ## Recuperar metadata desde packs remotos
 
-Este procedimiento recupera la metadata desde packs remotos. La restauración posterior de datos se realiza con `restore` y se cubre en `docs/disaster-recovery.md`.
+Este procedimiento recupera la metadata desde packs remotos. La restauración posterior de datos se realiza con `restore` y se cubre en [`docs/disaster-recovery.md`](disaster-recovery.md).
 
 En una máquina nueva o reparada, primero instala Stopan y prepara una configuración capaz de contactar con algún nodo vivo del clúster. También necesitas conservar la identidad de metadata y la passphrase.
 

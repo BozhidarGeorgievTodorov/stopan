@@ -157,7 +157,7 @@ Flags compartidos:
 --metadata-object-pack-dir DIR
 ```
 
-El flujo completo de protección y recuperación de metadata está documentado en `docs/metadata-recovery.md`.
+El flujo completo de protección y recuperación de metadata está documentado en [`docs/metadata-recovery.md`](metadata-recovery.md).
 
 ## `stopan backup`
 

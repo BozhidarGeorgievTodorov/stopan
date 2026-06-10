@@ -41,7 +41,7 @@ La configuración principal queda en:
 /etc/stopan/stopan.yaml
 ```
 
-La referencia completa del YAML está en `docs/config-reference.md`.
+La referencia completa del YAML está en [`docs/config-reference.md`](docs/config-reference.md).
 
 ## Construcción del paquete `.deb`
 
@@ -73,7 +73,7 @@ El paquete se genera en el directorio padre del repositorio, con un nombre simil
 ../stopan_1.0.0_amd64.deb
 ```
 
-Los detalles de desarrollo, protobuf, extensión nativa y empaquetado están en `docs/development.md`.
+Los detalles de desarrollo, protobuf, extensión nativa y empaquetado están en [`docs/development.md`](docs/development.md).
 
 ## Configuración inicial
 
@@ -135,7 +135,7 @@ Inspeccionar candidatos a limpieza local:
 stopan gc all
 ```
 
-La referencia completa del CLI está en `docs/cli-reference.md`.
+La referencia completa del CLI está en [`docs/cli-reference.md`](docs/cli-reference.md).
 
 ## Servicio de nodo
 
@@ -168,7 +168,7 @@ stopan metadata graph export --pack
 stopan metadata pack push
 ```
 
-La recuperación de metadata está documentada en `docs/metadata-recovery.md`. La recuperación completa de una máquina perdida está documentada en `docs/disaster-recovery.md`.
+La recuperación de metadata está documentada en [`docs/metadata-recovery.md`](docs/metadata-recovery.md). La recuperación completa de una máquina perdida está documentada en [`docs/disaster-recovery.md`](docs/disaster-recovery.md).
 
 ## Clúster Docker de demostración
 
@@ -182,11 +182,11 @@ docker compose up --build
 
 La documentación detallada está en `docs/`:
 
-- `docs/architecture.md`: arquitectura interna del sistema.
-- `docs/cli-reference.md`: comandos, opciones, efectos y validaciones del CLI.
-- `docs/config-reference.md`: configuración de `stopan.yaml`.
-- `docs/local-network-deployment.md`: despliegue en una red local.
-- `docs/jobs.md`: perfiles YAML y ejecución periódica con systemd.
-- `docs/metadata-recovery.md`: protección y recuperación de metadata.
-- `docs/disaster-recovery.md`: recuperación completa ante pérdida de una máquina.
-- `docs/development.md`: entorno de desarrollo, protobuf, extensión nativa y empaquetado.
+- [`docs/architecture.md`](docs/architecture.md): arquitectura interna del sistema.
+- [`docs/cli-reference.md`](docs/cli-reference.md): comandos, opciones, efectos y validaciones del CLI.
+- [`docs/config-reference.md`](docs/config-reference.md): configuración de `stopan.yaml`.
+- [`docs/local-network-deployment.md`](docs/local-network-deployment.md): despliegue en una red local.
+- [`docs/jobs.md`](docs/jobs.md): perfiles YAML y ejecución periódica con systemd.
+- [`docs/metadata-recovery.md`](docs/metadata-recovery.md): protección y recuperación de metadata.
+- [`docs/disaster-recovery.md`](docs/disaster-recovery.md): recuperación completa ante pérdida de una máquina.
+- [`docs/development.md`](docs/development.md): entorno de desarrollo, protobuf, extensión nativa y empaquetado.

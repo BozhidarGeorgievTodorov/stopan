@@ -3,6 +3,6 @@ packaging/systemd/stopan-node.service lib/systemd/system/
 packaging/systemd/stopan-job@.service lib/systemd/system/
 packaging/systemd/stopan-job@.timer lib/systemd/system/
 packaging/jobs/* usr/lib/stopan/jobs/
-packaging/examples/jobs/*.env usr/share/doc/stopan/examples/jobs/
-docs/operations.md usr/share/doc/stopan/
+packaging/examples/jobs/*.yaml usr/share/doc/stopan/examples/jobs/
+docs/*.md usr/share/doc/stopan/
 packaging/examples/stopan.yaml usr/share/doc/stopan/examples/configs/

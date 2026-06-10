@@ -1,0 +1,11 @@
+# Perfil de ejemplo: recuperar metadata desde packs remotos distribuidos.
+kind: metadata-pack
+
+metadata_pack:
+  action: recover
+  passphrase_file: /etc/stopan/metadata.passphrase
+  # owner_id:
+  # target_hash:
+  # download_only: false
+  # no_import_db: false
+  # no_protection: false

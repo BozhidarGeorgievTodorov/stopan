@@ -1,0 +1,9 @@
+# Perfil de ejemplo: verificar presencia remota de metadata packs.
+kind: metadata-pack
+
+metadata_pack:
+  action: verify
+  verify_all: false
+  # owner_id:
+  # pack_hash:
+  # show_sources: false

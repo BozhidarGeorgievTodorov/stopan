@@ -1,0 +1,8 @@
+# Perfil de ejemplo: auditoría de protección por replicación.
+kind: data-verify
+
+data_verify:
+  protection_mode: replication
+  scope: all-reachable
+  # limit: 10000
+  # reverify_verified: false

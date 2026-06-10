@@ -1,0 +1,8 @@
+# Perfil de ejemplo: auditoría de data packs EC.
+kind: data-verify
+
+data_verify:
+  protection_mode: ec
+  scope: all-reachable
+  # limit: 1000
+  # pack_hash:

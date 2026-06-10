@@ -1,0 +1,8 @@
+# Perfil de ejemplo: GC local completo.
+kind: gc
+
+gc:
+  target: all
+  apply: true
+  passphrase_file: /etc/stopan/metadata.passphrase
+  # identity_file: /etc/stopan/metadata_identity.json

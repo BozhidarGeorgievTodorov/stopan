@@ -33,8 +33,6 @@ from .remote_client import RemoteChunkClientPool
 from .states import replication_push_state
 
 
-PUSH_DETAIL_LIMIT = 20
-
 
 @dataclass(frozen=True)
 class PushStats:
@@ -184,9 +182,6 @@ def push_to_network(
         failed = 0
         stored_remote = 0
         already_present_remote = 0
-        detail_lines = 0
-        suppressed_degraded = 0
-        suppressed_failed = 0
 
         try:
             for outcome in push_chunk_replicas(
@@ -234,16 +229,6 @@ def push_to_network(
                         error=error,
                     )
                     degraded += 1
-                    if detail_lines < PUSH_DETAIL_LIMIT:
-                        print(
-                            f"   {outcome.chunk_hash[:8]} degradado: "
-                            f"protected={outcome.protected_remote_copies}/{required_remote_copies} "
-                            f"planned={outcome.required_remote_copies} "
-                            f"error={error}"
-                        )
-                        detail_lines += 1
-                    else:
-                        suppressed_degraded += 1
 
                 else:
                     error = outcome.error or "replicación fallida sin copias remotas protegidas"
@@ -255,29 +240,12 @@ def push_to_network(
                         error=error,
                     )
                     failed += 1
-                    if detail_lines < PUSH_DETAIL_LIMIT:
-                        print(
-                            f"   {outcome.chunk_hash[:8]} fallido: "
-                            f"protected=0/{required_remote_copies} "
-                            f"planned={outcome.required_remote_copies} "
-                            f"error={error}"
-                        )
-                        detail_lines += 1
-                    else:
-                        suppressed_failed += 1
 
                 metadata_changed = True
 
                 if attempted % commit_every == 0:
                     db.commit()
-                    print(
-                        f"   progreso {attempted}/{len(pending_chunks)} | "
-                        f"protected={protected} | degraded={degraded} | failed={failed} | "
-                        f"stored_remote={stored_remote} | "
-                        f"already_present_remote={already_present_remote}"
-                    )
 
-            _print_suppressed_details(suppressed_degraded, suppressed_failed)
 
             return PushStats(
                 attempted=attempted,
@@ -294,8 +262,6 @@ def push_to_network(
         except KeyboardInterrupt:
             print("\nPush interrumpido por el usuario.")
             db.commit()
-            _print_suppressed_details(suppressed_degraded, suppressed_failed)
-
             return PushStats(
                 attempted=attempted,
                 protected=protected,
@@ -336,13 +302,3 @@ def _sum_chunk_sizes(db: MetadataDB, chunk_hashes: list[str]) -> int:
         total += int(row["total_size"] or 0)
     return total
 
-
-def _print_suppressed_details(suppressed_degraded: int, suppressed_failed: int) -> None:
-    if suppressed_degraded == 0 and suppressed_failed == 0:
-        return
-    print(
-        "   detalles omitidos: "
-        f"degradados={suppressed_degraded} "
-        f"fallidos={suppressed_failed} "
-        "(consulta metadata para inspección completa)"
-    )

@@ -161,43 +161,63 @@ def _check_storage_rpc(
     return True, "reachable"
 
 
-def _print_members(members: Sequence[object], *, local_node_id: str | None) -> None:
+def _print_members(
+    members: Sequence[object],
+    *,
+    local_node_id: str | None = None,
+    target_address: str | None = None,
+) -> None:
     print(f"   members_alive: {len(members)}")
     if not members:
         return
 
     print("   members:")
+    normalized_target = str(target_address or "").strip()
     for member in sorted(members, key=lambda item: str(getattr(item, "address", ""))):
         node_id = str(getattr(member, "node_id", "") or "")
         address = str(getattr(member, "address", "") or "")
         incarnation = int(getattr(member, "incarnation", 0) or 0)
-        marker = " self" if local_node_id and node_id == local_node_id else ""
+        marker = ""
+        if local_node_id and node_id == local_node_id:
+            marker = " self"
+        elif normalized_target and address == normalized_target:
+            marker = " target"
         print(f"      {_short_node_id(node_id)}  {address}  incarnation={incarnation}{marker}")
 
 
 def _status(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
 
-    local_node_id, incarnation, identity_status = _read_node_identity(cfg.node.repo_store_dir)
-    address = str(args.address or cfg.node.advertise_addr or first_seed(cfg) or "").strip()
+    explicit_address = str(args.address or "").strip()
+    remote_query = bool(explicit_address)
+    address = explicit_address or str(cfg.node.advertise_addr or first_seed(cfg) or "").strip()
     timeout_s = _NODE_STATUS_RPC_TIMEOUT_S
+
+    local_node_id: str | None = None
+    if not remote_query:
+        local_node_id, incarnation, identity_status = _read_node_identity(cfg.node.repo_store_dir)
 
     print("Node status")
     print("Config")
     print(f"   config_file: {args.config}")
-    print(f"   bind_addr: {cfg.node.bind_addr}")
-    print(f"   advertise_addr: {cfg.node.advertise_addr or '(not configured)'}")
-    print(f"   rpc_target: {address or '(not configured)'}")
+    if remote_query:
+        print("   mode: remote")
+        print(f"   rpc_target: {address}")
+    else:
+        print("   mode: local")
+        print(f"   bind_addr: {cfg.node.bind_addr}")
+        print(f"   advertise_addr: {cfg.node.advertise_addr or '(not configured)'}")
+        print(f"   rpc_target: {address or '(not configured)'}")
 
-    print("Local identity")
-    print(f"   node_id: {local_node_id or '(not initialized)'}")
-    print(f"   incarnation: {incarnation if incarnation is not None else '(not initialized)'}")
-    print(f"   identity_file: {identity_status}")
+        print("Local identity")
+        print(f"   node_id: {local_node_id or '(not initialized)'}")
+        print(f"   incarnation: {incarnation if incarnation is not None else '(not initialized)'}")
+        print(f"   identity_file: {identity_status}")
 
-    print("Local storage")
-    print(f"   repo_store_dir: {_format_path_status(_path_status(cfg.node.repo_store_dir))}")
-    print(f"   local_shard_dir: {_format_path_status(_path_status(cfg.node.local_shard_dir))}")
-    print(f"   db_file: {cfg.node.db_file}")
+        print("Local storage")
+        print(f"   repo_store_dir: {_format_path_status(_path_status(cfg.node.repo_store_dir))}")
+        print(f"   local_shard_dir: {_format_path_status(_path_status(cfg.node.local_shard_dir))}")
+        print(f"   db_file: {cfg.node.db_file}")
 
     if not address:
         print("RPC")
@@ -223,7 +243,11 @@ def _status(args: argparse.Namespace) -> int:
     print("   metadata_pack_storage: same gRPC server")
 
     print("Cluster view")
-    _print_members(members, local_node_id=local_node_id)
+    _print_members(
+        members,
+        local_node_id=local_node_id if not remote_query else None,
+        target_address=address if remote_query else None,
+    )
 
     if membership_ok and storage_ok:
         print("Summary")

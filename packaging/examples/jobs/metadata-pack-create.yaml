@@ -1,0 +1,8 @@
+# Perfil de ejemplo: crear un .stopanmetapack local desde el latest object graph.
+kind: metadata-pack
+
+metadata_pack:
+  action: create
+  passphrase_file: /etc/stopan/metadata.passphrase
+  # object_store: /var/lib/stopan/metadata_object_store
+  # pack_dir: /var/lib/stopan/metadata_packs

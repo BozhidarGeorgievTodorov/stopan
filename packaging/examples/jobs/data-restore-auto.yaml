@@ -1,0 +1,9 @@
+# Perfil de ejemplo: restauración controlada desde CAS local y red.
+# Edita snapshot_id y out antes de ejecutar este perfil.
+kind: data-restore
+
+data_restore:
+  snapshot_id:
+  out: /var/lib/stopan/restores/snapshot
+  remote_recovery: auto
+  # replication_targets: 3

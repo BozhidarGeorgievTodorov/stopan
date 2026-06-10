@@ -175,7 +175,6 @@ def push_erasure_data_packs_to_network(
             metadata_changed = metadata_changed or pack_metadata_changed
             if pack_metadata_changed and stats.attempted_packs % commit_every == 0:
                 db.commit()
-                _print_progress(stats)
 
         for chunk_hash in pending_chunks:
             try:
@@ -183,14 +182,12 @@ def push_erasure_data_packs_to_network(
             except FileNotFoundError:
                 stats.missing_local_chunks += 1
                 stats.failed_chunks += 1
-                print(f"   {chunk_hash[:8]} omitido: no existe en CAS local")
                 continue
 
             try:
                 must_flush = builder.add_chunk(chunk_hash=chunk_hash, data=data)
             except ErasureCodingError as exc:
                 stats.failed_chunks += 1
-                print(f"   {chunk_hash[:8]} omitido: {exc}")
                 continue
 
             stats.packed_chunks += 1
@@ -209,7 +206,6 @@ def push_erasure_data_packs_to_network(
                 metadata_changed = True
                 if stats.attempted_packs % commit_every == 0:
                     db.commit()
-                    _print_progress(stats)
 
         _flush_and_push_pack(
             builder=builder,
@@ -290,17 +286,12 @@ def _retry_existing_pack(
     chunks = db.get_erasure_pack_chunks(record.pack_hash)
     chunk_count = len(chunks)
     if not chunks:
-        print(f"   pack={record.pack_hash[:8]} omitido: no tiene chunks registrados")
         return 0, False
 
     record_spec = spec_from_erasure_metadata(record)
     if remote_candidate_count < record_spec.total_shards:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        print(
-            f"   pack={record.pack_hash[:8]} omitido: no hay suficientes nodos remotos "
-            f"para reintento EC ({remote_candidate_count}/{record_spec.total_shards})"
-        )
         return chunk_count, False
 
     record_placement_epoch = cluster.placement_epoch_excluding(
@@ -318,10 +309,6 @@ def _retry_existing_pack(
             stats.missing_local_chunks += 1
             stats.failed_chunks += 1
             missing_local = True
-            print(
-                f"   pack={record.pack_hash[:8]} chunk={chunk.chunk_hash[:8]} "
-                "omitido: no existe en CAS local"
-            )
             continue
         materialized_chunks.append((chunk.chunk_hash, data))
 
@@ -334,16 +321,11 @@ def _retry_existing_pack(
     except ErasureCodingError as exc:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        print(f"   pack={record.pack_hash[:8]} omitido: {exc}")
         return chunk_count, False
 
     if pack.pack_hash != record.pack_hash:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        print(
-            f"   pack={record.pack_hash[:8]} omitido: el pack reconstruido no coincide "
-            f"con metadata ({pack.pack_hash[:8]})"
-        )
         return chunk_count, False
 
     stats.packed_chunks += len(pack.entries)
@@ -392,12 +374,6 @@ def _push_pack(
     stats.already_present_shards += push_result.already_present_shards
     stats.failed_shards += push_result.failed_shards
 
-    for address, result in push_result.failed_results:
-        print(
-            f"   pack={pack.pack_hash[:8]} shard={result.ref.shard_index} "
-            f"falló en {address}: {result.detail}"
-        )
-
     protection_state = data_pack_state(
         protected_shards=len(push_result.successful_indexes),
         data_shards=pack.spec.data_shards,
@@ -441,26 +417,10 @@ def _apply_pack_state_to_stats(
     elif protection_state == ProtectionState.DEGRADED:
         stats.degraded_packs += 1
         stats.degraded_chunks += chunk_count
-        print(
-            f"   pack={pack_hash[:8]} DEGRADED: "
-            f"shards={protected_shards}/{total_shards}"
-        )
     else:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        print(
-            f"   pack={pack_hash[:8]} FAILED: "
-            f"shards={protected_shards}/{total_shards}"
-        )
 
-
-def _print_progress(stats: "_MutableErasurePushStats") -> None:
-    print(
-        f"   progress packs={stats.attempted_packs} chunks={stats.packed_chunks} | "
-        f"placed_packs={stats.placed_packs} degraded_packs={stats.degraded_packs} "
-        f"failed_packs={stats.failed_packs} | stored_shards={stats.stored_shards} "
-        f"already_present_shards={stats.already_present_shards}"
-    )
 
 
 @dataclass

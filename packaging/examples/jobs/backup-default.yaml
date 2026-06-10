@@ -1,0 +1,12 @@
+# Perfil de ejemplo: backup programado de una carpeta local.
+kind: backup
+
+backup:
+  source: /srv/stopan/source
+  # workers: 4
+  # fast: true
+  # fast_remote: false
+  # deterministic: true
+  # desired_remote_copies: 3
+
+# config: /etc/stopan/profiles/backup-default.yaml

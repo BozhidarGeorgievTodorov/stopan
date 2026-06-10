@@ -1,0 +1,11 @@
+# Perfil de ejemplo: proteger chunks con replicación completa.
+kind: data-push
+
+data_push:
+  protection_mode: replication
+  scope: pending
+  # remote_copies: 3
+  # strict_remote_copies: false
+  # limit: 10000
+
+# config: /etc/stopan/profiles/push-replication.yaml

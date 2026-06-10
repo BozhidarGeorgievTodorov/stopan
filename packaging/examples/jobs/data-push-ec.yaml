@@ -1,0 +1,10 @@
+# Perfil de ejemplo: proteger chunks mediante erasure coding.
+kind: data-push
+
+data_push:
+  protection_mode: ec
+  scope: pending
+  # ec_k: 2
+  # ec_m: 1
+  # ec_pack_size_bytes: 8388608
+  # limit: 10000

@@ -1,0 +1,8 @@
+# Perfil de ejemplo: reconstruir _metadata.db desde el latest del object graph.
+kind: metadata-graph
+
+metadata_graph:
+  action: import
+  passphrase_file: /etc/stopan/metadata.passphrase
+  # object_store: /var/lib/stopan/metadata_object_store
+  # no_protection: false

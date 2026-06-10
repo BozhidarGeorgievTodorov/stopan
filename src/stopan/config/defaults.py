@@ -4,7 +4,7 @@ DEFAULT_STOPAN_CONFIG = "/etc/stopan/stopan.yaml"
 
 DEFAULT_NODE_BIND_ADDR = "[::]:50051"
 DEFAULT_NODE_ADVERTISE_ADDR = ""
-DEFAULT_NODE_REPO_STORE_DIR = "/var/lib/stopan/node_store"
+DEFAULT_NODE_REPO_STORE_DIR = "/var/lib/stopan/_node_store"
 DEFAULT_NODE_LOCAL_SHARD_DIR = "/var/lib/stopan/_data_chunks"
 DEFAULT_NODE_DB_FILE = "/var/lib/stopan/_metadata.db"
 

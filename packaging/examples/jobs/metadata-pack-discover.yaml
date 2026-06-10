@@ -1,0 +1,8 @@
+# Perfil de ejemplo: descubrir metadata packs distribuidos del owner configurado.
+kind: metadata-pack
+
+metadata_pack:
+  action: discover
+  # owner_id:
+  # max_candidates: 10
+  # show_sources: true

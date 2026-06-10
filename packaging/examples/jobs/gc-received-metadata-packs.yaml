@@ -1,0 +1,8 @@
+# Perfil de ejemplo: limpiar packs metadata recibidos en el store distribuido local.
+kind: gc
+
+gc:
+  target: received-metadata-packs
+  apply: true
+  # max_age_days: 30
+  # pack_store: /var/lib/stopan/metadata_distributed_packs

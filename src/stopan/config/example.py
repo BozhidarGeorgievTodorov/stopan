@@ -10,7 +10,7 @@ EXAMPLE_CONFIG = """# Configuración principal de Stopan para una máquina insta
 node:
   bind_addr: "[::]:50051"
   advertise_addr: "node.example.net:50051"
-  repo_store_dir: "/var/lib/stopan/node_store"
+  repo_store_dir: "/var/lib/stopan/_node_store"
   local_shard_dir: "/var/lib/stopan/_data_chunks"
   db_file: "/var/lib/stopan/_metadata.db"
 

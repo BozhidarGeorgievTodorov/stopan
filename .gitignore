@@ -9,3 +9,4 @@ restored/protos/*_pb2.py
 protos/*_pb2_grpc.py
 *.sh
 tests/
+!packaging/jobs/*.sh

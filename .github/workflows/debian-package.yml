@@ -1,0 +1,64 @@
+name: Debian package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debian-package:
+    name: Build and check Debian package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Build Debian package image
+        run: |
+          docker build --target deb-builder -t stopan-deb .
+
+      - name: Build runtime image
+        run: |
+          docker build --target runtime -t stopan-runtime .
+
+      - name: Check installed command
+        run: |
+          docker run --rm stopan-runtime test -x /usr/bin/stopan
+          docker run --rm stopan-runtime test -x /opt/stopan/venv/bin/python
+          docker run --rm stopan-runtime stopan --help
+
+      - name: Check installed example configuration
+        run: |
+          docker run --rm stopan-runtime \
+            stopan config validate /usr/share/doc/stopan/examples/configs/stopan.yaml
+
+      - name: Check installed job files
+        run: |
+          docker run --rm stopan-runtime sh -eu -c '
+            test -d /usr/lib/stopan/jobs
+            test -x /usr/lib/stopan/jobs/run-job
+            test -f /usr/lib/stopan/jobs/backup.sh
+            test -f /usr/lib/stopan/jobs/data-push.sh
+            test -f /usr/lib/stopan/jobs/data-restore.sh
+            test -f /usr/lib/stopan/jobs/data-verify.sh
+            test -f /usr/lib/stopan/jobs/metadata-graph.sh
+            test -f /usr/lib/stopan/jobs/metadata-pack.sh
+            test -f /usr/lib/stopan/jobs/gc.sh
+          '
+
+      - name: Check installed job profiles
+        run: |
+          docker run --rm stopan-runtime sh -eu -c '
+            test -d /usr/share/doc/stopan/examples/jobs
+            ls /usr/share/doc/stopan/examples/jobs/*.yaml >/dev/null
+          '
+
+      - name: Check installed systemd units
+        run: |
+          docker run --rm stopan-runtime sh -eu -c '
+            test -f /lib/systemd/system/stopan-node.service
+            test -f /lib/systemd/system/stopan-job@.service
+            test -f /lib/systemd/system/stopan-job@.timer
+          '

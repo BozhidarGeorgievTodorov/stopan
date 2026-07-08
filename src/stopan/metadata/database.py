@@ -4,8 +4,9 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 from stopan.config.defaults import DEFAULT_NODE_DB_FILE
 from stopan.errors import StopanDataError
@@ -122,6 +123,11 @@ class MetadataDB:
 
     def rollback(self) -> None:
         self.conn.rollback()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        with self.conn:
+            yield
 
     def close(self) -> None:
         self.conn.close()
@@ -810,6 +816,27 @@ class MetadataDB:
             WHERE hash = ?
         """, (chunk_hash,)).fetchone()
         return row is not None
+
+    def sum_chunk_sizes(self, chunk_hashes: Iterable[str]) -> int:
+        hashes = _unique_hashes(chunk_hashes)
+        if not hashes:
+            return 0
+
+        total = 0
+        batch_size = 500
+        for offset in range(0, len(hashes), batch_size):
+            batch = hashes[offset:offset + batch_size]
+            placeholders = ", ".join("?" for _ in batch)
+            row = self.conn.execute(
+                f"""
+                SELECT COALESCE(SUM(size), 0) AS total_size
+                FROM chunks
+                WHERE hash IN ({placeholders})
+                """,
+                tuple(batch),
+            ).fetchone()
+            total += int(row["total_size"] or 0)
+        return total
 
 
     # ------------------------------------------------------------------

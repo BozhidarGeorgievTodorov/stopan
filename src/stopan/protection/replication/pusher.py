@@ -149,7 +149,7 @@ def push_to_network(
                 remote_candidates=remote_candidate_count,
             )
 
-        processed_bytes = _sum_chunk_sizes(db, pending_chunks)
+        processed_bytes = db.sum_chunk_sizes(pending_chunks)
 
         remote_client = RemoteChunkClientPool(
             probe_timeout_s=probe_timeout_s,
@@ -287,18 +287,3 @@ def push_to_network(
             settings=metadata_object_graph_auto_export,
             context_label="PUSH",
         )
-
-
-def _sum_chunk_sizes(db: MetadataDB, chunk_hashes: list[str]) -> int:
-    total = 0
-    batch_size = 500
-    for offset in range(0, len(chunk_hashes), batch_size):
-        batch = chunk_hashes[offset:offset + batch_size]
-        placeholders = ", ".join("?" for _ in batch)
-        row = db.conn.execute(
-            f"SELECT COALESCE(SUM(size), 0) AS total_size FROM chunks WHERE hash IN ({placeholders})",
-            tuple(batch),
-        ).fetchone()
-        total += int(row["total_size"] or 0)
-    return total
-

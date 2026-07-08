@@ -111,7 +111,7 @@ class MetadataObjectGraphImporter:
         try:
             db.set_vault_id(latest.vault_id)
             writer.require_empty_operational_db(db)
-            with db.conn:
+            with db.transaction():
                 chunks_inserted = writer.insert_chunks(db, chunks)
                 snapshot_stats = writer.insert_snapshots(db, snapshot_entries)
 

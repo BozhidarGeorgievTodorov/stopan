@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-package:
+    name: Python package smoke checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Upgrade packaging tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-build.txt
+
+      - name: Generate protobuf stubs
+        run: |
+          python -m grpc_tools.protoc \
+            -Isrc \
+            --python_out=src \
+            --grpc_python_out=src \
+            src/stopan/protos/p2p_storage.proto \
+            src/stopan/protos/membership.proto
+
+      - name: Install Stopan package
+        run: |
+          python -m pip install -e .
+
+      - name: Compile Python modules
+        run: |
+          python -m compileall -q src/stopan
+
+      - name: Import all Stopan modules
+        run: |
+          python - <<'PY'
+          import importlib
+          import pkgutil
+          import stopan
+
+          failures = []
+
+          for module in pkgutil.walk_packages(stopan.__path__, stopan.__name__ + "."):
+              name = module.name
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  failures.append((name, repr(exc)))
+
+          if failures:
+              for name, exc in failures:
+                  print(f"{name}: {exc}")
+              raise SystemExit(1)
+
+          print("All Stopan modules imported successfully.")
+          PY
+
+      - name: Check CLI help
+        run: |
+          python -m stopan --help
+          python -m stopan backup --help
+          python -m stopan push --help
+          python -m stopan restore --help
+          python -m stopan verify --help
+          python -m stopan node --help
+          python -m stopan init --help
+          python -m stopan config --help
+          python -m stopan metadata --help
+          python -m stopan gc --help
+
+      - name: Validate example configuration files
+        run: |
+          python -m stopan config validate packaging/examples/stopan.yaml
+          python -m stopan config validate configs/node1.yaml
+          python -m stopan config validate configs/node2.yaml
+          python -m stopan config validate configs/node3.yaml
+          python -m stopan config validate configs/node4.yaml
+
+      - name: Validate job profile files
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          profiles_dir = Path("packaging/examples/job-profiles")
+          if not profiles_dir.exists():
+              raise SystemExit("Missing packaging/examples/job-profiles")
+
+          files = sorted(profiles_dir.glob("*.yaml"))
+          if not files:
+              raise SystemExit("No job profile YAML files found")
+
+          for path in files:
+              with path.open("r", encoding="utf-8") as fh:
+                  data = yaml.safe_load(fh)
+              if not isinstance(data, dict):
+                  raise SystemExit(f"{path} does not contain a YAML mapping")
+              print(f"Valid YAML: {path}")
+
+          print("All job profile YAML files are valid.")
+          PY
+
+      - name: Build Python wheel
+        run: |
+          python -m pip wheel . -w dist --no-deps

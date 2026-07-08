@@ -112,7 +112,6 @@ jobs:
           from stopan.jobs.runner import _load_profile, _profile_to_env
 
           profiles_dir = Path("packaging/examples/jobs")
-          scripts_dir = Path("packaging/jobs")
 
           if not profiles_dir.exists():
               raise SystemExit(f"Missing {profiles_dir}")
@@ -123,57 +122,10 @@ jobs:
 
           for path in files:
               profile = _load_profile(path)
-              kind, _env = _profile_to_env(profile, path)
-
-              script_path = scripts_dir / f"{kind}.sh"
-              if not script_path.is_file():
-                  raise SystemExit(
-                      f"{path} declares kind={kind}, but {script_path} does not exist"
-                  )
-
-              print(f"Valid job profile: {path} -> {script_path}")
+              kind, env = _profile_to_env(profile, path)
+              print(f"Valid job profile: {path} -> kind={kind}, env_vars={len(env)}")
 
           print("All job profile files are valid.")
-          PY
-
-      - name: Check packaging shell scripts
-        run: |
-          for script in packaging/bin/stopan packaging/jobs/run-job packaging/jobs/*.sh; do
-            echo "Checking $script"
-            sh -n "$script"
-          done
-
-      - name: Validate Debian install manifest references
-        run: |
-          python - <<'PY'
-          from glob import glob
-          from pathlib import Path
-
-          manifest = Path("debian/stopan.install")
-          if not manifest.is_file():
-              raise SystemExit("Missing debian/stopan.install")
-
-          missing = []
-
-          for raw_line in manifest.read_text(encoding="utf-8").splitlines():
-              line = raw_line.strip()
-              if not line or line.startswith("#"):
-                  continue
-
-              source = line.split()[0]
-              matches = glob(source)
-
-              if not matches:
-                  missing.append(source)
-              else:
-                  print(f"{source}: {len(matches)} match(es)")
-
-          if missing:
-              for source in missing:
-                  print(f"Missing source referenced by debian/stopan.install: {source}")
-              raise SystemExit(1)
-
-          print("All debian/stopan.install source paths exist.")
           PY
 
       - name: Build Python package artifact

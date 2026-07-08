@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   python-package:
-    name: Python package smoke checks
+    name: Python package checks
     runs-on: ubuntu-latest
 
     steps:
@@ -21,6 +21,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+            pyproject.toml
+            setup.py
 
       - name: Install system build dependencies
         run: |
@@ -48,6 +53,7 @@ jobs:
       - name: Install Stopan package
         run: |
           python -m pip install -e .
+          python -m pip check
 
       - name: Compile Python modules
         run: |
@@ -102,26 +108,74 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-          import yaml
 
-          profiles_dir = Path("packaging/examples/job-profiles")
+          from stopan.jobs.runner import _load_profile, _profile_to_env
+
+          profiles_dir = Path("packaging/examples/jobs")
+          scripts_dir = Path("packaging/jobs")
+
           if not profiles_dir.exists():
-              raise SystemExit("Missing packaging/examples/job-profiles")
+              raise SystemExit(f"Missing {profiles_dir}")
 
           files = sorted(profiles_dir.glob("*.yaml"))
           if not files:
-              raise SystemExit("No job profile YAML files found")
+              raise SystemExit(f"No job profile YAML files found in {profiles_dir}")
 
           for path in files:
-              with path.open("r", encoding="utf-8") as fh:
-                  data = yaml.safe_load(fh)
-              if not isinstance(data, dict):
-                  raise SystemExit(f"{path} does not contain a YAML mapping")
-              print(f"Valid YAML: {path}")
+              profile = _load_profile(path)
+              kind, _env = _profile_to_env(profile, path)
 
-          print("All job profile YAML files are valid.")
+              script_path = scripts_dir / f"{kind}.sh"
+              if not script_path.is_file():
+                  raise SystemExit(
+                      f"{path} declares kind={kind}, but {script_path} does not exist"
+                  )
+
+              print(f"Valid job profile: {path} -> {script_path}")
+
+          print("All job profile files are valid.")
           PY
 
-      - name: Build Python wheel
+      - name: Check packaging shell scripts
+        run: |
+          for script in packaging/bin/stopan packaging/jobs/run-job packaging/jobs/*.sh; do
+            echo "Checking $script"
+            sh -n "$script"
+          done
+
+      - name: Validate Debian install manifest references
+        run: |
+          python - <<'PY'
+          from glob import glob
+          from pathlib import Path
+
+          manifest = Path("debian/stopan.install")
+          if not manifest.is_file():
+              raise SystemExit("Missing debian/stopan.install")
+
+          missing = []
+
+          for raw_line in manifest.read_text(encoding="utf-8").splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+
+              source = line.split()[0]
+              matches = glob(source)
+
+              if not matches:
+                  missing.append(source)
+              else:
+                  print(f"{source}: {len(matches)} match(es)")
+
+          if missing:
+              for source in missing:
+                  print(f"Missing source referenced by debian/stopan.install: {source}")
+              raise SystemExit(1)
+
+          print("All debian/stopan.install source paths exist.")
+          PY
+
+      - name: Build Python package artifact
         run: |
           python -m pip wheel . -w dist --no-deps

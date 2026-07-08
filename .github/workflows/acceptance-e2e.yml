@@ -1,0 +1,48 @@
+name: Acceptance E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Escenario a ejecutar"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - both
+          - replication
+          - ec
+      dataset_mb:
+        description: "Tamaño aproximado del dataset por escenario, en MiB"
+        required: true
+        default: "128"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance-e2e:
+    name: Acceptance E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Check script syntax
+        run: |
+          python -m py_compile e2e/acceptance.py
+
+      - name: Show Docker information
+        run: |
+          docker --version
+          docker info
+          df -h
+
+      - name: Run acceptance E2E
+        run: |
+          python e2e/acceptance.py \
+            --scenario "${{ inputs.scenario }}" \
+            --dataset-mb "${{ inputs.dataset_mb }}"

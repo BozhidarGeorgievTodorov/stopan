@@ -1,6 +1,6 @@
 [Unit]
 Description=Stopan scheduled job profile: %i
-Documentation=file:/usr/share/doc/stopan/operations.md
+Documentation=file:/usr/share/doc/stopan/local-network-deployment.md
 After=network-online.target
 Wants=network-online.target
 

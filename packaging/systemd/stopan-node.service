@@ -1,6 +1,6 @@
 [Unit]
 Description=Stopan storage and membership node
-Documentation=file:/usr/share/doc/stopan/operations.md
+Documentation=file:/usr/share/doc/stopan/jobs.md
 After=network-online.target
 Wants=network-online.target
 

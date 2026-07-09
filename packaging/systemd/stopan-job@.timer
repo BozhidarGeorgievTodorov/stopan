@@ -1,6 +1,6 @@
 [Unit]
 Description=Run Stopan scheduled job profile periodically: %i
-Documentation=file:/usr/share/doc/stopan/operations.md
+Documentation=file:/usr/share/doc/stopan/jobs.md
 
 [Timer]
 OnCalendar=daily

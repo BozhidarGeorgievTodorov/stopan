@@ -824,11 +824,12 @@ Opciones:
 
 ```bash
 --decrypt
+--full-validation
 --passphrase-file FILE
 --identity-file FILE
 ```
 
-Sin `--decrypt`, muestra cabecera del pack. Con `--decrypt`, usa passphrase e identity file para mostrar resumen interno del latest.
+Sin `--decrypt`, muestra la cabecera del pack. Con `--decrypt`, descifra el contenido y valida su resumen. `--full-validation` requiere `--decrypt` y verifica además el hash, el tipo y el tamaño de todos los objetos sin conservar en memoria la colección decodificada.
 
 ### `metadata pack list`
 
@@ -954,6 +955,8 @@ Lista metadata packs distribuidos para un owner. Consulta nodos remotos y agrupa
 
 Si existe publicación local previa, muestra estado de presencia contra las copias deseadas. Si no existe publicación local para un pack, el estado queda como desconocido porque Stopan ve copias, pero no sabe cuál era el objetivo.
 
+La consulta de publicaciones locales es auxiliar. Si la SQLite configurada no puede abrirse o consultarse, el comando continúa con el descubrimiento remoto, muestra una advertencia y clasifica los paquetes sin expectativa local como `UNKNOWN`.
+
 ### `metadata pack verify`
 
 Uso:
@@ -1026,7 +1029,7 @@ Recupera metadata desde packs distribuidos. Descubre packs remotos del owner, el
 
 `--vault-id` limita la selección automática a un vault concreto cuando el owner tiene packs de varios vaults.
 
-`--download-only` solo descarga y valida el pack elegido. No importa el object store ni reconstruye la DB.
+`--download-only` descarga y valida íntegramente el pack elegido, incluida la correspondencia entre hash, tipo, tamaño y bytes canónicos de cada objeto. No importa el object store ni reconstruye la DB.
 
 `--no-import-db` importa el pack al object store local pero no reconstruye `_metadata.db`.
 

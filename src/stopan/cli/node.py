@@ -140,6 +140,7 @@ def _check_storage_rpc(
     import grpc
 
     from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
+    from stopan.rpc.auth import cluster_token_metadata
     from stopan.rpc.channels import temporary_insecure_channel
 
     try:
@@ -154,6 +155,7 @@ def _check_storage_rpc(
             stub.ProbeMissingChunks(
                 p2p_storage_pb2.ProbeMissingChunksRequest(chunk_hashes=[]),
                 timeout=timeout_s,
+                metadata=cluster_token_metadata(cfg.cluster.token),
             )
     except grpc.RpcError as exc:
         return False, f"unreachable: {format_rpc_error(exc)}"

@@ -148,6 +148,7 @@ def push_erasure_data_packs_to_network(
         print(f"placement_epoch={placement_epoch[:12]}")
 
         pool = RemoteDataPackShardClientPool(
+            cluster_token=cluster_token,
             timeout_s=stream_timeout_s,
             max_message_bytes=max_message_bytes,
         )

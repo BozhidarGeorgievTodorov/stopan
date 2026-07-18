@@ -201,10 +201,12 @@ def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
     )
 
 
-def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, list[EncodedMetadataObject], str, int, float]:
-    parsed = parse_pack_payload_base(payload)
-
-    objects: list[EncodedMetadataObject] = []
+def _validate_pack_payload_entries(
+    parsed: ParsedPackPayloadBase,
+    *,
+    collect_objects: bool,
+) -> list[EncodedMetadataObject] | None:
+    objects: list[EncodedMetadataObject] | None = [] if collect_objects else None
     seen: set[str] = set()
     total_bytes = 0
     catalog_vault_id: str | None = None
@@ -221,36 +223,45 @@ def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, 
         try:
             expected_type = MetadataObjectType(str(entry.get("object_type")))
         except ValueError as exc:
-            raise MetadataObjectPackError(f"tipo de objeto de metadata pack no soportado: {entry.get('object_type')!r}") from exc
+            raise MetadataObjectPackError(
+                f"tipo de objeto de metadata pack no soportado: {entry.get('object_type')!r}"
+            ) from exc
 
         canonical = b64decode(f"pack object[{index}].canonical_b64", entry.get("canonical_b64"))
         actual_type, object_payload = decode_object_envelope(canonical, expected_hash=object_hash)
 
         if actual_type != expected_type:
             raise MetadataObjectPackError(
-                f"tipo de objeto de metadata pack no coincide {object_hash}: esperado={expected_type.value} actual={actual_type.value}"
+                f"tipo de objeto de metadata pack no coincide {object_hash}: "
+                f"esperado={expected_type.value} actual={actual_type.value}"
             )
         if actual_type == MetadataObjectType.CATALOG and object_hash == parsed.latest.catalog_hash:
             catalog_vault_id = require_vault_id("catalog.vault_id", object_payload.get("vault_id"))
 
-        declared_size = require_non_negative_int(f"pack object[{index}].canonical_bytes", entry.get("canonical_bytes"))
+        declared_size = require_non_negative_int(
+            f"pack object[{index}].canonical_bytes",
+            entry.get("canonical_bytes"),
+        )
         if declared_size != len(canonical):
             raise MetadataObjectPackError(
-                f"tamaño de objeto de metadata pack no coincide {object_hash}: declarado={declared_size} actual={len(canonical)}"
+                f"tamaño de objeto de metadata pack no coincide {object_hash}: "
+                f"declarado={declared_size} actual={len(canonical)}"
             )
 
         total_bytes += len(canonical)
-        objects.append(
-            EncodedMetadataObject(
-                object_type=actual_type,
-                object_hash=object_hash,
-                canonical_bytes=canonical,
+        if objects is not None:
+            objects.append(
+                EncodedMetadataObject(
+                    object_type=actual_type,
+                    object_hash=object_hash,
+                    canonical_bytes=canonical,
+                )
             )
-        )
 
     if total_bytes != parsed.latest.total_canonical_bytes:
         raise MetadataObjectPackError(
-            f"pack latest.total_canonical_bytes={parsed.latest.total_canonical_bytes} pero contiene {total_bytes} bytes"
+            f"pack latest.total_canonical_bytes={parsed.latest.total_canonical_bytes} "
+            f"pero contiene {total_bytes} bytes"
         )
     if catalog_vault_id is None:
         raise MetadataObjectPackError("metadata pack no contiene el catalog latest")
@@ -259,6 +270,28 @@ def parse_pack_payload(payload: dict[str, Any]) -> tuple[LatestMetadataPointer, 
             f"catalog.vault_id={catalog_vault_id} no coincide con vault.id={parsed.vault_id}"
         )
 
+    return objects
+
+
+def validate_pack_payload(
+    payload: dict[str, Any],
+) -> tuple[LatestMetadataPointer, str, int, float]:
+    """Valida íntegramente todos los objetos sin conservar sus bytes decodificados."""
+
+    parsed = parse_pack_payload_base(payload)
+    _validate_pack_payload_entries(parsed, collect_objects=False)
+    return parsed.latest, parsed.vault_id, parsed.vault_generation, parsed.pack_created_at_unix
+
+
+def parse_pack_payload(
+    payload: dict[str, Any],
+) -> tuple[LatestMetadataPointer, list[EncodedMetadataObject], str, int, float]:
+    """Valida el payload y materializa sus objetos para importarlos."""
+
+    parsed = parse_pack_payload_base(payload)
+    objects = _validate_pack_payload_entries(parsed, collect_objects=True)
+    if objects is None:
+        raise AssertionError("collect_objects=True debe devolver los objetos validados")
     return parsed.latest, objects, parsed.vault_id, parsed.vault_generation, parsed.pack_created_at_unix
 
 

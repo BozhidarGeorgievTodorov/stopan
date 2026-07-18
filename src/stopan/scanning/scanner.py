@@ -4,7 +4,7 @@ import os
 import stat as statmod
 from collections.abc import Iterator
 
-from stopan.errors import StopanUsageError
+from stopan.errors import StopanStorageOSError, StopanUsageError
 
 
 class TreeWalker:
@@ -15,7 +15,7 @@ class TreeWalker:
       - emite tuplas (rel_path, full_path, stat, item_type)
       - incluye la raíz como (".", root_path, stat, "dir")
       - ignora symlinks y archivos especiales
-      - ignora directorios inaccesibles por permisos
+      - detiene el recorrido si una entrada no puede inspeccionarse o recorrerse
       - opcionalmente usa un orden determinista y estable
     """
 
@@ -30,6 +30,10 @@ class TreeWalker:
             root_stat = os.stat(root_path, follow_symlinks=False)
         except FileNotFoundError:
             raise StopanUsageError(f"Directorio no encontrado: {root_path}") from None
+        except OSError as exc:
+            raise StopanStorageOSError(
+                f"No se pudo inspeccionar el directorio origen: {root_path}: {exc}"
+            ) from exc
 
         if not statmod.S_ISDIR(root_stat.st_mode):
             raise StopanUsageError(f"No es un directorio: {root_path}")
@@ -45,7 +49,13 @@ class TreeWalker:
           - "file"
           - "dir"
         """
-        root_stat = os.stat(self.root_path, follow_symlinks=False)
+        try:
+            root_stat = os.stat(self.root_path, follow_symlinks=False)
+        except OSError as exc:
+            raise StopanStorageOSError(
+                f"No se pudo inspeccionar el directorio origen: {self.root_path}: {exc}"
+            ) from exc
+
         yield ".", self.root_path, root_stat, "dir"
 
         stack: list[tuple[str, str]] = [(self.root_path, ".")]
@@ -70,8 +80,11 @@ class TreeWalker:
 
                         try:
                             stat_info = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
+                        except OSError as exc:
+                            raise StopanStorageOSError(
+                                f"No se pudo inspeccionar la entrada del respaldo: "
+                                f"{entry.path}: {exc}"
+                            ) from exc
 
                         mode = stat_info.st_mode
                         if statmod.S_ISREG(mode):
@@ -82,8 +95,13 @@ class TreeWalker:
 
                         # symlinks y especiales se ignoran explícitamente
 
-            except OSError:
-                continue
+            except StopanStorageOSError:
+                raise
+            except OSError as exc:
+                raise StopanStorageOSError(
+                    f"No se pudo recorrer el directorio del respaldo: "
+                    f"{current_path}: {exc}"
+                ) from exc
 
             if self.deterministic:
                 stack.extend(reversed(directories))

@@ -111,10 +111,16 @@ Para inspeccionar un pack sin descifrar:
 stopan metadata pack inspect pack.stopanmetapack
 ```
 
-Para inspeccionarlo descifrando el contenido:
+Para inspeccionarlo descifrando el contenido y validando su resumen:
 
 ```bash
 stopan metadata pack inspect pack.stopanmetapack --decrypt
+```
+
+Para verificar íntegramente todos sus objetos sin importarlos:
+
+```bash
+stopan metadata pack inspect pack.stopanmetapack --decrypt --full-validation
 ```
 
 ## Distribución y verificación remota
@@ -201,7 +207,7 @@ stopan metadata pack recover \
 
 Si hay packs de varios vaults bajo el mismo owner, usa `--vault-id` para elegir el vault correcto. Si conoces el pack exacto, usa `--target-hash`.
 
-Descargar y validar un pack sin importarlo ni reconstruir la base:
+Descargar y validar íntegramente un pack, incluidos sus objetos, sin importarlo ni reconstruir la base:
 
 ```bash
 stopan metadata pack recover \

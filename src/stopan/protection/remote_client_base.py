@@ -13,12 +13,14 @@ class P2PStorageProtectionClient:
     def __init__(
         self,
         *,
+        cluster_token: str,
         max_message_bytes: int,
         closed_message: str,
         closed_error_factory: Callable[[str], Exception],
     ):
         self.max_message_bytes = max(int(max_message_bytes), 1)
         self._runtime = P2PStorageClientRuntime(
+            cluster_token=cluster_token,
             max_message_bytes=self.max_message_bytes,
             closed_message=closed_message,
             closed_error_factory=closed_error_factory,
@@ -36,6 +38,10 @@ class P2PStorageProtectionClient:
 
     def _get_stub(self, address: str):
         return self._runtime.get_stub(address)
+
+    @property
+    def _call_metadata(self):
+        return self._runtime.call_metadata
 
     def close(self) -> None:
         self._runtime.close()

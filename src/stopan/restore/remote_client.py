@@ -35,10 +35,17 @@ class RemoteStorageClientPool:
       - sin retrocompatibilidad con RetrieveChunk unary.
     """
 
-    def __init__(self, *, timeout_s: float, max_message_bytes: int):
+    def __init__(
+        self,
+        *,
+        cluster_token: str,
+        timeout_s: float,
+        max_message_bytes: int,
+    ):
         self.timeout_s = float(timeout_s)
         self.max_message_bytes = max(int(max_message_bytes), 1)
         self._runtime = P2PStorageClientRuntime(
+            cluster_token=cluster_token,
             max_message_bytes=self.max_message_bytes,
             closed_message="RemoteStorageClientPool cerrado",
             closed_error_factory=RuntimeError,
@@ -108,7 +115,11 @@ class RemoteStorageClientPool:
 
         stub = self._get_stub(addr)
         request = self._pb.RetrieveChunkBatchRequest(chunk_hashes=chunk_hashes)
-        response = stub.RetrieveChunkBatch(request, timeout=self.timeout_s)
+        response = stub.RetrieveChunkBatch(
+            request,
+            timeout=self.timeout_s,
+            metadata=self._runtime.call_metadata,
+        )
 
         results: dict[str, BatchRetrieveItemResult] = {}
         for item in response.results:

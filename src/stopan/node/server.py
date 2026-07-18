@@ -99,6 +99,7 @@ def serve(config: StopanConfig) -> None:
     )
     storage_servicer = StorageNodeServicer(
         config.node.repo_store_dir,
+        cluster_token=config.cluster.token,
         commit_workers=config.storage.commit_workers,
         commit_queue_items=config.storage.commit_queue_items,
         max_chunk_size=config.storage.max_chunk_size,

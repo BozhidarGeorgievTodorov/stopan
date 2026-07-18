@@ -29,7 +29,6 @@ RESTORE_PROGRESS_EVERY_ITEMS = 100
 class RestoreResult:
     snapshot_id: int
     completed: bool
-    already_restored: bool = False
     interrupted: bool = False
     processed_items: int = 0
     successful_items: int = 0
@@ -67,8 +66,9 @@ class SnapshotRestorer:
         """
         Ejecuta el restore de snapshot_id.
 
-        Si el directorio final ya existe, no sobrescribe. Si existe el directorio
-        .incomplete, continúa trabajando sobre él para permitir reintentos.
+        Si el directorio final ya existe, rechaza la operación para no asumir que
+        contiene una restauración válida. Si existe el directorio .incomplete,
+        continúa trabajando sobre él para permitir reintentos.
         """
         started_at = time.perf_counter()
         stats = self.fetch_service.stats
@@ -93,13 +93,17 @@ class SnapshotRestorer:
 
         paths = RestorePaths.for_snapshot(self.base_output_dir, snapshot_uuid)
 
-        if os.path.exists(paths.final_dir):
-            print(f"Snapshot {snapshot_id} ya restaurado en: {paths.final_dir}")
+        if os.path.lexists(paths.final_dir):
+            message = (
+                f"El destino final ya existe y no se sobrescribirá: {paths.final_dir}. "
+                "Utiliza otro directorio base o retira el destino existente antes de reintentar."
+            )
+            print(message)
             return RestoreResult(
                 snapshot_id=snapshot_id,
-                completed=True,
-                already_restored=True,
+                completed=False,
                 final_dir=paths.final_dir,
+                error=message,
                 stats=stats,
             )
 
@@ -242,6 +246,23 @@ class SnapshotRestorer:
                 self.apply_item_metadata(directory_path, item, is_dir=True)
 
         if stats.successful_items == stats.processed_items and stats.processed_items > 0:
+            if os.path.lexists(paths.final_dir):
+                message = (
+                    f"El destino final apareció durante la restauración y no se sobrescribirá: "
+                    f"{paths.final_dir}. El resultado permanece en {paths.incomplete_dir}."
+                )
+                print(message)
+                return RestoreResult(
+                    snapshot_id=snapshot_id,
+                    completed=False,
+                    processed_items=stats.processed_items,
+                    successful_items=stats.successful_items,
+                    final_dir=paths.final_dir,
+                    work_dir=paths.incomplete_dir,
+                    error=message,
+                    stats=stats,
+                )
+
             try:
                 os.replace(paths.incomplete_dir, paths.final_dir)
                 print("-" * 40)

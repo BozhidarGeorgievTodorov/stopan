@@ -233,6 +233,7 @@ def verify_erasure_data_packs(
 ) -> ErasureVerificationStats:
     db = MetadataDB(db_file)
     client_pool = RemoteDataPackShardClientPool(
+        cluster_token=cluster_token,
         timeout_s=probe_timeout_s,
         max_message_bytes=max_message_bytes,
     )

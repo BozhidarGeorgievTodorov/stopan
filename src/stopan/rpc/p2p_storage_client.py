@@ -25,10 +25,12 @@ class P2PStorageClientRuntime:
     def __init__(
         self,
         *,
+        cluster_token: str,
         max_message_bytes: int,
         closed_message: str,
         closed_error_factory: Callable[[str], Exception] | None = None,
     ):
+        self.cluster_token = str(cluster_token or "")
         self.max_message_bytes = max(int(max_message_bytes), 1)
         self._closed_message = str(closed_message)
         self._closed_error_factory = closed_error_factory or RuntimeError
@@ -64,6 +66,12 @@ class P2PStorageClientRuntime:
     def pb(self):
         self.ensure_runtime()
         return self._pb
+
+    @property
+    def call_metadata(self):
+        from stopan.rpc.auth import cluster_token_metadata
+
+        return cluster_token_metadata(self.cluster_token)
 
     def get_stub(self, address: str):
         self.ensure_runtime()

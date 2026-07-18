@@ -492,7 +492,7 @@ def cmd_list_object_packs(args: argparse.Namespace) -> int:
 
     for path in paths:
         try:
-            inspection = service.inspect_pack(path, decrypt=False)
+            inspection = service.inspect_pack_header(path)
             header = inspection.header
             stat_result = path.stat()
             print(f"- {path.name}")
@@ -583,11 +583,10 @@ def find_reusable_latest_object_pack(
 
     for path in sorted(resolved_pack_dir.glob("*.stopanmetapack")):
         try:
-            inspection = pack_service.inspect_pack(
+            inspection = pack_service.inspect_pack_summary(
                 path,
                 identity_file=identity_file,
                 passphrase=passphrase,
-                decrypt=True,
             )
             if inspection.decrypted is None:
                 continue
@@ -630,6 +629,34 @@ def metadata_pack_publication_maps(cfg, *, owner_id: str) -> tuple[dict[str, int
         )
     finally:
         db.close()
+
+
+def metadata_pack_publication_maps_best_effort(
+    cfg,
+    *,
+    owner_id: str,
+) -> tuple[dict[str, int], dict[str, float], str | None]:
+    """
+    Consulta publicaciones locales sin bloquear el descubrimiento remoto.
+
+    El estado persistido solo sirve para comparar las copias observadas con la
+    intención local. Si SQLite no puede consultarse, discovery todavía puede
+    listar y validar las referencias remotas, aunque la presencia quede UNKNOWN.
+    """
+
+    try:
+        desired_copies_by_hash, pushed_at_by_hash = metadata_pack_publication_maps(
+            cfg,
+            owner_id=owner_id,
+        )
+    except Exception as exc:
+        return (
+            {},
+            {},
+            f"No se pudieron consultar las publicaciones locales: {exc}",
+        )
+
+    return desired_copies_by_hash, pushed_at_by_hash, None
 
 
 def record_metadata_pack_publication(cfg, result) -> None:
@@ -870,7 +897,11 @@ def cmd_discover_metadata_packs(args: argparse.Namespace) -> int:
 
     from stopan.metadata.packs.discovery import discover_metadata_packs_from_network
 
-    desired_copies_by_hash, local_pushed_at_by_hash = metadata_pack_publication_maps(
+    (
+        desired_copies_by_hash,
+        local_pushed_at_by_hash,
+        local_publication_warning,
+    ) = metadata_pack_publication_maps_best_effort(
         cfg,
         owner_id=owner_id,
     )
@@ -900,6 +931,12 @@ def cmd_discover_metadata_packs(args: argparse.Namespace) -> int:
             local_pushed_at_by_hash=local_pushed_at_by_hash,
         )
 
+    if local_publication_warning:
+        _print_limited_items(
+            "Advertencias de publicaciones locales",
+            (local_publication_warning,),
+            limit=1,
+        )
     _print_limited_items("List warnings", stats.list_errors, limit=_configured_warning_limit(cfg))
 
     return 0
@@ -987,12 +1024,29 @@ def cmd_pack_object_graph(args: argparse.Namespace) -> int:
 def cmd_inspect_object_pack(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     service = object_pack_service_from_config_defaults(cfg)
-    inspection = service.inspect_pack(
-        args.path,
-        identity_file=(identity_file_from_args(args, cfg) if args.decrypt else None),
-        passphrase=(passphrase_for_decrypt(args, cfg) if args.decrypt else None),
-        decrypt=bool(args.decrypt),
-    )
+    decrypt = bool(args.decrypt)
+    full_validation = bool(args.full_validation)
+
+    if full_validation and not decrypt:
+        raise StopanUsageError("--full-validation requiere --decrypt")
+
+    if not decrypt:
+        inspection = service.inspect_pack_header(args.path)
+    else:
+        identity_file = identity_file_from_args(args, cfg)
+        passphrase = passphrase_for_decrypt(args, cfg)
+        if full_validation:
+            inspection = service.validate_pack(
+                args.path,
+                identity_file=identity_file,
+                passphrase=passphrase,
+            )
+        else:
+            inspection = service.inspect_pack_summary(
+                args.path,
+                identity_file=identity_file,
+                passphrase=passphrase,
+            )
 
     header = inspection.header
     print("Metadata object pack")
@@ -1008,6 +1062,7 @@ def cmd_inspect_object_pack(args: argparse.Namespace) -> int:
     if inspection.decrypted is not None:
         summary = inspection.decrypted
         print("Decrypted pack")
+        print(f"   object_validation: {'full' if full_validation else 'summary'}")
         print(f"   vault_id: {summary.vault_id}")
         print(f"   vault_generation: {summary.vault_generation}")
         print(f"   pack_created_at: {format_time(summary.pack_created_at_unix)}")

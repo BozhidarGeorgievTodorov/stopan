@@ -76,6 +76,7 @@ class RemoteChunkClientPool(P2PStorageProtectionClient):
     def __init__(
         self,
         *,
+        cluster_token: str,
         probe_timeout_s: float,
         probe_batch_hashes: int,
         stream_timeout_s: float = DEFAULT_REPLICATION_STREAM_TIMEOUT_S,
@@ -87,6 +88,7 @@ class RemoteChunkClientPool(P2PStorageProtectionClient):
         self.stream_timeout_s = float(stream_timeout_s)
         self.stream_inflight = max(1, int(stream_inflight))
         super().__init__(
+            cluster_token=cluster_token,
             max_message_bytes=max_message_bytes or DEFAULT_GRPC_MAX_MESSAGE_BYTES,
             closed_message="RemoteChunkClientPool cerrado",
             closed_error_factory=StopanNetworkError,
@@ -111,6 +113,7 @@ class RemoteChunkClientPool(P2PStorageProtectionClient):
             response = stub.ProbeMissingChunks(
                 self._pb.ProbeMissingChunksRequest(chunk_hashes=batch),
                 timeout=self.probe_timeout_s,
+                metadata=self._call_metadata,
             )
             missing.update(chunk_hash for chunk_hash in response.missing_hashes if chunk_hash)
 
@@ -226,7 +229,11 @@ class RemoteChunkClientPool(P2PStorageProtectionClient):
         sender_thread.start()
 
         try:
-            responses = stub.ReplicateChunks(request_iter, timeout=self.stream_timeout_s)
+            responses = stub.ReplicateChunks(
+                request_iter,
+                timeout=self.stream_timeout_s,
+                metadata=self._call_metadata,
+            )
             for result in responses:
                 if not result.chunk_hash:
                     continue

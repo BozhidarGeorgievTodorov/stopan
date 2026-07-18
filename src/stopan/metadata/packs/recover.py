@@ -194,11 +194,10 @@ def recover_metadata_from_network(
 
                 atomic_write_bytes(pack_path, data, mode=0o600)
 
-                inspection = pack_service.inspect_pack(
+                inspection = pack_service.validate_pack(
                     pack_path,
                     identity_file=identity_file,
                     passphrase=passphrase,
-                    decrypt=True,
                 )
                 if inspection.decrypted is None:
                     raise MetadataPackRecoverError("metadata pack no fue descifrado durante la validación")
@@ -311,7 +310,7 @@ def recover_metadata_from_network(
             db_import_result=db_import_result,
         )
 
-    message = "No se pudo descargar e importar ningún metadata pack válido."
+    message = "No se pudo descargar y validar ningún metadata pack válido."
     if download_errors:
         message += " Últimos errores: " + "; ".join(download_errors[-5:])
     raise MetadataPackRecoverError(message)

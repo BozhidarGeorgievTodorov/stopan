@@ -8,14 +8,20 @@ estado de metadata entre nodos o para recuperación posterior.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from stopan.common.fs import atomic_write_bytes, ensure_private_dir
 from stopan.errors import StopanUsageError
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.graph.walk import collect_reachable_object_bytes
-from stopan.metadata.objects.store import MetadataObjectStore, object_store_lock
+from stopan.metadata.objects.store import (
+    LatestMetadataPointer,
+    MetadataObjectStore,
+    object_store_lock,
+)
 from stopan.metadata.packs.crypto import decrypt_pack_payload, encrypt_pack_payload
 from stopan.metadata.packs.format import (
     MetadataObjectPackError,
@@ -28,10 +34,17 @@ from stopan.metadata.packs.payload import (
     parse_pack_payload,
     parse_pack_payload_summary,
     require_vault_id,
+    validate_pack_payload,
 )
 
 
 _PACK_GENERATION_DIR = "pack-generations"
+
+
+_PackPayloadSummaryParser = Callable[
+    [dict[str, Any]],
+    tuple[LatestMetadataPointer, str, int, float],
+]
 
 
 def _pack_generation_path(object_store_dir: str | Path, vault_id: str) -> Path:
@@ -217,29 +230,58 @@ class MetadataObjectPackService:
             ),
         )
 
-    def inspect_pack(
+    def inspect_pack_header(self, path: str | Path) -> MetadataObjectPackInspection:
+        pack_path = Path(path).expanduser().resolve()
+        return MetadataObjectPackInspection(header=read_pack_header(pack_path), decrypted=None)
+
+    def inspect_pack_summary(
         self,
         path: str | Path,
         *,
-        identity_file: str | Path | None = None,
-        passphrase: str | bytes | None = None,
-        decrypt: bool = False,
+        identity_file: str | Path,
+        passphrase: str | bytes,
     ) -> MetadataObjectPackInspection:
-        pack_path = Path(path).expanduser().resolve()
-        header = read_pack_header(pack_path)
-        if not decrypt:
-            return MetadataObjectPackInspection(header=header, decrypted=None)
-        if passphrase is None:
-            raise StopanUsageError("inspect_pack decrypt=True requiere passphrase")
-        if identity_file is None:
-            raise StopanUsageError("inspect_pack decrypt=True requiere identity_file")
+        return self._inspect_decrypted_pack(
+            path,
+            identity_file=identity_file,
+            passphrase=passphrase,
+            payload_parser=parse_pack_payload_summary,
+        )
 
-        payload, _header, compressed_bytes, plaintext_bytes = decrypt_pack_payload(
+    def validate_pack(
+        self,
+        path: str | Path,
+        *,
+        identity_file: str | Path,
+        passphrase: str | bytes,
+    ) -> MetadataObjectPackInspection:
+        return self._inspect_decrypted_pack(
+            path,
+            identity_file=identity_file,
+            passphrase=passphrase,
+            payload_parser=validate_pack_payload,
+        )
+
+    def _inspect_decrypted_pack(
+        self,
+        path: str | Path,
+        *,
+        identity_file: str | Path,
+        passphrase: str | bytes,
+        payload_parser: _PackPayloadSummaryParser,
+    ) -> MetadataObjectPackInspection:
+        if not identity_file:
+            raise StopanUsageError("la inspección descifrada requiere identity_file")
+        if passphrase is None:
+            raise StopanUsageError("la inspección descifrada requiere passphrase")
+
+        pack_path = Path(path).expanduser().resolve()
+        payload, header, compressed_bytes, plaintext_bytes = decrypt_pack_payload(
             pack_path,
             identity_file=identity_file,
             passphrase=passphrase,
         )
-        latest, vault_id, vault_generation, pack_created_at_unix = parse_pack_payload_summary(payload)
+        latest, vault_id, vault_generation, pack_created_at_unix = payload_parser(payload)
         return MetadataObjectPackInspection(
             header=header,
             decrypted=MetadataObjectPackSummary(

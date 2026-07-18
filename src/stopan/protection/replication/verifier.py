@@ -63,6 +63,7 @@ class ChunkProtectionVerifier:
         self.target_parallelism = max(1, int(target_parallelism))
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
         self._client_pool = RemoteChunkClientPool(
+            cluster_token=self.cluster_token,
             probe_timeout_s=probe_timeout_s,
             probe_batch_hashes=probe_batch_hashes,
             max_message_bytes=max_message_bytes,

@@ -100,6 +100,14 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         help="Descifra el pack y muestra resumen del latest que contiene.",
     )
     inspect_parser.add_argument(
+        "--full-validation",
+        action="store_true",
+        help=(
+            "Con --decrypt, valida íntegramente todos los objetos del pack. "
+            "Añade coste lineal de CPU."
+        ),
+    )
+    inspect_parser.add_argument(
         "--passphrase-file",
         default=None,
         help="Lee la passphrase desde un fichero privado para --decrypt. Default: metadata.passphrase_file si existe.",

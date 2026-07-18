@@ -83,12 +83,14 @@ def restore_snapshot(
 
         if use_remote_chunks:
             remote_pool = RemoteStorageClientPool(
+                cluster_token=cluster_token,
                 timeout_s=rpc_timeout_s,
                 max_message_bytes=max_message_bytes,
             )
 
         if use_ec_recovery:
             ec_remote_pool = RemoteDataPackShardClientPool(
+                cluster_token=cluster_token,
                 timeout_s=rpc_timeout_s,
                 max_message_bytes=max_message_bytes,
             )

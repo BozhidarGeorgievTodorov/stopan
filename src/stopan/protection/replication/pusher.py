@@ -152,6 +152,7 @@ def push_to_network(
         processed_bytes = db.sum_chunk_sizes(pending_chunks)
 
         remote_client = RemoteChunkClientPool(
+            cluster_token=cluster_token,
             probe_timeout_s=probe_timeout_s,
             probe_batch_hashes=probe_batch_hashes,
             stream_timeout_s=stream_timeout_s,

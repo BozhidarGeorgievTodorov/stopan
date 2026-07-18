@@ -129,7 +129,7 @@ En el arranque se cargan o crean dos datos persistentes de identidad: `node_id` 
 
 El servidor gRPC registra tres servicios:
 
-`P2PStorage` expone chunks y shards EC. Sus RPC principales son `ProbeMissingChunks`, `ReplicateChunks`, `RetrieveChunkBatch`, `ProbeMissingDataPackShards`, `ReplicateDataPackShards` y `RetrieveDataPackShardBatch`.
+`P2PStorage` expone chunks y shards EC. Sus RPC principales son `ProbeMissingChunks`, `ReplicateChunks`, `RetrieveChunkBatch`, `ProbeMissingDataPackShards`, `ReplicateDataPackShards` y `RetrieveDataPackShardBatch`. Los clientes adjuntan `cluster.token` como metadata binaria de gRPC y el servidor rechaza la llamada antes de consultar, leer o escribir contenido cuando la credencial configurada no coincide.
 
 `Membership` expone `Join`, `Ping`, `PingReq` y `GetMembers`.
 
@@ -143,7 +143,7 @@ El proceso de nodo mantiene membership con un protocolo tipo SWIM. Los clientes 
 
 `ClusterView` representa la vista canónica usada por placement. Contiene miembros elegibles y, si se pudo resolver, el `self_node_id`.
 
-El token de clúster forma parte de la separación lógica entre clústeres. No sustituye a una capa de seguridad de red.
+El token de clúster forma parte de la separación lógica entre clústeres. Membership y metadata packs lo transportan dentro de sus mensajes. `P2PStorage` lo transporta mediante metadata binaria de gRPC para cubrir de forma uniforme las consultas de presencia, la replicación y la recuperación de chunks y shards EC. Un token vacío desactiva esta barrera lógica. El mecanismo no identifica criptográficamente al nodo y no sustituye a TLS, una VPN, un cortafuegos ni otro control de red.
 
 ## Placement remoto
 
@@ -231,7 +231,7 @@ Todo chunk recuperado fuera del CAS local principal se descomprime con Zstandard
 
 La recuperación EC trabaja a nivel de data pack completo. Cuando necesita un chunk de un pack, recupera al menos `ec_k` shards, reconstruye el payload completo, extrae todos los chunks del pack y cachea los chunks reconstruidos.
 
-La escritura del restore usa un directorio `snapshot_<uuid>.incomplete`. Cada archivo se escribe primero como `.tmp`. Al completar todo el árbol, el directorio incompleto se promueve a `snapshot_<uuid>`. Si el directorio final ya existe, no se sobrescribe.
+La escritura del restore usa un directorio `snapshot_<uuid>.incomplete`. Cada archivo se escribe primero como `.tmp`. Al completar todo el árbol, el directorio incompleto se promueve a `snapshot_<uuid>`. Si el destino final ya existe, la operación se rechaza sin sobrescribirlo ni asumir que contiene una restauración válida.
 
 Las rutas restauradas pasan por una normalización que rechaza rutas absolutas, escapes con `..` y cualquier path que salga del directorio destino.
 
@@ -259,7 +259,9 @@ La distribución de packs usa una política separada de la protección de chunks
 
 Las publicaciones locales de metadata packs se guardan en SQLite para que discover y verify puedan comparar presencia remota contra intención de copias.
 
-La recuperación de metadata lista packs remotos del owner, descarga candidatos, valida firma y hash, descifra con la identidad local, importa el pack al object store y, si se solicita, reconstruye `_metadata.db`.
+En `metadata pack discover`, esta comparación es de mejor esfuerzo. Un fallo al abrir o consultar la SQLite local no impide listar y validar referencias remotas. El comando informa de la incidencia y deja la presencia en `UNKNOWN` cuando no dispone de una expectativa local utilizable.
+
+La recuperación de metadata lista packs remotos del owner, descarga candidatos, valida firma y hash, descifra con la identidad local y comprueba todos los objetos del paquete antes de considerarlo seleccionable. Después, salvo en `--download-only`, importa el pack al object store y, si se solicita, reconstruye `_metadata.db`.
 
 ## Verificación y estados
 
@@ -293,6 +295,8 @@ Las familias principales son:
 Los targets de edad máxima usan `0` como valor que desactiva borrado por edad. Los targets generados usan periodos de gracia para evitar borrar artefactos recién creados.
 
 El metadata object graph usa un GC tipo mark-and-sweep desde `latest`. Los objetos alcanzables siguen vivos. Los objetos huérfanos se vuelven candidatos después del periodo de gracia. Los packs locales generados se tratan como artefactos de exportación o cache.
+
+La limpieza conserva un opt-in destructivo tanto en la CLI como en los jobs periódicos. La omisión de `gc.apply` y los valores booleanos falsos se traducen a `--dry-run`. Solo un valor verdadero reconocido se traduce a `--apply`. Los valores no reconocibles se rechazan antes de invocar el CLI.
 
 ## Superficie de control
 

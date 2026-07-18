@@ -11,12 +11,14 @@ if [ -n "${STOPAN_CONFIG:-}" ]; then
     set -- "$@" --config "$STOPAN_CONFIG"
 fi
 
-if stopan_job_bool_is_true "${STOPAN_GC_APPLY:-}"; then
+apply_mode="${STOPAN_GC_APPLY:-}"
+
+if stopan_job_bool_is_true "$apply_mode"; then
     set -- "$@" --apply
-elif stopan_job_bool_is_false "${STOPAN_GC_APPLY:-}"; then
+elif [ -z "$apply_mode" ] || stopan_job_bool_is_false "$apply_mode"; then
     set -- "$@" --dry-run
 else
-    set -- "$@" --apply
+    stopan_job_die "STOPAN_GC_APPLY debe ser un valor booleano reconocido"
 fi
 
 if [ -n "${STOPAN_CHUNK_STORE:-}" ]; then

@@ -291,11 +291,10 @@ def _sweep_packs(
             continue
 
         try:
-            inspection = service.inspect_pack(
+            inspection = service.inspect_pack_summary(
                 path,
                 identity_file=identity_file,
                 passphrase=passphrase,
-                decrypt=True,
             )
             if inspection.decrypted is None:
                 raise MetadataObjectGarbageCollectionError("la inspección del pack no devolvió resumen descifrado")

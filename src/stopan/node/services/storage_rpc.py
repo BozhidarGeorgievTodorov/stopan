@@ -21,6 +21,7 @@ from stopan.cas.repository import CASRepository
 from stopan.node.storage.commit_engine import StorageCommitEngine
 from stopan.node.storage.ec_shard_store import DataPackShardStore
 from stopan.node.services.ec_storage_rpc import DataPackShardRpcHandler
+from stopan.rpc.auth import require_cluster_token_metadata
 
 
 _INVALID_HASH_PREVIEW_CHARS = 32
@@ -38,6 +39,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         self,
         repo_store_dir: str,
         *,
+        cluster_token: str,
         commit_workers: int,
         commit_queue_items: int,
         max_chunk_size: int,
@@ -48,6 +50,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         Los chunks entrantes se validan mediante StorageCommitEngine. Los chunks
         salientes se devuelven comprimidos y el cliente restore valida integridad.
         """
+        self._cluster_token = str(cluster_token or "")
         self.repo = CASRepository(repo_store_dir)
         self.commit_engine = StorageCommitEngine(
             self.repo,
@@ -79,6 +82,8 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         - la integridad se valida al aceptar blobs nuevos en ReplicateChunks
             y al consumir blobs en restore/retrieve mediante BLAKE3.
         """
+        require_cluster_token_metadata(self._cluster_token, context)
+
         try:
             invalid = [
                 chunk_hash
@@ -113,6 +118,8 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
           - en cancelación se pueden descartar futures pendientes de la cola de
             salida porque el cliente ya no debe contarlos como confirmados.
         """
+        require_cluster_token_metadata(self._cluster_token, context)
+
         future_queue: queue.Queue = queue.Queue(maxsize=max(1, self.commit_engine.max_pending))
         sentinel = object()
         reader_errors: list[Exception] = []
@@ -254,6 +261,8 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         La validación de integridad extremo-a-extremo la realiza el cliente restore
         al descomprimir y comprobar BLAKE3 contra chunk_hash.
         """
+        require_cluster_token_metadata(self._cluster_token, context)
+
         try:
             results = []
 
@@ -306,11 +315,14 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             return p2p_storage_pb2.RetrieveChunkBatchResponse()
 
     def ProbeMissingDataPackShards(self, request, context):
+        require_cluster_token_metadata(self._cluster_token, context)
         return self.ec_shard_rpc.probe_missing(request, context)
 
     def ReplicateDataPackShards(self, request_iterator, context):
+        require_cluster_token_metadata(self._cluster_token, context)
         yield from self.ec_shard_rpc.replicate(request_iterator, context)
 
     def RetrieveDataPackShardBatch(self, request, context):
+        require_cluster_token_metadata(self._cluster_token, context)
         return self.ec_shard_rpc.retrieve_batch(request, context)
 

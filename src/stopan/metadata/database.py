@@ -207,7 +207,8 @@ class MetadataDB:
                 chunk_hash TEXT NOT NULL,
                 chunk_size INTEGER NOT NULL,
                 PRIMARY KEY(recipe_id, chunk_order),
-                FOREIGN KEY(recipe_id) REFERENCES recipes(id) ON DELETE CASCADE
+                FOREIGN KEY(recipe_id) REFERENCES recipes(id) ON DELETE CASCADE,
+                FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
             )
         """)
         cursor.execute("""
@@ -716,7 +717,10 @@ class MetadataDB:
             if existing_chunks:
                 if existing_chunks != chunks:
                     raise MetadataDatabaseError(f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}")
-            elif chunk_count > 0:
+
+            self._register_chunks(chunks)
+
+            if not existing_chunks and chunk_count > 0:
                 self.conn.executemany("""
                     INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
                     VALUES (?, ?, ?, ?)
@@ -725,7 +729,6 @@ class MetadataDB:
                     for order, chunk_hash, chunk_size in chunks
                 ))
 
-            self._register_chunks(chunks)
             self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
 
         return recipe_id

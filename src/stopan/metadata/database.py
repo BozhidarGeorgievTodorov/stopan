@@ -3,15 +3,17 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
-from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from collections.abc import Iterable, Iterator
 
 from stopan.config.defaults import DEFAULT_NODE_DB_FILE
 from stopan.errors import StopanDataError
 from stopan.protection.policy import ProtectionRecord, ProtectionState, is_record_sufficient
 
+
+_SQLITE_CACHE_SIZE_KIB = 64 * 1024
+_SQLITE_MMAP_SIZE_BYTES = 2 * 1024**3
 
 
 class MetadataDatabaseError(StopanDataError, RuntimeError):
@@ -19,7 +21,7 @@ class MetadataDatabaseError(StopanDataError, RuntimeError):
 
 
 class MetadataDatabaseValueError(StopanDataError, ValueError):
-    """Valor inválido de metadata persistida, preservando compatibilidad con ValueError."""
+    """Valor persistido inválido."""
 
 
 @dataclass(frozen=True)
@@ -27,7 +29,6 @@ class VerificationCandidate:
     chunk_hash: str
     desired_rf: int
     protection_state: ProtectionState
-
 
 
 @dataclass(frozen=True)
@@ -84,39 +85,43 @@ class MetadataPackPublicationRecord:
 
 
 class MetadataDB:
-    """
-    Guarda snapshots, recetas de chunks y estado de protección distribuida.
+    """Catálogo operativo local del nodo.
 
-    Modelo canónico:
-      - snapshots
-      - snapshot_items
-      - recipes / recipe_chunks
-      - chunks
-      - chunk_protection
-      - erasure_data_packs / erasure_data_pack_chunks / erasure_data_pack_shards
+    Conserva la identidad lógica del catálogo, las instantáneas y sus recetas,
+    los fragmentos conocidos, los estados de protección por replicación y
+    codificación de borrado, y el último resultado de publicación de cada
+    paquete de metadatos.
 
-    La protección por replicación remota se decide exclusivamente desde
-    chunk_protection. La protección por erasure coding usa data packs separados.
+    La estructura estable del contenido permanece separada de la evidencia
+    mutable generada por los envíos, reintentos y verificaciones.
     """
 
-    def __init__(self, db_file: str = DEFAULT_NODE_DB_FILE, *, init_schema: bool = True):
+    def __init__(
+        self,
+        db_file: str = DEFAULT_NODE_DB_FILE,
+        *,
+        init_schema: bool = True,
+    ) -> None:
         self.db_file = db_file
-        self.conn = sqlite3.connect(self.db_file)
+        self.conn: sqlite3.Connection = sqlite3.connect(self.db_file)
         self.conn.row_factory = sqlite3.Row
-
-        self.conn.execute("PRAGMA journal_mode = WAL")
-        self.conn.execute("PRAGMA synchronous = NORMAL")
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA cache_size = -64000")
-        self.conn.execute("PRAGMA temp_store = MEMORY")
-        self.conn.execute("PRAGMA mmap_size = 2147483648")
+        self._configure_connection()
 
         if init_schema:
             self._init_db()
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Connection and lifecycle
     # ------------------------------------------------------------------
+
+    def _configure_connection(self) -> None:
+        """Aplica a cada conexión los ajustes de integridad, concurrencia y memoria."""
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute(f"PRAGMA cache_size = -{_SQLITE_CACHE_SIZE_KIB}")
+        self.conn.execute("PRAGMA temp_store = MEMORY")
+        self.conn.execute(f"PRAGMA mmap_size = {_SQLITE_MMAP_SIZE_BYTES}")
 
     def commit(self) -> None:
         self.conn.commit()
@@ -137,206 +142,194 @@ class MetadataDB:
     # ------------------------------------------------------------------
 
     def _init_db(self) -> None:
-        cursor = self.conn.cursor()
+        """Crea las tablas y los índices requeridos por los recorridos actuales."""
+        with self.conn:
+            cursor = self.conn.cursor()
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS metadata_vault (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
+            # Identidad lógica del catálogo.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata_vault (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                uuid TEXT NOT NULL UNIQUE,
-                root_path TEXT NOT NULL,
-                origin_node_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'CREATING',
-                error TEXT,
-                total_size INTEGER NOT NULL DEFAULT 0,
-                total_files INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            # Estructura estable de instantáneas, recetas y fragmentos.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uuid TEXT NOT NULL UNIQUE,
+                    root_path TEXT NOT NULL,
+                    origin_node_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'CREATING',
+                    error TEXT,
+                    total_size INTEGER NOT NULL DEFAULT 0,
+                    total_files INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_snapshots_root_status_id
-            ON snapshots(root_path, status, id DESC)
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_snapshots_origin_node_id
-            ON snapshots(origin_node_id)
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS recipes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipe_hash TEXT UNIQUE NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    total_size INTEGER NOT NULL
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS snapshot_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_id INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                item_type TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mode INTEGER,
-                mtime REAL,
-                mtime_ns INTEGER,
-                uid INTEGER,
-                gid INTEGER,
-                recipe_id INTEGER,
-                FOREIGN KEY(snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE,
-                FOREIGN KEY(recipe_id) REFERENCES recipes(id),
-                UNIQUE(snapshot_id, path)
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot_path
-            ON snapshot_items(snapshot_id, path)
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chunks (
+                    hash TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    ref_count INTEGER NOT NULL DEFAULT 0
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS recipes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recipe_hash TEXT UNIQUE NOT NULL,
-                chunk_count INTEGER NOT NULL,
-                total_size INTEGER NOT NULL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS recipe_chunks (
-                recipe_id INTEGER NOT NULL,
-                chunk_order INTEGER NOT NULL,
-                chunk_hash TEXT NOT NULL,
-                chunk_size INTEGER NOT NULL,
-                PRIMARY KEY(recipe_id, chunk_order),
-                FOREIGN KEY(recipe_id) REFERENCES recipes(id) ON DELETE CASCADE,
-                FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_recipe_chunks_hash
-            ON recipe_chunks(chunk_hash)
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS snapshot_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    item_type TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mode INTEGER,
+                    mtime REAL,
+                    mtime_ns INTEGER,
+                    uid INTEGER,
+                    gid INTEGER,
+                    recipe_id INTEGER,
+                    FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(recipe_id) REFERENCES recipes(id),
+                    UNIQUE(snapshot_id, path)
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chunks (
-                hash TEXT PRIMARY KEY,
-                size INTEGER NOT NULL,
-                ref_count INTEGER NOT NULL DEFAULT 0
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS recipe_chunks (
+                    recipe_id INTEGER NOT NULL,
+                    chunk_order INTEGER NOT NULL,
+                    chunk_hash TEXT NOT NULL,
+                    chunk_size INTEGER NOT NULL,
+                    PRIMARY KEY(recipe_id, chunk_order),
+                    FOREIGN KEY(recipe_id) REFERENCES recipes(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chunk_protection (
-                chunk_hash TEXT PRIMARY KEY,
-                desired_rf INTEGER NOT NULL DEFAULT 1,
-                protection_state TEXT NOT NULL DEFAULT 'PENDING',
-                protected_remote_copies INTEGER NOT NULL DEFAULT 0,
-                placement_epoch TEXT,
-                last_push_at REAL,
-                last_verify_at REAL,
-                last_error TEXT,
-                FOREIGN KEY(chunk_hash) REFERENCES chunks(hash) ON DELETE CASCADE
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chunk_protection_state
-            ON chunk_protection(protection_state)
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chunk_protection_epoch
-            ON chunk_protection(placement_epoch)
-        """)
+            # Evidencia mutable de protección por replicación.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chunk_protection (
+                    chunk_hash TEXT PRIMARY KEY,
+                    desired_rf INTEGER NOT NULL DEFAULT 1,
+                    protection_state TEXT NOT NULL DEFAULT 'PENDING',
+                    protected_remote_copies INTEGER NOT NULL DEFAULT 0,
+                    placement_epoch TEXT,
+                    last_push_at REAL,
+                    last_verify_at REAL,
+                    last_error TEXT,
+                    FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
+                        ON DELETE CASCADE
+                )
+            """)
 
+            # Paquetes y fragmentos de codificación de borrado.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS erasure_data_packs (
+                    pack_hash TEXT PRIMARY KEY,
+                    codec TEXT NOT NULL,
+                    data_shards INTEGER NOT NULL,
+                    parity_shards INTEGER NOT NULL,
+                    payload_size INTEGER NOT NULL,
+                    padded_size INTEGER NOT NULL,
+                    shard_size INTEGER NOT NULL,
+                    protection_state TEXT NOT NULL DEFAULT 'PENDING',
+                    placement_epoch TEXT,
+                    created_at REAL NOT NULL,
+                    last_push_at REAL,
+                    last_verify_at REAL,
+                    last_error TEXT
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS erasure_data_packs (
-                pack_hash TEXT PRIMARY KEY,
-                codec TEXT NOT NULL,
-                data_shards INTEGER NOT NULL,
-                parity_shards INTEGER NOT NULL,
-                payload_size INTEGER NOT NULL,
-                padded_size INTEGER NOT NULL,
-                shard_size INTEGER NOT NULL,
-                protection_state TEXT NOT NULL DEFAULT 'PENDING',
-                placement_epoch TEXT,
-                created_at REAL NOT NULL,
-                last_push_at REAL,
-                last_verify_at REAL,
-                last_error TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_erasure_data_packs_state
-            ON erasure_data_packs(protection_state)
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_erasure_data_packs_epoch
-            ON erasure_data_packs(placement_epoch)
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS erasure_data_pack_chunks (
+                    chunk_hash TEXT PRIMARY KEY,
+                    pack_hash TEXT NOT NULL,
+                    chunk_offset INTEGER NOT NULL,
+                    chunk_length INTEGER NOT NULL,
+                    chunk_ordinal INTEGER NOT NULL,
+                    FOREIGN KEY(chunk_hash) REFERENCES chunks(hash)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(pack_hash) REFERENCES erasure_data_packs(pack_hash)
+                        ON DELETE CASCADE,
+                    UNIQUE(pack_hash, chunk_ordinal)
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS erasure_data_pack_chunks (
-                chunk_hash TEXT PRIMARY KEY,
-                pack_hash TEXT NOT NULL,
-                chunk_offset INTEGER NOT NULL,
-                chunk_length INTEGER NOT NULL,
-                chunk_ordinal INTEGER NOT NULL,
-                FOREIGN KEY(chunk_hash) REFERENCES chunks(hash) ON DELETE CASCADE,
-                FOREIGN KEY(pack_hash) REFERENCES erasure_data_packs(pack_hash)
-                    ON DELETE CASCADE,
-                UNIQUE(pack_hash, chunk_ordinal)
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_erasure_data_pack_chunks_pack
-            ON erasure_data_pack_chunks(pack_hash, chunk_ordinal)
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS erasure_data_pack_shards (
+                    pack_hash TEXT NOT NULL,
+                    shard_index INTEGER NOT NULL,
+                    shard_hash TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    protection_state TEXT NOT NULL DEFAULT 'PENDING',
+                    last_push_at REAL,
+                    last_verify_at REAL,
+                    last_error TEXT,
+                    PRIMARY KEY(pack_hash, shard_index),
+                    FOREIGN KEY(pack_hash) REFERENCES erasure_data_packs(pack_hash)
+                        ON DELETE CASCADE
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS erasure_data_pack_shards (
-                pack_hash TEXT NOT NULL,
-                shard_index INTEGER NOT NULL,
-                shard_hash TEXT NOT NULL,
-                node_id TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                protection_state TEXT NOT NULL DEFAULT 'PENDING',
-                last_push_at REAL,
-                last_verify_at REAL,
-                last_error TEXT,
-                PRIMARY KEY(pack_hash, shard_index),
-                FOREIGN KEY(pack_hash) REFERENCES erasure_data_packs(pack_hash)
-                    ON DELETE CASCADE
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_erasure_data_pack_shards_node
-            ON erasure_data_pack_shards(node_id)
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_erasure_data_pack_shards_state
-            ON erasure_data_pack_shards(protection_state)
-        """)
+            # Último resultado agregado de publicación de metadatos.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata_pack_publications (
+                    owner_id TEXT NOT NULL,
+                    pack_hash TEXT NOT NULL,
+                    desired_copies INTEGER NOT NULL,
+                    pushed_at REAL NOT NULL,
+                    pack_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    attempted_targets INTEGER NOT NULL DEFAULT 0,
+                    successful_targets INTEGER NOT NULL DEFAULT 0,
+                    stored_targets INTEGER NOT NULL DEFAULT 0,
+                    already_present_targets INTEGER NOT NULL DEFAULT 0,
+                    failed_targets INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(owner_id, pack_hash)
+                )
+            """)
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS metadata_pack_publications (
-                owner_id TEXT NOT NULL,
-                pack_hash TEXT NOT NULL,
-                desired_copies INTEGER NOT NULL,
-                pushed_at REAL NOT NULL,
-                pack_size_bytes INTEGER NOT NULL DEFAULT 0,
-                attempted_targets INTEGER NOT NULL DEFAULT 0,
-                successful_targets INTEGER NOT NULL DEFAULT 0,
-                stored_targets INTEGER NOT NULL DEFAULT 0,
-                already_present_targets INTEGER NOT NULL DEFAULT 0,
-                failed_targets INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(owner_id, pack_hash)
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_metadata_pack_publications_owner_pushed
-            ON metadata_pack_publications(owner_id, pushed_at DESC)
-        """)
+            # Índices explícitos vinculados a consultas actuales. Las claves
+            # primarias y restricciones UNIQUE ya aportan el resto de recorridos.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_snapshots_root_status_id
+                ON snapshots(root_path, status, id DESC)
+            """)
 
-        self.conn.commit()
+            # SQLite no indexa automáticamente la columna hija de esta FK.
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_recipe_chunks_hash
+                ON recipe_chunks(chunk_hash)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chunk_protection_state
+                ON chunk_protection(protection_state)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_erasure_data_packs_state
+                ON erasure_data_packs(protection_state)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_metadata_pack_publications_owner_pushed
+                ON metadata_pack_publications(owner_id, pushed_at DESC)
+            """)
 
     # ------------------------------------------------------------------
     # Vault identity
@@ -595,7 +588,7 @@ class MetadataDB:
         ))
         return cursor.lastrowid
 
-    def get_snapshot_items(self, snapshot_id: int):
+    def get_snapshot_items(self, snapshot_id: int) -> Iterator[dict[str, object]]:
         """Genera los elementos de un snapshot en orden de ruta."""
         cursor = self.conn.execute("""
             SELECT *
@@ -626,7 +619,7 @@ class MetadataDB:
             WHERE id = ?
         """, (recipe_id, item_id))
 
-    def get_item_chunks(self, item_id: int):
+    def get_item_chunks(self, item_id: int) -> Iterator[str]:
         """Genera la receta de hashes de un archivo."""
         row = self.conn.execute("""
             SELECT recipe_id
@@ -662,6 +655,7 @@ class MetadataDB:
         desired_rf: int = 3,
     ) -> int:
         """Crea o reutiliza una receta deduplicada de chunks."""
+        recipe_hash = _require_hash64("recipe_hash", recipe_hash)
         chunks = list(chunks)
         desired_rf = int(desired_rf)
         chunk_count = len(chunks)
@@ -746,15 +740,24 @@ class MetadataDB:
         self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
 
     def _register_chunks(self, chunks: Iterable[tuple[int, str, int]]) -> None:
-        ref_counts = defaultdict(lambda: [0, 0])
+        ref_counts: dict[str, list[int]] = {}
         for _, chunk_hash, chunk_size in chunks:
-            ref_counts[chunk_hash][0] = chunk_size
-            ref_counts[chunk_hash][1] += 1
+            current = ref_counts.get(chunk_hash)
+            if current is None:
+                ref_counts[chunk_hash] = [chunk_size, 1]
+                continue
+            if current[0] != chunk_size:
+                raise MetadataDatabaseError(
+                    "un mismo chunk no puede tener tamaños distintos dentro de una receta: "
+                    f"hash={chunk_hash} tamaños={current[0]},{chunk_size}"
+                )
+            current[1] += 1
 
         self.conn.executemany("""
             INSERT INTO chunks (hash, size, ref_count)
             VALUES (?, ?, ?)
-            ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + excluded.ref_count
+            ON CONFLICT(hash) DO UPDATE SET
+                ref_count = ref_count + excluded.ref_count
         """, (
             (chunk_hash, chunk_size, ref_count)
             for chunk_hash, (chunk_size, ref_count) in ref_counts.items()
@@ -767,7 +770,8 @@ class MetadataDB:
         desired_rf: int,
     ) -> None:
         desired_rf = int(desired_rf)
-        rows = [(chunk_hash, desired_rf) for _, chunk_hash, _ in chunks]
+        chunk_hashes = _unique_hashes(chunk_hash for _, chunk_hash, _ in chunks)
+        rows = [(chunk_hash, desired_rf) for chunk_hash in chunk_hashes]
         if not rows:
             return
 
@@ -1025,7 +1029,7 @@ class MetadataDB:
         self,
         chunk_hashes: Iterable[str],
     ) -> dict[str, ErasureDataPackChunkRecord]:
-        hashes = [_require_hash64("chunk_hash", chunk_hash) for chunk_hash in chunk_hashes]
+        hashes = _unique_hashes(chunk_hashes)
         if not hashes:
             return {}
 
@@ -1499,8 +1503,6 @@ class MetadataDB:
                 WHERE pack_hash = ?
                   AND shard_index NOT IN ({placeholders})
             """, (pack_hash, *sorted(seen_indexes)))
-
-
 
 
     # ------------------------------------------------------------------
@@ -2434,7 +2436,6 @@ class MetadataDB:
         ))
 
 
-
 _HASH64_ALPHABET = set("0123456789abcdef")
 
 
@@ -2524,7 +2525,7 @@ def _normalize_erasure_chunk_rows(
 def _normalize_erasure_shard_rows(
     shards: Iterable[tuple[int, str, str, int]],
     total_shards: int,
-) -> list[tuple[int, str, str, str, int]]:
+) -> list[tuple[int, str, str, int]]:
     rows = [
         (
             _require_non_negative_int("shard_index", shard_index),

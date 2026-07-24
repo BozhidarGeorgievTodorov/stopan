@@ -72,7 +72,7 @@ Un snapshot representa una captura de una raíz local. Se crea en estado `CREATI
 
 El recorrido del árbol lo realiza `TreeWalker`. Emite la raíz como `.` y produce items de tipo `dir` y `file`. Ignora symlinks y ficheros especiales. Puede recorrer de forma determinista para pruebas o comparaciones reproducibles.
 
-Cada archivo se reconstruye mediante una recipe. Una recipe es una secuencia ordenada de chunks, donde cada entrada contiene orden, hash y tamaño. El `recipe_hash` se calcula con SHA-256 sobre esa secuencia canónica. El contenido de cada chunk queda identificado aparte por BLAKE3.
+Cada archivo se reconstruye mediante una recipe. Una recipe es una secuencia ordenada de chunks, donde cada entrada contiene orden, hash y tamaño. El `recipe_hash` se calcula con BLAKE3 sobre una serialización binaria canónica y versionada de esa secuencia. El contenido de cada chunk queda identificado aparte por BLAKE3.
 
 Si un archivo no cambia respecto al snapshot completo anterior de la misma raíz, se puede reutilizar la recipe anterior y evitar leer de nuevo el archivo completo. La comprobación usa metadata de filesystem como tamaño, modo, propietario, grupo y mtime.
 
@@ -153,7 +153,7 @@ La puntuación HRW se calcula con BLAKE3 sobre una combinación estable de `clus
 
 El nodo origen se excluye del placement remoto. Esto afecta a replication, EC, verificación y recuperación remota.
 
-`placement_epoch` identifica el contexto de placement vigente. Cambia si cambia el token, el número de copias remotas requeridas o el conjunto de nodos elegibles. Se usa para detectar evidencia antigua que ya no corresponde al placement actual.
+`placement_epoch` identifica el contexto de placement vigente mediante BLAKE3 sobre una representación JSON canónica y versionada. Incluye el token, `desired_rf`, el conjunto ordenado de nodos elegibles y la versión del contrato HRW. Se usa para detectar evidencia antigua que ya no corresponde al placement actual.
 
 ## Protección por replication
 

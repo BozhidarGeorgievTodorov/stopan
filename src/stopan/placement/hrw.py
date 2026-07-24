@@ -8,8 +8,11 @@ elegir targets remotos sin mantener estado adicional de asignación.
 from __future__ import annotations
 
 import heapq
-from collections.abc import Iterable
 
+
+# Identifica el contrato de colocación usado por placement_epoch. Debe cambiar si
+# cambia el algoritmo, el hash o la serialización del mensaje de puntuación.
+HRW_PLACEMENT_SCHEME = "hrw-blake3-v1"
 
 
 def _hrw_score(chunk_hash: str, node_id: str, *, salt: str) -> int:
@@ -20,7 +23,7 @@ def _hrw_score(chunk_hash: str, node_id: str, *, salt: str) -> int:
         "{salt}|{node_id}|{chunk_hash}"
 
     Importante:
-      - no cambiar este formato una vez congelado, porque define el placement.
+      - cualquier cambio en este formato exige actualizar HRW_PLACEMENT_SCHEME
       - score mayor = mejor candidato.
     """
     import blake3
@@ -35,8 +38,8 @@ def hrw_top_k_node_ids(chunk_hash: str, node_ids, k: int, *, salt: str = "") -> 
     Devuelve los k mejores node_id según HRW.
 
     Contrato:
-      - si k <= 0, devuelve [].
-      - si k > número de nodos disponibles, devuelve todos los nodos rankeados.
+      - si k <= 0, devuelve []
+      - si k > número de nodos disponibles, devuelve todos los nodos rankeados
     """
     if k <= 0:
         return []

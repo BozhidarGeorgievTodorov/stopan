@@ -776,44 +776,40 @@ class MetadataDB:
             return
 
         self.conn.executemany("""
-            INSERT OR IGNORE INTO chunk_protection (
+            INSERT INTO chunk_protection (
                 chunk_hash, desired_rf, protection_state, protected_remote_copies,
                 placement_epoch, last_push_at, last_verify_at, last_error
             )
             VALUES (?, ?, ?, 0, NULL, NULL, NULL, NULL)
-        """, (
-            (chunk_hash, desired_rf, ProtectionState.PENDING.value)
-            for chunk_hash, desired_rf in rows
-        ))
-
-        self.conn.executemany("""
-            UPDATE chunk_protection
-            SET desired_rf = CASE WHEN desired_rf < ? THEN ? ELSE desired_rf END,
+            ON CONFLICT(chunk_hash) DO UPDATE SET
+                desired_rf = MAX(
+                    chunk_protection.desired_rf,
+                    excluded.desired_rf
+                ),
                 protection_state = CASE
-                    WHEN desired_rf < ? AND protection_state IN (?, ?)
+                    WHEN chunk_protection.desired_rf < excluded.desired_rf
+                         AND chunk_protection.protection_state IN (?, ?)
                     THEN ?
-                    ELSE protection_state
+                    ELSE chunk_protection.protection_state
                 END,
                 last_error = CASE
-                    WHEN desired_rf < ? AND protection_state IN (?, ?)
+                    WHEN chunk_protection.desired_rf < excluded.desired_rf
+                         AND chunk_protection.protection_state IN (?, ?)
                     THEN 'desired_rf increased'
-                    ELSE last_error
+                    ELSE chunk_protection.last_error
                 END
-            WHERE chunk_hash = ?
         """, (
             (
+                chunk_hash,
                 desired_rf,
-                desired_rf,
-                desired_rf,
+                ProtectionState.PENDING.value,
                 ProtectionState.PLACED.value,
                 ProtectionState.VERIFIED.value,
                 ProtectionState.DEGRADED.value,
-                desired_rf,
                 ProtectionState.PLACED.value,
                 ProtectionState.VERIFIED.value,
-                chunk_hash,
             )
-            for chunk_hash, _ in rows
+            for chunk_hash, desired_rf in rows
         ))
 
     def has_chunk(self, chunk_hash: str) -> bool:

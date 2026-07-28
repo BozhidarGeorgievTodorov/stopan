@@ -117,7 +117,7 @@ backup:
 
 `grpc` contiene parámetros comunes para canales gRPC.
 
-`max_message_bytes` limita el tamaño máximo de mensajes gRPC. Debe estar alineado con `storage.max_chunk_size` y con tamaños de packs/shards que se envían por RPC.
+`max_message_bytes` limita cada mensaje gRPC. Debe estar alineado con `storage.max_chunk_size` y con los shards que se envían en un único mensaje. Los metadata packs se transfieren como un flujo de bloques y su tamaño total queda limitado por `metadata.max_distributed_pack_bytes`.
 
 `keepalive_time_ms`, `keepalive_timeout_ms` y `keepalive_permit_without_calls` ajustan el comportamiento de keepalive de los canales. Estos valores solo suelen modificarse por requisitos de red o infraestructura.
 
@@ -183,7 +183,7 @@ replication:
 
 `target_parallelism` limita los targets consultados en paralelo.
 
-`probe_batch_hashes` se usa en verificación de replicación para agrupar hashes.
+`probe_batch_hashes` limita los chunks o shards incluidos en cada consulta remota de verificación.
 
 `probe_timeout_s` es el timeout de las consultas remotas de presencia.
 
@@ -282,7 +282,7 @@ membership:
 
 `cli_warning_limit` limita cuántos avisos o resultados se muestran en algunas salidas CLI de metadata.
 
-Los límites `max_distributed_pack_bytes`, `max_distributed_packs_per_owner`, `max_distributed_pack_bytes_per_owner` y `max_distributed_pack_store_bytes` protegen el store de packs recibidos frente a abuso o crecimiento descontrolado. Los límites por owner y por store deben ser al menos tan grandes como el tamaño máximo de un pack individual.
+Los límites `max_distributed_pack_bytes`, `max_distributed_packs_per_owner`, `max_distributed_pack_bytes_per_owner` y `max_distributed_pack_store_bytes` protegen el store de packs recibidos frente a abuso o crecimiento descontrolado. `max_distributed_pack_bytes` se aplica al paquete completo, aunque su publicación y recuperación se realicen mediante bloques gRPC. Los límites por owner y por store deben ser al menos tan grandes como el tamaño máximo de un pack individual.
 
 `scrypt_n`, `scrypt_r`, `scrypt_p` y `key_length` controlan la derivación criptográfica. `scrypt_n` debe ser potencia de dos y `key_length` debe ser al menos 32.
 

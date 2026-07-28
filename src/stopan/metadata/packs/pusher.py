@@ -1,8 +1,8 @@
 """
 Publicación de metadata packs en la red P2P.
 
-Selecciona targets remotos por HRW y almacena packs cifrados y firmados mediante
-MetadataPackService.StoreMetadataPack.
+Selecciona targets remotos por HRW y transmite packs cifrados y firmados mediante
+un flujo de bloques de MetadataPackService.StoreMetadataPack.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.signatures import sign_metadata_pack_hash
-from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
+from stopan.metadata.packs.hashes import calculate_pack_hash_file, validate_pack_hash
 from stopan.metadata.packs.remote import (
     MetadataPackTargetResult,
     select_metadata_pack_targets,
@@ -71,6 +71,7 @@ def push_metadata_pack_to_network(
     rpc_timeout_s: float,
     membership_timeout_s: float,
     max_message_bytes: int,
+    max_pack_bytes: int,
     grpc_keepalive_time_ms: int,
     grpc_keepalive_timeout_ms: int,
     grpc_keepalive_permit_without_calls: bool,
@@ -81,22 +82,26 @@ def push_metadata_pack_to_network(
     desired_rf = normalize_remote_rf(rf)
     parallelism = max(1, int(target_parallelism))
     max_message_bytes = int(max_message_bytes)
+    max_pack_bytes = max(1, int(max_pack_bytes))
 
     path = Path(pack_path).expanduser().resolve()
     try:
-        pack_data = path.read_bytes()
+        pack_size_bytes = int(path.stat().st_size)
     except OSError as exc:
-        raise MetadataPackPushError(f"No se pudo leer el metadata pack {path}: {exc}") from exc
-
-    if not pack_data:
+        raise MetadataPackPushError(f"No se pudo inspeccionar el metadata pack {path}: {exc}") from exc
+    if not path.is_file():
+        raise MetadataPackPushError(f"metadata pack no es un archivo regular: {path}")
+    if pack_size_bytes <= 0:
         raise MetadataPackPushError(f"metadata pack vacío: {path}")
-    if len(pack_data) > max_message_bytes:
+    if pack_size_bytes > max_pack_bytes:
         raise MetadataPackPushError(
-            f"metadata pack demasiado grande para gRPC: {len(pack_data)} bytes > max_message_bytes={max_message_bytes}. "
-            "Aumenta grpc.max_message_bytes o usa en el futuro un transporte de metadata packs por streaming/chunks."
+            f"metadata pack demasiado grande: {pack_size_bytes} bytes > {max_pack_bytes}"
         )
 
-    pack_hash = validate_pack_hash(calculate_pack_hash(pack_data))
+    try:
+        pack_hash = validate_pack_hash(calculate_pack_hash_file(path))
+    except OSError as exc:
+        raise MetadataPackPushError(f"No se pudo leer el metadata pack {path}: {exc}") from exc
     owner, public_key_b64, signature_b64 = sign_metadata_pack_hash(
         identity_file=identity_file,
         passphrase=identity_passphrase,
@@ -109,7 +114,7 @@ def push_metadata_pack_to_network(
             owner_id=owner,
             pack_hash=pack_hash,
             pack_path=path,
-            pack_size_bytes=len(pack_data),
+            pack_size_bytes=pack_size_bytes,
             stats=MetadataPackPushStats(
                 desired_rf=desired_rf,
                 remote_candidates=0,
@@ -154,7 +159,7 @@ def push_metadata_pack_to_network(
             owner_id=owner,
             pack_hash=pack_hash,
             pack_path=path,
-            pack_size_bytes=len(pack_data),
+            pack_size_bytes=pack_size_bytes,
             stats=MetadataPackPushStats(
                 desired_rf=desired_rf,
                 remote_candidates=remote_candidate_count,
@@ -187,7 +192,8 @@ def push_metadata_pack_to_network(
                     target,
                     owner_id=owner,
                     pack_hash=pack_hash,
-                    pack_data=pack_data,
+                    pack_path=path,
+                    pack_size_bytes=pack_size_bytes,
                     public_key_b64=public_key_b64,
                     signature_b64=signature_b64,
                     cluster_token=cluster_token,
@@ -212,7 +218,7 @@ def push_metadata_pack_to_network(
         owner_id=owner,
         pack_hash=pack_hash,
         pack_path=path,
-        pack_size_bytes=len(pack_data),
+        pack_size_bytes=pack_size_bytes,
         stats=MetadataPackPushStats(
             desired_rf=desired_rf,
             remote_candidates=remote_candidate_count,

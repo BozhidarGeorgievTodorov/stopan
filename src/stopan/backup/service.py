@@ -18,7 +18,7 @@ from .models import BackupRunStats
 from .policy import build_backup_fast_path_policy
 from .worker import process_file_worker
 from stopan.chunking.chunk_index import ChunkIndex
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
     export_metadata_object_graph_after_metadata_change,
@@ -103,7 +103,7 @@ def backup_directory(
     else:
         print("Fast-path: desactivado")
 
-    db = MetadataDB(db_file)
+    db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     snapshot_id: int | None = None
     snapshot_completed = False
 

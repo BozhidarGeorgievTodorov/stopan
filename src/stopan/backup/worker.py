@@ -15,7 +15,7 @@ from stopan.cas.repository import CASRepository
 from stopan.chunking.chunker import FileChunker
 from stopan.chunking.planner import ChunkPlanner
 from stopan.chunking.recipes import compute_recipe_hash
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 
 
 _thread_local = threading.local()
@@ -40,7 +40,11 @@ def get_thread_local_tools(*, local_shard_dir: str, db_file: str):
         _thread_local.tools_key = key
         _thread_local.chunker = FileChunker()
         _thread_local.repo = CASRepository(local_shard_dir)
-        _thread_local.db_ro = MetadataDB(db_file, init_schema=False)
+        _thread_local.db_ro = MetadataDB(
+            db_file,
+            init_schema=False,
+            access_mode=MetadataDBAccessMode.READ_ONLY,
+        )
 
     return _thread_local.chunker, _thread_local.repo, _thread_local.db_ro
 

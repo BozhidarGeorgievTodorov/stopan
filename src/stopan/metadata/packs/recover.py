@@ -7,17 +7,23 @@ con la identidad local e importa el estado más reciente recuperable.
 
 from __future__ import annotations
 
+import uuid
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from stopan.errors import StopanNetworkError, StopanStorageError
-from stopan.common.fs import atomic_write_bytes, ensure_private_dir
+from stopan.errors import StopanNetworkError
+from stopan.common.fs import atomic_copy_file, ensure_private_dir
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.service import MetadataObjectGraphStoreService
 from stopan.metadata.packs.object_pack import MetadataObjectPackService
-from stopan.metadata.packs.discovery import discover_metadata_packs_from_network
+from stopan.metadata.packs.discovery import (
+    MetadataPackDiscoveryEntry,
+    discover_metadata_packs_from_network,
+)
 from stopan.metadata.packs.hashes import validate_pack_hash
 from stopan.metadata.packs.payload import require_vault_id
 from stopan.metadata.packs.remote import (
@@ -81,6 +87,217 @@ class MetadataPackRecoverResult:
     db_import_result: Any | None
 
 
+@dataclass(frozen=True, slots=True)
+class _DownloadAttempt:
+    candidate: MetadataPackDiscoveryEntry
+    source: MetadataPackSource
+
+
+def _download_and_validate_candidate_source(
+    *,
+    attempt: _DownloadAttempt,
+    temp_dir: Path,
+    pack_service: MetadataObjectPackService,
+    identity_file: str | Path,
+    passphrase: str | bytes,
+    owner_id: str,
+    cluster_token: str,
+    rpc_timeout_s: float,
+    max_message_bytes: int,
+    max_pack_bytes: int,
+    grpc_keepalive_time_ms: int,
+    grpc_keepalive_timeout_ms: int,
+    grpc_keepalive_permit_without_calls: bool,
+) -> DownloadedMetadataPackCandidate:
+    candidate = attempt.candidate
+    source = attempt.source
+    temp_path = temp_dir / (
+        f".recover-{candidate.pack_hash[:16]}-{uuid.uuid4().hex}.stopanmetapack"
+    )
+
+    try:
+        _retrieve_pack_from_source(
+            source,
+            owner_id=owner_id,
+            out_path=temp_path,
+            cluster_token=cluster_token,
+            timeout_s=rpc_timeout_s,
+            max_message_bytes=max_message_bytes,
+            max_pack_bytes=max_pack_bytes,
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        )
+
+        inspection = pack_service.validate_pack(
+            temp_path,
+            identity_file=identity_file,
+            passphrase=passphrase,
+        )
+        if inspection.decrypted is None:
+            raise MetadataPackRecoverError(
+                "metadata pack no fue descifrado durante la validación"
+            )
+
+        summary = inspection.decrypted
+        return DownloadedMetadataPackCandidate(
+            pack_hash=candidate.pack_hash,
+            pack_path=temp_path,
+            source=source,
+            vault_id=summary.vault_id,
+            vault_generation=int(summary.vault_generation),
+            pack_created_at_unix=float(summary.pack_created_at_unix),
+            catalog_hash=summary.catalog_hash,
+            state_digest=summary.state_digest,
+            object_count=int(summary.object_count),
+            snapshot_count=int(summary.snapshot_count),
+            known_chunk_count=int(summary.known_chunk_count),
+            protection_record_count=int(summary.protection_record_count),
+        )
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _download_valid_metadata_pack_candidates(
+    *,
+    candidates: list[MetadataPackDiscoveryEntry],
+    parallelism: int,
+    temp_dir: Path,
+    pack_service: MetadataObjectPackService,
+    identity_file: str | Path,
+    passphrase: str | bytes,
+    owner_id: str,
+    cluster_token: str,
+    rpc_timeout_s: float,
+    max_message_bytes: int,
+    max_pack_bytes: int,
+    grpc_keepalive_time_ms: int,
+    grpc_keepalive_timeout_ms: int,
+    grpc_keepalive_permit_without_calls: bool,
+) -> tuple[list[DownloadedMetadataPackCandidate], int, list[str]]:
+    """Descarga candidatos con una sola fuente activa por paquete.
+
+    La cola intercala paquetes antes de reintentar sus fuentes alternativas.
+    Así se mantiene concurrencia entre candidatos sin descargar en paralelo dos
+    copias del mismo contenido.
+    """
+
+    ready = deque(candidate for candidate in candidates if candidate.sources)
+    if not ready:
+        return [], 0, []
+
+    valid_by_hash: dict[str, DownloadedMetadataPackCandidate] = {}
+    errors: list[str] = []
+    next_source_index = {candidate.pack_hash: 0 for candidate in ready}
+    max_workers = min(max(1, int(parallelism)), len(ready))
+    downloads_attempted = 0
+
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="metadata-pack-recover",
+    )
+    active: dict[Future[DownloadedMetadataPackCandidate], _DownloadAttempt] = {}
+
+    def submit_next(candidate: MetadataPackDiscoveryEntry) -> bool:
+        nonlocal downloads_attempted
+
+        source_index = next_source_index[candidate.pack_hash]
+        if source_index >= len(candidate.sources):
+            return False
+
+        attempt = _DownloadAttempt(
+            candidate=candidate,
+            source=candidate.sources[source_index],
+        )
+        next_source_index[candidate.pack_hash] = source_index + 1
+        future = executor.submit(
+            _download_and_validate_candidate_source,
+            attempt=attempt,
+            temp_dir=temp_dir,
+            pack_service=pack_service,
+            identity_file=identity_file,
+            passphrase=passphrase,
+            owner_id=owner_id,
+            cluster_token=cluster_token,
+            rpc_timeout_s=rpc_timeout_s,
+            max_message_bytes=max_message_bytes,
+            max_pack_bytes=max_pack_bytes,
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        )
+        active[future] = attempt
+        downloads_attempted += 1
+        return True
+
+    def fill_available_slots() -> None:
+        while ready and len(active) < max_workers:
+            candidate = ready.popleft()
+            if candidate.pack_hash in valid_by_hash:
+                continue
+            submit_next(candidate)
+
+    try:
+        fill_available_slots()
+
+        while active:
+            completed, _ = wait(
+                tuple(active),
+                return_when=FIRST_COMPLETED,
+            )
+
+            for future in completed:
+                attempt = active.pop(future)
+                try:
+                    downloaded = future.result()
+                except Exception as exc:
+                    errors.append(
+                        f"{attempt.candidate.pack_hash} desde "
+                        f"{_target_label(attempt.source)}: {exc}"
+                    )
+                    if (
+                        next_source_index[attempt.candidate.pack_hash]
+                        < len(attempt.candidate.sources)
+                    ):
+                        ready.append(attempt.candidate)
+                    continue
+
+                existing = valid_by_hash.get(downloaded.pack_hash)
+                if existing is None:
+                    valid_by_hash[downloaded.pack_hash] = downloaded
+                else:
+                    downloaded.pack_path.unlink(missing_ok=True)
+
+            fill_available_slots()
+
+    except BaseException:
+        for future in active:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+        for future in active:
+            if future.cancelled():
+                continue
+            try:
+                downloaded = future.result()
+            except BaseException:
+                continue
+            downloaded.pack_path.unlink(missing_ok=True)
+
+        for downloaded in valid_by_hash.values():
+            downloaded.pack_path.unlink(missing_ok=True)
+        raise
+
+    else:
+        executor.shutdown(wait=True, cancel_futures=False)
+
+    valid_downloads = [
+        valid_by_hash[pack_hash]
+        for pack_hash in sorted(valid_by_hash)
+    ]
+    return valid_downloads, downloads_attempted, errors
+
 
 def recover_metadata_from_network(
     *,
@@ -95,6 +312,7 @@ def recover_metadata_from_network(
     rpc_timeout_s: float,
     target_parallelism: int,
     max_message_bytes: int,
+    max_pack_bytes: int,
     grpc_keepalive_time_ms: int,
     grpc_keepalive_timeout_ms: int,
     grpc_keepalive_permit_without_calls: bool,
@@ -114,6 +332,7 @@ def recover_metadata_from_network(
     requested_vault_id = require_vault_id("vault_id", vault_id) if vault_id is not None else None
     object_store_path = Path(object_store_dir).expanduser().resolve() if object_store_dir is not None else None
     max_message_bytes = int(max_message_bytes)
+    max_pack_bytes = max(1, int(max_pack_bytes))
     parallelism = max(1, int(target_parallelism))
 
     try:
@@ -166,149 +385,116 @@ def recover_metadata_from_network(
         ensure_private_dir(base)
         selected_pack_path_base = base / "recovered.stopanmetapack"
 
-    download_errors: list[str] = []
-    downloads_attempted = 0
-    valid_downloads: list[DownloadedMetadataPackCandidate] = []
-
-    for candidate in candidates:
-        for source in candidate.sources:
-            downloads_attempted += 1
-            try:
-                data = _retrieve_pack_from_source(
-                    source,
-                    owner_id=owner,
-                    cluster_token=cluster_token,
-                    timeout_s=rpc_timeout_s,
-                    max_message_bytes=max_message_bytes,
-                    grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-                    grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-                    grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-                )
-
-                if pack_out is None:
-                    pack_path = selected_pack_path_base.with_name(f"recovered-{candidate.pack_hash}.stopanmetapack")
-                else:
-                    pack_path = selected_pack_path_base.with_name(
-                        f".{selected_pack_path_base.name}.{candidate.pack_hash}.{source.node_id[:8] or 'node'}.tmp"
-                    )
-
-                atomic_write_bytes(pack_path, data, mode=0o600)
-
-                inspection = pack_service.validate_pack(
-                    pack_path,
-                    identity_file=identity_file,
-                    passphrase=passphrase,
-                )
-                if inspection.decrypted is None:
-                    raise MetadataPackRecoverError("metadata pack no fue descifrado durante la validación")
-
-                summary = inspection.decrypted
-                valid_downloads.append(
-                    DownloadedMetadataPackCandidate(
-                        pack_hash=candidate.pack_hash,
-                        pack_path=pack_path,
-                        source=source,
-                        vault_id=summary.vault_id,
-                        vault_generation=int(summary.vault_generation),
-                        pack_created_at_unix=float(summary.pack_created_at_unix),
-                        catalog_hash=summary.catalog_hash,
-                        state_digest=summary.state_digest,
-                        object_count=int(summary.object_count),
-                        snapshot_count=int(summary.snapshot_count),
-                        known_chunk_count=int(summary.known_chunk_count),
-                        protection_record_count=int(summary.protection_record_count),
-                    )
-                )
-                break
-            except Exception as exc:
-                download_errors.append(f"{candidate.pack_hash} desde {_target_label(source)}: {exc}")
-                continue
+    valid_downloads, downloads_attempted, download_errors = (
+        _download_valid_metadata_pack_candidates(
+            candidates=candidates,
+            parallelism=parallelism,
+            temp_dir=selected_pack_path_base.parent,
+            pack_service=pack_service,
+            identity_file=identity_file,
+            passphrase=passphrase,
+            owner_id=owner,
+            cluster_token=cluster_token,
+            rpc_timeout_s=rpc_timeout_s,
+            max_message_bytes=max_message_bytes,
+            max_pack_bytes=max_pack_bytes,
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        )
+    )
 
     if valid_downloads:
-        selectable_downloads = valid_downloads
-        if requested_vault_id is not None:
-            selectable_downloads = [item for item in valid_downloads if item.vault_id == requested_vault_id]
-            if not selectable_downloads:
-                raise MetadataPackRecoverError(
-                    f"No se encontró ningún metadata pack válido para vault_id={requested_vault_id}"
-                )
-        elif requested_hash is None:
-            vault_ids = sorted({item.vault_id for item in valid_downloads})
-            if len(vault_ids) > 1:
-                raise MetadataPackRecoverError(
-                    "Se encontraron metadata packs de varios vault_id para el mismo owner_id: "
-                    + ", ".join(vault_ids)
-                    + ". Usa --vault-id o --target-hash para elegir uno."
-                )
+        try:
+            selectable_downloads = valid_downloads
+            if requested_vault_id is not None:
+                selectable_downloads = [
+                    item for item in valid_downloads
+                    if item.vault_id == requested_vault_id
+                ]
+                if not selectable_downloads:
+                    raise MetadataPackRecoverError(
+                        f"No se encontró ningún metadata pack válido para vault_id={requested_vault_id}"
+                    )
+            elif requested_hash is None:
+                vault_ids = sorted({item.vault_id for item in valid_downloads})
+                if len(vault_ids) > 1:
+                    raise MetadataPackRecoverError(
+                        "Se encontraron metadata packs de varios vault_id para el mismo owner_id: "
+                        + ", ".join(vault_ids)
+                        + ". Usa --vault-id o --target-hash para elegir uno."
+                    )
 
-        best = max(
-            selectable_downloads,
-            key=lambda item: (
-                int(item.vault_generation),
-                item.pack_hash,
-            ),
-        )
-
-        if pack_out is not None and best.pack_path != selected_pack_path_base:
-            try:
-                data = best.pack_path.read_bytes()
-            except OSError as exc:
-                raise StopanStorageError(f"No se pudo leer el metadata pack recuperado {best.pack_path}: {exc}") from exc
-            atomic_write_bytes(selected_pack_path_base, data, mode=0o600)
-            best_path = selected_pack_path_base
-        else:
-            best_path = best.pack_path
-
-        pack_import_result = None
-        db_import_result = None
-        if not download_only:
-            if object_store_path is None:
-                raise MetadataPackRecoverError(
-                    "Se requiere --object-store o metadata.object_store_dir para importar el pack recuperado."
-                )
-            pack_import_result = pack_service.import_pack(
-                best_path,
-                identity_file=identity_file,
-                object_store_dir=object_store_path,
-                passphrase=passphrase,
+            best = max(
+                selectable_downloads,
+                key=lambda item: (
+                    int(item.vault_generation),
+                    item.pack_hash,
+                ),
             )
-            if import_db:
-                db_import_result = graph_service.import_latest_state(
+
+            if pack_out is not None:
+                best_path = selected_pack_path_base
+            else:
+                best_path = selected_pack_path_base.with_name(
+                    f"recovered-{best.pack_hash}.stopanmetapack"
+                )
+
+            atomic_copy_file(best.pack_path, best_path, mode=0o600)
+
+            pack_import_result = None
+            db_import_result = None
+            if not download_only:
+                if object_store_path is None:
+                    raise MetadataPackRecoverError(
+                        "Se requiere --object-store o metadata.object_store_dir para importar el pack recuperado."
+                    )
+                pack_import_result = pack_service.import_pack(
+                    best_path,
+                    identity_file=identity_file,
                     object_store_dir=object_store_path,
                     passphrase=passphrase,
-                    include_protection=include_protection,
-                    default_desired_rf=int(default_desired_rf),
                 )
+                if import_db:
+                    db_import_result = graph_service.import_latest_state(
+                        object_store_dir=object_store_path,
+                        passphrase=passphrase,
+                        include_protection=include_protection,
+                        default_desired_rf=int(default_desired_rf),
+                    )
 
-        return MetadataPackRecoverResult(
-            owner_id=owner,
-            object_store_dir=object_store_path,
-            stats=MetadataPackRecoverStats(
-                candidates_seen=discovery.stats.sources_seen,
-                unique_packs_seen=discovery.stats.unique_packs_seen,
-                list_targets_attempted=discovery.stats.list_targets_attempted,
-                list_targets_succeeded=discovery.stats.list_targets_succeeded,
-                downloads_attempted=downloads_attempted,
-                list_errors=tuple(list_errors),
-                download_errors=tuple(download_errors),
-            ),
-            recovered_pack_hash=best.pack_hash,
-            vault_id=best.vault_id,
-            recovered_pack_path=best_path,
-            recovered_from_address=best.source.address,
-            recovered_from_node_id=best.source.node_id,
-            remote_stored_at_unix=float(best.source.stored_at_unix),
-            vault_generation=int(best.vault_generation),
-            pack_created_at_unix=float(best.pack_created_at_unix),
-            pack_catalog_hash=best.catalog_hash,
-            pack_state_digest=best.state_digest,
-            pack_object_count=best.object_count,
-            pack_snapshot_count=best.snapshot_count,
-            pack_known_chunk_count=best.known_chunk_count,
-            pack_protection_record_count=best.protection_record_count,
-            pack_import_result=pack_import_result,
-            db_import_result=db_import_result,
-        )
+            return MetadataPackRecoverResult(
+                owner_id=owner,
+                object_store_dir=object_store_path,
+                stats=MetadataPackRecoverStats(
+                    candidates_seen=discovery.stats.sources_seen,
+                    unique_packs_seen=discovery.stats.unique_packs_seen,
+                    list_targets_attempted=discovery.stats.list_targets_attempted,
+                    list_targets_succeeded=discovery.stats.list_targets_succeeded,
+                    downloads_attempted=downloads_attempted,
+                    list_errors=tuple(list_errors),
+                    download_errors=tuple(download_errors),
+                ),
+                recovered_pack_hash=best.pack_hash,
+                vault_id=best.vault_id,
+                recovered_pack_path=best_path,
+                recovered_from_address=best.source.address,
+                recovered_from_node_id=best.source.node_id,
+                remote_stored_at_unix=float(best.source.stored_at_unix),
+                vault_generation=int(best.vault_generation),
+                pack_created_at_unix=float(best.pack_created_at_unix),
+                pack_catalog_hash=best.catalog_hash,
+                pack_state_digest=best.state_digest,
+                pack_object_count=best.object_count,
+                pack_snapshot_count=best.snapshot_count,
+                pack_known_chunk_count=best.known_chunk_count,
+                pack_protection_record_count=best.protection_record_count,
+                pack_import_result=pack_import_result,
+                db_import_result=db_import_result,
+            )
+        finally:
+            for downloaded in valid_downloads:
+                downloaded.pack_path.unlink(missing_ok=True)
 
     message = "No se pudo descargar y validar ningún metadata pack válido."
     if download_errors:

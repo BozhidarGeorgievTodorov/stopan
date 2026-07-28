@@ -1,5 +1,5 @@
 """
-Cliente remoto mínimo para metadata packs.
+Cliente remoto para metadata packs transferidos por bloques.
 
 Comparte la infraestructura gRPC usada por push y recuperación sin mezclar la
 semántica de alto nivel de ambos comandos.
@@ -7,15 +7,19 @@ semántica de alto nivel de ambos comandos.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from collections.abc import Iterable
+import os
+from pathlib import Path
 
 import blake3
 import grpc
 
+from stopan.common.fs import ensure_private_dir, fsync_dir
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.signatures import verify_metadata_pack_signature
-from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
+from stopan.metadata.packs.hashes import validate_pack_hash
+from stopan.metadata.packs.streaming import iter_file_chunks, metadata_pack_stream_chunk_bytes
 from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
 from stopan.rpc.channels import temporary_insecure_channel
 
@@ -122,12 +126,38 @@ def select_metadata_pack_targets(
     return candidates[: max(0, int(rf))]
 
 
+def _store_metadata_pack_requests(
+    *,
+    pack_path: Path,
+    chunk_bytes: int,
+    cluster_token: str,
+    owner_id: str,
+    pack_hash: str,
+    pack_size_bytes: int,
+    public_key_b64: str,
+    signature_b64: str,
+) -> Iterator[object]:
+    yield p2p_storage_pb2.StoreMetadataPackRequest(
+        header=p2p_storage_pb2.StoreMetadataPackHeader(
+            cluster_token=str(cluster_token or ""),
+            owner_id=owner_id,
+            pack_hash=pack_hash,
+            size_bytes=int(pack_size_bytes),
+            public_key_b64=public_key_b64,
+            signature_b64=signature_b64,
+        )
+    )
+    for block in iter_file_chunks(pack_path, chunk_bytes=chunk_bytes):
+        yield p2p_storage_pb2.StoreMetadataPackRequest(chunk_data=block)
+
+
 def store_metadata_pack_on_target(
     target: MetadataPackTarget,
     *,
     owner_id: str,
     pack_hash: str,
-    pack_data: bytes,
+    pack_path: str | Path,
+    pack_size_bytes: int,
     public_key_b64: str,
     signature_b64: str,
     cluster_token: str,
@@ -137,6 +167,7 @@ def store_metadata_pack_on_target(
     grpc_keepalive_timeout_ms: int,
     grpc_keepalive_permit_without_calls: bool,
 ) -> MetadataPackTargetResult:
+    path = Path(pack_path).expanduser().resolve()
     try:
         with temporary_insecure_channel(
             target.address,
@@ -147,25 +178,59 @@ def store_metadata_pack_on_target(
         ) as channel:
             stub = p2p_storage_pb2_grpc.MetadataPackServiceStub(channel)
             response = stub.StoreMetadataPack(
-                p2p_storage_pb2.StoreMetadataPackRequest(
-                    cluster_token=str(cluster_token or ""),
+                _store_metadata_pack_requests(
+                    pack_path=path,
+                    chunk_bytes=metadata_pack_stream_chunk_bytes(max_message_bytes),
+                    cluster_token=cluster_token,
                     owner_id=owner_id,
                     pack_hash=pack_hash,
-                    pack_data=pack_data,
+                    pack_size_bytes=pack_size_bytes,
                     public_key_b64=public_key_b64,
                     signature_b64=signature_b64,
                 ),
                 timeout=float(timeout_s),
             )
+        status = int(response.status)
+        response_public_key_b64 = str(getattr(response, "public_key_b64", "") or "")
+        response_signature_b64 = str(getattr(response, "signature_b64", "") or "")
+        if status in {
+            p2p_storage_pb2.METADATA_PACK_STORE_STATUS_STORED,
+            p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ALREADY_PRESENT,
+        }:
+            response_owner_id = str(getattr(response, "owner_id", "") or "")
+            response_pack_hash = validate_pack_hash(
+                str(getattr(response, "pack_hash", "") or "")
+            )
+            response_size_bytes = int(getattr(response, "size_bytes", 0))
+            if response_owner_id != owner_id:
+                raise MetadataPackRemoteError(
+                    "la respuesta de almacenamiento devolvió un owner_id distinto: "
+                    f"esperado={owner_id} recibido={response_owner_id}"
+                )
+            if response_pack_hash != pack_hash:
+                raise MetadataPackRemoteError(
+                    "la respuesta de almacenamiento devolvió un pack_hash distinto: "
+                    f"esperado={pack_hash} recibido={response_pack_hash}"
+                )
+            if response_size_bytes != int(pack_size_bytes):
+                raise MetadataPackRemoteError(
+                    "la respuesta de almacenamiento devolvió un tamaño distinto: "
+                    f"esperado={int(pack_size_bytes)} recibido={response_size_bytes}"
+                )
+            if response_public_key_b64 != public_key_b64 or response_signature_b64 != signature_b64:
+                raise MetadataPackRemoteError(
+                    "la respuesta de almacenamiento devolvió un sidecar de firma distinto"
+                )
+
         return MetadataPackTargetResult(
             node_id=target.node_id,
             address=target.address,
-            status=int(response.status),
+            status=status,
             detail=str(response.detail or ""),
             size_bytes=int(response.size_bytes),
             stored_at_unix=float(response.stored_at_unix),
-            public_key_b64=str(getattr(response, "public_key_b64", "") or ""),
-            signature_b64=str(getattr(response, "signature_b64", "") or ""),
+            public_key_b64=response_public_key_b64,
+            signature_b64=response_signature_b64,
         )
     except grpc.RpcError as exc:
         detail = exc.details() or str(exc)
@@ -328,57 +393,161 @@ def retrieve_metadata_pack_from_source(
     source: MetadataPackSource,
     *,
     owner_id: str,
+    out_path: str | Path,
     cluster_token: str,
     timeout_s: float,
     max_message_bytes: int,
+    max_pack_bytes: int,
     grpc_keepalive_time_ms: int,
     grpc_keepalive_timeout_ms: int,
     grpc_keepalive_permit_without_calls: bool,
-) -> bytes:
-    if source.size_bytes > int(max_message_bytes):
-        raise MetadataPackRemoteError(
-            f"metadata pack {source.pack_hash} anunciado por {metadata_pack_target_label(source)} supera max_message_bytes: "
-            f"{source.size_bytes} > {int(max_message_bytes)}"
-        )
+) -> Path:
+    destination = Path(out_path).expanduser().resolve()
+    ensure_private_dir(destination.parent)
+    partial = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{os.urandom(8).hex()}.part"
+    )
+    published = False
 
-    with temporary_insecure_channel(
-        source.address,
-        max_message_bytes=max_message_bytes,
-        keepalive_time_ms=grpc_keepalive_time_ms,
-        keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-        keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
-    ) as channel:
-        stub = p2p_storage_pb2_grpc.MetadataPackServiceStub(channel)
-        response = stub.RetrieveMetadataPack(
-            p2p_storage_pb2.RetrieveMetadataPackRequest(
-                cluster_token=str(cluster_token or ""),
+    try:
+        with temporary_insecure_channel(
+            source.address,
+            max_message_bytes=max_message_bytes,
+            keepalive_time_ms=grpc_keepalive_time_ms,
+            keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        ) as channel:
+            stub = p2p_storage_pb2_grpc.MetadataPackServiceStub(channel)
+            responses = iter(
+                stub.RetrieveMetadataPack(
+                    p2p_storage_pb2.RetrieveMetadataPackRequest(
+                        cluster_token=str(cluster_token or ""),
+                        owner_id=owner_id,
+                        pack_hash=source.pack_hash,
+                    ),
+                    timeout=float(timeout_s),
+                )
+            )
+
+            try:
+                first = next(responses)
+            except StopIteration as exc:
+                raise MetadataPackRemoteError(
+                    f"retrieve {source.pack_hash} desde {metadata_pack_target_label(source)} no devolvió cabecera"
+                ) from exc
+
+            if first.WhichOneof("part") != "header":
+                raise MetadataPackRemoteError(
+                    f"retrieve {source.pack_hash} desde {metadata_pack_target_label(source)} comenzó sin cabecera"
+                )
+            header = first.header
+            if int(header.status) != p2p_storage_pb2.METADATA_PACK_RETRIEVE_STATUS_FOUND:
+                raise MetadataPackRemoteError(
+                    f"retrieve {source.pack_hash} desde {metadata_pack_target_label(source)} falló: "
+                    f"status={int(header.status)} detail={header.detail or ''}"
+                )
+
+            received_owner = str(header.owner_id or "")
+            received_hash = validate_pack_hash(str(header.pack_hash or ""))
+            declared_size = int(header.size_bytes)
+            if received_owner != owner_id:
+                raise MetadataPackRemoteError(
+                    f"owner_id descargado no coincide desde {metadata_pack_target_label(source)}: "
+                    f"esperado={owner_id} recibido={received_owner}"
+                )
+            if received_hash != source.pack_hash:
+                raise MetadataPackRemoteError(
+                    f"pack_hash anunciado no coincide desde {metadata_pack_target_label(source)}: "
+                    f"esperado={source.pack_hash} recibido={received_hash}"
+                )
+            if declared_size <= 0:
+                raise MetadataPackRemoteError(
+                    f"metadata pack {source.pack_hash} anunció un tamaño inválido: {declared_size}"
+                )
+            if declared_size > int(max_pack_bytes):
+                raise MetadataPackRemoteError(
+                    f"metadata pack {source.pack_hash} supera el límite local: "
+                    f"{declared_size} > {int(max_pack_bytes)}"
+                )
+            if source.size_bytes > 0 and declared_size != int(source.size_bytes):
+                raise MetadataPackRemoteError(
+                    f"tamaño anunciado no coincide desde {metadata_pack_target_label(source)}: "
+                    f"esperado={int(source.size_bytes)} recibido={declared_size}"
+                )
+
+            public_key_b64 = str(header.public_key_b64 or source.public_key_b64 or "")
+            signature_b64 = str(header.signature_b64 or source.signature_b64 or "")
+            if not verify_metadata_pack_signature(
                 owner_id=owner_id,
+                public_key_b64=public_key_b64,
+                signature_b64=signature_b64,
                 pack_hash=source.pack_hash,
-            ),
-            timeout=float(timeout_s),
-        )
-    if int(response.status) != p2p_storage_pb2.METADATA_PACK_RETRIEVE_STATUS_FOUND:
+            ):
+                raise MetadataPackRemoteError(
+                    f"firma de metadata pack inválida desde {metadata_pack_target_label(source)}: "
+                    f"{source.pack_hash}"
+                )
+
+            hasher = blake3.blake3()
+            received_size = 0
+            try:
+                fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError as exc:
+                raise MetadataPackRemoteError(
+                    f"No se pudo crear el temporal de recuperación {partial}: {exc}"
+                ) from exc
+
+            with os.fdopen(fd, "wb") as fh:
+                for response in responses:
+                    if response.WhichOneof("part") != "chunk_data":
+                        raise MetadataPackRemoteError(
+                            f"retrieve {source.pack_hash} recibió una parte inesperada"
+                        )
+                    block = bytes(response.chunk_data)
+                    if not block:
+                        continue
+                    received_size += len(block)
+                    if received_size > declared_size:
+                        raise MetadataPackRemoteError(
+                            f"metadata pack {source.pack_hash} excede el tamaño anunciado: "
+                            f"{received_size} > {declared_size}"
+                        )
+                    hasher.update(block)
+                    fh.write(block)
+                fh.flush()
+                os.fsync(fh.fileno())
+
+        if received_size != declared_size:
+            raise MetadataPackRemoteError(
+                f"metadata pack {source.pack_hash} incompleto: "
+                f"esperado={declared_size} recibido={received_size}"
+            )
+        calculated = hasher.hexdigest()
+        if calculated != source.pack_hash:
+            raise MetadataPackRemoteError(
+                f"pack_hash descargado no coincide desde {metadata_pack_target_label(source)}: "
+                f"esperado={source.pack_hash} calculado={calculated}"
+            )
+
+        try:
+            os.replace(partial, destination)
+        except OSError as exc:
+            raise MetadataPackRemoteError(
+                f"No se pudo publicar el metadata pack recuperado {destination}: {exc}"
+            ) from exc
+        published = True
+        fsync_dir(destination.parent)
+        return destination
+    except grpc.RpcError as exc:
         raise MetadataPackRemoteError(
-            f"retrieve {source.pack_hash} desde {metadata_pack_target_label(source)} falló: "
-            f"status={int(response.status)} detail={response.detail or ''}"
-        )
-    data = bytes(response.pack_data)
-    calculated = calculate_pack_hash(data)
-    if calculated != source.pack_hash:
-        raise MetadataPackRemoteError(
-            f"pack_hash descargado no coincide desde {metadata_pack_target_label(source)}: "
-            f"esperado={source.pack_hash} calculado={calculated}"
-        )
-    public_key_b64 = str(getattr(response, "public_key_b64", "") or source.public_key_b64 or "")
-    signature_b64 = str(getattr(response, "signature_b64", "") or source.signature_b64 or "")
-    if not verify_metadata_pack_signature(
-        owner_id=owner_id,
-        public_key_b64=public_key_b64,
-        signature_b64=signature_b64,
-        pack_hash=source.pack_hash,
-    ):
-        raise MetadataPackRemoteError(
-            f"firma de metadata pack inválida desde {metadata_pack_target_label(source)}: "
-            f"{source.pack_hash}"
-        )
-    return data
+            f"{metadata_pack_target_label(source)}: {exc.details() or str(exc)}"
+        ) from exc
+    finally:
+        if not published:
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+

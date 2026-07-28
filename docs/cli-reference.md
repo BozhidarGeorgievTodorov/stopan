@@ -415,7 +415,7 @@ Validaciones relevantes:
 --scope snapshot requiere --snapshot-id.
 --pack-hash solo aplica a EC.
 --pack-hash no se puede combinar con --scope ni --snapshot-id.
---probe-batch-hashes solo aplica a replication.
+--probe-batch-hashes limita el tamaño de los lotes remotos en replication y ec.
 ```
 
 El comando devuelve `0` si no detecta degradación. En replication devuelve `2` si hay chunks degradados. En EC devuelve `2` si hay packs degradados o fallidos.
@@ -913,7 +913,7 @@ Distribuye metadata packs a nodos remotos. Si se pasa `--pack-in`, distribuye es
 
 `--strict-pack-copies` exige suficientes targets remotos antes de distribuir. `--no-strict-pack-copies` fuerza modo no estricto para esa ejecución.
 
-`--target-parallelism`, `--rpc-timeout-s` y `--max-message-bytes` ajustan concurrencia, tiempo máximo de espera y tamaño máximo de mensaje durante la distribución del pack.
+`--target-parallelism`, `--rpc-timeout-s` y `--max-message-bytes` ajustan la concurrencia, el tiempo máximo de espera y el límite de cada mensaje del flujo. El tamaño completo del pack queda limitado por `metadata.max_distributed_pack_bytes`.
 
 Validaciones relevantes:
 
@@ -1023,7 +1023,7 @@ Opciones:
 
 Recupera metadata desde packs distribuidos. Descubre packs remotos del owner, elige uno válido, lo descarga, valida firma/hash, lo importa al object store local y, por defecto, reconstruye `_metadata.db`.
 
-`--target-parallelism`, `--rpc-timeout-s` y `--max-message-bytes` controlan la búsqueda y descarga remota de packs.
+`--target-parallelism`, `--rpc-timeout-s` y `--max-message-bytes` controlan la búsqueda y la descarga remota. El pack se recibe por bloques, se valida mientras se escribe en un temporal y solo se publica tras comprobar su tamaño, firma y hash.
 
 `--target-hash` fuerza un pack concreto.
 

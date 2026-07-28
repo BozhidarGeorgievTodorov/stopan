@@ -14,9 +14,9 @@ service P2PStorage {
 }
 
 service MetadataPackService {
-  rpc StoreMetadataPack(StoreMetadataPackRequest) returns (StoreMetadataPackResponse);
+  rpc StoreMetadataPack(stream StoreMetadataPackRequest) returns (StoreMetadataPackResponse);
   rpc ListMetadataPacks(ListMetadataPacksRequest) returns (ListMetadataPacksResponse);
-  rpc RetrieveMetadataPack(RetrieveMetadataPackRequest) returns (RetrieveMetadataPackResponse);
+  rpc RetrieveMetadataPack(RetrieveMetadataPackRequest) returns (stream RetrieveMetadataPackResponse);
   rpc ProbeMetadataPack(ProbeMetadataPackRequest) returns (ProbeMetadataPackResponse);
 }
 
@@ -160,13 +160,20 @@ enum MetadataPackProbeStatus {
   METADATA_PACK_PROBE_STATUS_ERROR = 3;
 }
 
-message StoreMetadataPackRequest {
+message StoreMetadataPackHeader {
   string cluster_token = 1;
   string owner_id = 2;
   string pack_hash = 3;
-  bytes pack_data = 4;
+  int64 size_bytes = 4;
   string public_key_b64 = 5;
   string signature_b64 = 6;
+}
+
+message StoreMetadataPackRequest {
+  oneof part {
+    StoreMetadataPackHeader header = 1;
+    bytes chunk_data = 2;
+  }
 }
 
 message StoreMetadataPackResponse {
@@ -204,16 +211,22 @@ message RetrieveMetadataPackRequest {
   string pack_hash = 3;
 }
 
-message RetrieveMetadataPackResponse {
+message RetrieveMetadataPackHeader {
   MetadataPackRetrieveStatus status = 1;
   string detail = 2;
   string owner_id = 3;
   string pack_hash = 4;
-  bytes pack_data = 5;
-  int64 size_bytes = 6;
-  double stored_at_unix = 7;
-  string public_key_b64 = 8;
-  string signature_b64 = 9;
+  int64 size_bytes = 5;
+  double stored_at_unix = 6;
+  string public_key_b64 = 7;
+  string signature_b64 = 8;
+}
+
+message RetrieveMetadataPackResponse {
+  oneof part {
+    RetrieveMetadataPackHeader header = 1;
+    bytes chunk_data = 2;
+  }
 }
 
 message ProbeMetadataPackRequest {

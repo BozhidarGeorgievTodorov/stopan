@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import blake3
 
 from stopan.errors import StopanDataError
@@ -20,6 +22,22 @@ def calculate_pack_hash(data: bytes) -> str:
     if not isinstance(data, bytes):
         raise MetadataPackHashTypeError("metadata pack data debe ser bytes")
     return blake3.blake3(data).hexdigest()
+
+
+def calculate_pack_hash_file(path: str | Path, *, block_size: int = 1024 * 1024) -> str:
+    pack_path = Path(path).expanduser().resolve()
+    size = int(block_size)
+    if size <= 0:
+        raise MetadataPackHashValueError("block_size debe ser > 0")
+
+    hasher = blake3.blake3()
+    with pack_path.open("rb") as fh:
+        while True:
+            block = fh.read(size)
+            if not block:
+                break
+            hasher.update(block)
+    return hasher.hexdigest()
 
 
 def validate_pack_hash(value: str, *, name: str = "pack_hash") -> str:

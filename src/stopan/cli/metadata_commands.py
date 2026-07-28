@@ -27,9 +27,9 @@ from stopan.metadata.identity import (
     sign_metadata_pack_hash,
     validate_owner_id,
 )
-from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
+from stopan.metadata.packs.hashes import calculate_pack_hash, calculate_pack_hash_file, validate_pack_hash
 from stopan.metadata.packs.object_pack import MetadataObjectPackService
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 
 
 def _configured_warning_limit(cfg) -> int:
@@ -54,6 +54,7 @@ def _metadata_pack_network_kwargs(args: argparse.Namespace, cfg) -> dict[str, ob
 def _metadata_pack_push_kwargs(args: argparse.Namespace, cfg) -> dict[str, object]:
     values = _metadata_pack_network_kwargs(args, cfg)
     values.update(
+        max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),
         rf=int(choose(args.pack_copies, cfg.metadata.pack_copies)),
         strict_rf=bool(choose(args.strict_pack_copies, cfg.metadata.strict_pack_copies)),
     )
@@ -252,10 +253,9 @@ def cmd_local_store_pack(args: argparse.Namespace) -> int:
     identity_file = identity_file_from_args(args, cfg)
     pack_path = Path(args.path).expanduser().resolve()
     try:
-        pack_data = pack_path.read_bytes()
+        calculated_pack_hash = validate_pack_hash(calculate_pack_hash_file(pack_path))
     except OSError as exc:
         raise StopanStorageError(f"No se pudo leer el metadata pack {pack_path}: {exc}") from exc
-    calculated_pack_hash = validate_pack_hash(calculate_pack_hash(pack_data))
     if args.expected_pack_hash is not None and validate_pack_hash(args.expected_pack_hash) != calculated_pack_hash:
         raise StopanDataError(
             f"pack_hash esperado no coincide con fichero: "
@@ -620,7 +620,11 @@ def find_reusable_latest_object_pack(
 
 
 def metadata_pack_publication_maps(cfg, *, owner_id: str) -> tuple[dict[str, int], dict[str, float]]:
-    db = MetadataDB(cfg.node.db_file)
+    db = MetadataDB(
+        cfg.node.db_file,
+        init_schema=False,
+        access_mode=MetadataDBAccessMode.READ_ONLY,
+    )
     try:
         publications = db.get_metadata_pack_publications(owner_id=owner_id)
         return (
@@ -665,7 +669,10 @@ def record_metadata_pack_publication(cfg, result) -> None:
     if desired < 1:
         return
 
-    db = MetadataDB(cfg.node.db_file)
+    db = MetadataDB(
+        cfg.node.db_file,
+        access_mode=MetadataDBAccessMode.READ_WRITE,
+    )
     try:
         db.record_metadata_pack_publication(
             owner_id=result.owner_id,
@@ -806,6 +813,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         object_store_dir=object_store_dir,
         passphrase=passphrase,
         **_metadata_pack_network_kwargs(args, cfg),
+        max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),
         scrypt_cost=scrypt_cost_from_args(args, cfg),
         db_file=cfg.node.db_file,
         import_db=bool(args.import_db),

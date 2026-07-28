@@ -15,7 +15,7 @@ _MEMBERSHIP_DISCOVERY_HELP = "Seed de membership para descubrir nodos remotos. D
 _PACK_TARGET_PARALLELISM_HELP = (
     "Número de nodos remotos consultados en paralelo. Default: metadata.pack_target_parallelism."
 )
-_PACK_MAX_MESSAGE_HELP = "Límite gRPC de mensaje. Default: grpc.max_message_bytes."
+_PACK_MAX_MESSAGE_HELP = "Límite gRPC por mensaje durante el flujo del pack. Default: grpc.max_message_bytes."
 
 
 def _add_owner_identity_args(parser: argparse.ArgumentParser) -> None:
@@ -285,7 +285,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     _add_metadata_pack_query_args(
         recover_parser,
         rpc_timeout_help="Timeout de RPC List/RetrieveMetadataPack. Default: metadata.pack_rpc_timeout_s.",
-        max_message_help="Límite gRPC de mensaje para descargar packs. Default: grpc.max_message_bytes.",
+        max_message_help="Límite gRPC por mensaje durante la descarga por flujo. Default: grpc.max_message_bytes.",
     )
     recover_parser.add_argument(
         "--download-dir",

@@ -8,7 +8,7 @@ CAS local, CAS P2P local, resolución lazy de cluster, cliente remoto y restorer
 from __future__ import annotations
 
 from stopan.cas.repository import CASRepository
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 from stopan.restore.cluster import LazyClusterResolver
 from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
 from stopan.restore.ec_fetch import ErasureChunkRecoveryService
@@ -52,7 +52,11 @@ def restore_snapshot(
     use_remote_chunks = remote_recovery in {"replication", "auto"}
     use_ec_recovery = remote_recovery in {"ec", "auto"}
 
-    db = MetadataDB(db_file)
+    db = MetadataDB(
+        db_file,
+        init_schema=False,
+        access_mode=MetadataDBAccessMode.READ_ONLY,
+    )
     remote_pool: RemoteStorageClientPool | None = None
     ec_remote_pool: RemoteDataPackShardClientPool | None = None
     cluster_resolver: LazyClusterResolver | None = None

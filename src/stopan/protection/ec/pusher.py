@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from stopan.cas.repository import CASRepository
-from stopan.metadata.database import ErasureDataPackRecord, MetadataDB
+from stopan.metadata.database import (
+    ErasureDataPackRecord,
+    MetadataDB,
+    MetadataDBAccessMode,
+)
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
     export_after_successful_metadata_change,
@@ -79,7 +83,7 @@ def push_erasure_data_packs_to_network(
     cluster_token = str(cluster_token or "")
 
     repo = CASRepository(local_shard_dir)
-    db = MetadataDB(db_file)
+    db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     pool: RemoteDataPackShardClientPool | None = None
     metadata_changed = False
 

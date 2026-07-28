@@ -86,3 +86,73 @@ def atomic_write_bytes(
                 pass
             except OSError:
                 pass
+
+
+def atomic_copy_file(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    mode: int = 0o600,
+    block_size: int = 1024 * 1024,
+    sync_parent_dir: bool = True,
+) -> None:
+    source_path = Path(source).expanduser().resolve()
+    destination_path = Path(destination).expanduser().resolve()
+    size = int(block_size)
+    if size <= 0:
+        raise ValueError("block_size debe ser > 0")
+
+    ensure_private_dir(destination_path.parent)
+    temp_path = destination_path.with_name(
+        f".{destination_path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+    )
+    published = False
+    try:
+        try:
+            source_fh = source_path.open("rb")
+        except OSError as exc:
+            raise StopanStorageOSError(
+                f"No se pudo abrir el archivo de origen {source_path}: {exc}"
+            ) from exc
+
+        try:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except OSError as exc:
+            source_fh.close()
+            raise StopanStorageOSError(
+                f"No se pudo crear el archivo temporal {temp_path}: {exc}"
+            ) from exc
+
+        try:
+            with source_fh, os.fdopen(fd, "wb") as destination_fh:
+                while True:
+                    block = source_fh.read(size)
+                    if not block:
+                        break
+                    destination_fh.write(block)
+                destination_fh.flush()
+                os.fsync(destination_fh.fileno())
+        except OSError as exc:
+            raise StopanStorageOSError(
+                f"No se pudo copiar {source_path} a {temp_path}: {exc}"
+            ) from exc
+
+        try:
+            os.chmod(temp_path, mode)
+            os.replace(temp_path, destination_path)
+        except OSError as exc:
+            raise StopanStorageOSError(
+                f"No se pudo reemplazar {destination_path} con {temp_path}: {exc}"
+            ) from exc
+        published = True
+        if sync_parent_dir:
+            fsync_dir(destination_path.parent)
+    finally:
+        if not published:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+

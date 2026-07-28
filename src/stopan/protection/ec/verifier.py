@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stopan.metadata.database import MetadataDB, ErasureDataPackRecord
+from stopan.common.batching import iter_batches
+from stopan.metadata.database import (
+    ErasureDataPackRecord,
+    ErasureDataPackVerificationUpdate,
+    MetadataDB,
+    MetadataDBAccessMode,
+)
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
     export_after_successful_metadata_change,
@@ -29,10 +35,25 @@ class ErasureVerificationStats:
 
 
 @dataclass(frozen=True)
-class _ShardProbeOutcome:
-    address: str
-    present_indexes: frozenset[int]
+class _AddressProbeOutcome:
+    completed_keys: frozenset[tuple[str, int, str]]
+    missing_keys: frozenset[tuple[str, int, str]]
     error: str | None = None
+
+
+@dataclass
+class _PackVerificationAccumulator:
+    pack: ErasureDataPackRecord
+    total_shards: int
+    verified_shard_indexes: set[int]
+    errors: list[str]
+    metadata_complete: bool
+
+    @property
+    def error_summary(self) -> str | None:
+        if not self.errors:
+            return None
+        return "; ".join(self.errors)[:1800]
 
 
 class ErasureDataPackVerifier:
@@ -42,11 +63,13 @@ class ErasureDataPackVerifier:
         db: MetadataDB,
         client_pool: RemoteDataPackShardClientPool,
         target_parallelism: int,
+        probe_batch_hashes: int,
         cluster,
     ):
         self.db = db
         self.client_pool = client_pool
         self.target_parallelism = max(1, int(target_parallelism))
+        self.probe_batch_hashes = max(1, int(probe_batch_hashes))
         self.cluster = cluster
 
     def verify(self, candidates: list[ErasureDataPackRecord]) -> ErasureVerificationStats:
@@ -56,21 +79,20 @@ class ErasureDataPackVerifier:
 
         print(f"Verify EC: {len(candidates)} data packs candidatos")
 
+        outcomes, rpc_failures = self._verify_candidates(candidates)
         verified = 0
         degraded = 0
         failed = 0
-        rpc_failures = 0
+        updates: list[ErasureDataPackVerificationUpdate] = []
 
-        for pack in candidates:
-            outcome = self._verify_pack(pack)
-            if outcome.error and "RPC" in outcome.error:
-                rpc_failures += 1
-
-            self.db.mark_erasure_data_pack_verification(
-                pack.pack_hash,
-                protection_state=outcome.protection_state,
-                verified_shard_indexes=outcome.verified_shard_indexes,
-                error=outcome.error,
+        for pack, outcome in zip(candidates, outcomes, strict=True):
+            updates.append(
+                ErasureDataPackVerificationUpdate(
+                    pack_hash=pack.pack_hash,
+                    protection_state=outcome.protection_state,
+                    verified_shard_indexes=tuple(sorted(outcome.verified_shard_indexes)),
+                    error=outcome.error,
+                )
             )
 
             if outcome.protection_state == ProtectionState.VERIFIED:
@@ -79,17 +101,20 @@ class ErasureDataPackVerifier:
                 degraded += 1
                 print(
                     f"   pack={pack.pack_hash[:8]} DEGRADED: "
-                    f"shards={len(outcome.verified_shard_indexes)}/{pack.data_shards + pack.parity_shards} "
+                    f"shards={len(outcome.verified_shard_indexes)}/"
+                    f"{pack.data_shards + pack.parity_shards} "
                     f"error={outcome.error}"
                 )
             else:
                 failed += 1
                 print(
                     f"   pack={pack.pack_hash[:8]} FAILED: "
-                    f"shards={len(outcome.verified_shard_indexes)}/{pack.data_shards + pack.parity_shards} "
+                    f"shards={len(outcome.verified_shard_indexes)}/"
+                    f"{pack.data_shards + pack.parity_shards} "
                     f"error={outcome.error}"
                 )
 
+        self.db.apply_erasure_data_pack_verifications(updates)
         return ErasureVerificationStats(
             candidates=len(candidates),
             verified=verified,
@@ -98,112 +123,174 @@ class ErasureDataPackVerifier:
             rpc_failures=rpc_failures,
         )
 
-    def _verify_pack(self, pack: ErasureDataPackRecord) -> "_PackVerificationOutcome":
-        shard_rows = self.db.get_erasure_pack_shards(pack.pack_hash)
-        total_shards = pack.data_shards + pack.parity_shards
-
-        if len(shard_rows) < total_shards:
-            verified_indexes = {row.shard_index for row in shard_rows}
-            return _PackVerificationOutcome(
-                protection_state=ProtectionState.FAILED,
-                verified_shard_indexes=frozenset(verified_indexes),
-                error=(
-                    "metadata EC incompleta: "
-                    f"registered_shards={len(shard_rows)} total_shards={total_shards}"
-                ),
-            )
-
-        target_groups = group_erasure_shard_refs_by_address(
-            shard_rows=shard_rows,
-            node_addresses=self.cluster.node_addresses,
-            short_node_ids_in_errors=True,
-        )
-        refs_by_addr = target_groups.refs_by_address
-        verified_indexes: set[int] = set()
-        errors = list(target_groups.offline_errors)
-
-        outcomes = self._probe_targets(refs_by_addr)
-
-        for outcome in outcomes:
-            verified_indexes.update(outcome.present_indexes)
-            if outcome.error:
-                errors.append(outcome.error)
-
-        if len(verified_indexes) >= total_shards:
-            return _PackVerificationOutcome(
-                protection_state=ProtectionState.VERIFIED,
-                verified_shard_indexes=frozenset(verified_indexes),
-                error=None,
-            )
-
-        error_summary = "; ".join(errors)[:1800] if errors else (
-            f"verified_shards={len(verified_indexes)}/{total_shards}"
-        )
-        protection_state = data_pack_state(
-            protected_shards=len(verified_indexes),
-            data_shards=pack.data_shards,
-            total_shards=total_shards,
-        )
-        return _PackVerificationOutcome(
-            protection_state=protection_state,
-            verified_shard_indexes=frozenset(verified_indexes),
-            error=error_summary,
-        )
-
-    def _probe_targets(
+    def _verify_candidates(
         self,
-        refs_by_addr: dict[str, list[RemoteDataPackShardRef]],
-    ) -> list[_ShardProbeOutcome]:
-        max_workers = min(self.target_parallelism, len(refs_by_addr))
-        if max_workers <= 0:
-            return []
+        candidates: list[ErasureDataPackRecord],
+    ) -> tuple[list["_PackVerificationOutcome"], int]:
+        shard_rows_by_pack = self.db.get_erasure_pack_shards_many(
+            pack.pack_hash for pack in candidates
+        )
+        accumulators: dict[str, _PackVerificationAccumulator] = {}
+        refs_by_address: dict[str, list[RemoteDataPackShardRef]] = {}
 
-        outcomes: list[_ShardProbeOutcome] = []
+        for pack in candidates:
+            shard_rows = shard_rows_by_pack.get(pack.pack_hash, [])
+            total_shards = pack.data_shards + pack.parity_shards
+            metadata_complete = len(shard_rows) >= total_shards
+            accumulator = _PackVerificationAccumulator(
+                pack=pack,
+                total_shards=total_shards,
+                verified_shard_indexes=set(),
+                errors=[],
+                metadata_complete=metadata_complete,
+            )
+            accumulators[pack.pack_hash] = accumulator
+
+            if not metadata_complete:
+                accumulator.verified_shard_indexes.update(
+                    row.shard_index for row in shard_rows
+                )
+                accumulator.errors.append(
+                    "metadata EC incompleta: "
+                    f"registered_shards={len(shard_rows)} "
+                    f"total_shards={total_shards}"
+                )
+                continue
+
+            target_groups = group_erasure_shard_refs_by_address(
+                shard_rows=shard_rows,
+                node_addresses=self.cluster.node_addresses,
+                short_node_ids_in_errors=True,
+            )
+            accumulator.errors.extend(target_groups.offline_errors)
+            for address, refs in target_groups.refs_by_address.items():
+                refs_by_address.setdefault(address, []).extend(refs)
+
+        rpc_failures = self._probe_global_targets(
+            refs_by_address=refs_by_address,
+            accumulators=accumulators,
+        )
+
+        outcomes: list[_PackVerificationOutcome] = []
+        for pack in candidates:
+            accumulator = accumulators[pack.pack_hash]
+            if not accumulator.metadata_complete:
+                state = ProtectionState.FAILED
+                error = accumulator.error_summary
+            elif len(accumulator.verified_shard_indexes) >= accumulator.total_shards:
+                state = ProtectionState.VERIFIED
+                error = None
+            else:
+                state = data_pack_state(
+                    protected_shards=len(accumulator.verified_shard_indexes),
+                    data_shards=pack.data_shards,
+                    total_shards=accumulator.total_shards,
+                )
+                error = accumulator.error_summary or (
+                    "verified_shards="
+                    f"{len(accumulator.verified_shard_indexes)}/"
+                    f"{accumulator.total_shards}"
+                )
+
+            outcomes.append(
+                _PackVerificationOutcome(
+                    protection_state=state,
+                    verified_shard_indexes=frozenset(
+                        accumulator.verified_shard_indexes
+                    ),
+                    error=error,
+                )
+            )
+
+        return outcomes, rpc_failures
+
+    def _probe_global_targets(
+        self,
+        *,
+        refs_by_address: dict[str, list[RemoteDataPackShardRef]],
+        accumulators: dict[str, _PackVerificationAccumulator],
+    ) -> int:
+        if not refs_by_address:
+            return 0
+
         tasks = {
             address: (
                 lambda address=address, refs=refs: self._probe_address(address, refs)
             )
-            for address, refs in refs_by_addr.items()
+            for address, refs in refs_by_address.items()
         }
+        rpc_failures = 0
 
         for completed in iter_completed_keyed_tasks(
             tasks=tasks,
-            max_workers=max_workers,
+            max_workers=min(self.target_parallelism, len(tasks)),
             thread_name_prefix="ec-verify",
         ):
             address = completed.key
+            planned_refs = refs_by_address[address]
+
             if completed.error is not None:
-                outcomes.append(
-                    _ShardProbeOutcome(
-                        address=address,
-                        present_indexes=frozenset(),
-                        error=f"RPC {address}: {completed.error}",
-                    )
+                outcome = _AddressProbeOutcome(
+                    completed_keys=frozenset(),
+                    missing_keys=frozenset(),
+                    error=str(completed.error),
                 )
             else:
-                outcomes.append(completed.result)
+                outcome = completed.result
 
-        return outcomes
+            missing_by_pack: dict[str, list[int]] = {}
+            unprobed_packs: list[str] = []
+            for ref in planned_refs:
+                key = ref.identity_key
+                if key not in outcome.completed_keys:
+                    unprobed_packs.append(ref.pack_hash)
+                elif key in outcome.missing_keys:
+                    missing_by_pack.setdefault(ref.pack_hash, []).append(ref.shard_index)
+                else:
+                    accumulators[ref.pack_hash].verified_shard_indexes.add(
+                        ref.shard_index
+                    )
+
+            for pack_hash, indexes in missing_by_pack.items():
+                accumulators[pack_hash].errors.append(
+                    f"{address}: missing_shards={sorted(indexes)}"
+                )
+
+            if outcome.error is not None:
+                rpc_failures += 1
+                message = f"RPC {address}: {outcome.error}"
+                for pack_hash in dict.fromkeys(unprobed_packs):
+                    accumulators[pack_hash].errors.append(message)
+
+        return rpc_failures
 
     def _probe_address(
         self,
         address: str,
         refs: list[RemoteDataPackShardRef],
-    ) -> _ShardProbeOutcome:
-        missing = self.client_pool.probe_missing_shards(addr=address, refs=refs)
-        missing_indexes = {ref.shard_index for ref in missing}
-        present_indexes = frozenset(
-            ref.shard_index for ref in refs if ref.shard_index not in missing_indexes
-        )
+    ) -> _AddressProbeOutcome:
+        completed_keys: set[tuple[str, int, str]] = set()
+        missing_keys: set[tuple[str, int, str]] = set()
 
-        error = None
-        if missing_indexes:
-            error = f"{address}: missing_shards={sorted(missing_indexes)}"
+        for batch in iter_batches(refs, self.probe_batch_hashes):
+            try:
+                missing = self.client_pool.probe_missing_shards(
+                    addr=address,
+                    refs=batch,
+                )
+            except Exception as exc:
+                return _AddressProbeOutcome(
+                    completed_keys=frozenset(completed_keys),
+                    missing_keys=frozenset(missing_keys),
+                    error=str(exc),
+                )
 
-        return _ShardProbeOutcome(
-            address=address,
-            present_indexes=present_indexes,
-            error=error,
+            completed_keys.update(ref.identity_key for ref in batch)
+            missing_keys.update(ref.identity_key for ref in missing)
+
+        return _AddressProbeOutcome(
+            completed_keys=frozenset(completed_keys),
+            missing_keys=frozenset(missing_keys),
         )
 
 
@@ -227,11 +314,12 @@ def verify_erasure_data_packs(
     snapshot_id: int | None,
     pack_hash: str | None,
     target_parallelism: int,
+    probe_batch_hashes: int,
     probe_timeout_s: float,
     max_message_bytes: int,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
 ) -> ErasureVerificationStats:
-    db = MetadataDB(db_file)
+    db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     client_pool = RemoteDataPackShardClientPool(
         cluster_token=cluster_token,
         timeout_s=probe_timeout_s,
@@ -261,6 +349,7 @@ def verify_erasure_data_packs(
             db=db,
             client_pool=client_pool,
             target_parallelism=target_parallelism,
+            probe_batch_hashes=probe_batch_hashes,
             cluster=cluster,
         )
 

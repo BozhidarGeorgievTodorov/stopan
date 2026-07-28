@@ -11,7 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import (
+    MetadataDB,
+    MetadataDBAccessMode,
+    MetadataDBTransactionMode,
+)
 from stopan.metadata.objects.codec import canonical_state_digest
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.metadata.objects.store import MetadataObjectStore
@@ -107,11 +111,14 @@ class MetadataObjectGraphImporter:
             chunk_sizes=self._chunk_sizes,
         )
 
-        db = MetadataDB(self.db_file)
+        db = MetadataDB(
+            self.db_file,
+            access_mode=MetadataDBAccessMode.REBUILD,
+        )
         try:
-            db.set_vault_id(latest.vault_id)
-            writer.require_empty_operational_db(db)
-            with db.transaction():
+            with db.transaction(mode=MetadataDBTransactionMode.EXCLUSIVE):
+                db.set_vault_id(latest.vault_id)
+                writer.require_empty_operational_db(db)
                 chunks_inserted = writer.insert_chunks(db, chunks)
                 snapshot_stats = writer.insert_snapshots(db, snapshot_entries)
 

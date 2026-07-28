@@ -6,7 +6,10 @@ import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
 
+from stopan.common.batching import iter_batches
 from stopan.config.defaults import DEFAULT_NODE_DB_FILE
 from stopan.errors import StopanDataError
 from stopan.protection.policy import ProtectionRecord, ProtectionState, is_record_sufficient
@@ -14,6 +17,7 @@ from stopan.protection.policy import ProtectionRecord, ProtectionState, is_recor
 
 _SQLITE_CACHE_SIZE_KIB = 64 * 1024
 _SQLITE_MMAP_SIZE_BYTES = 2 * 1024**3
+_SQLITE_BUSY_TIMEOUT_MS = 5_000
 
 
 class MetadataDatabaseError(StopanDataError, RuntimeError):
@@ -24,11 +28,55 @@ class MetadataDatabaseValueError(StopanDataError, ValueError):
     """Valor persistido inválido."""
 
 
+class MetadataDBAccessMode(StrEnum):
+    """Rol de una conexión al catálogo operativo."""
+
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
+    REBUILD = "rebuild"
+
+
+class MetadataDBTransactionMode(StrEnum):
+    """Modo de adquisición de una transacción SQLite explícita."""
+
+    DEFERRED = "DEFERRED"
+    IMMEDIATE = "IMMEDIATE"
+    EXCLUSIVE = "EXCLUSIVE"
+
+
 @dataclass(frozen=True)
 class VerificationCandidate:
     chunk_hash: str
     desired_rf: int
     protection_state: ProtectionState
+
+
+@dataclass(frozen=True)
+class ChunkProtectionPushUpdate:
+    chunk_hash: str
+    desired_rf: int
+    protection_state: ProtectionState
+    protected_remote_copies: int
+    placement_epoch: str | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ChunkProtectionVerificationUpdate:
+    chunk_hash: str
+    desired_rf: int
+    protection_state: ProtectionState
+    protected_remote_copies: int
+    placement_epoch: str | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ErasureDataPackVerificationUpdate:
+    pack_hash: str
+    protection_state: ProtectionState
+    verified_shard_indexes: tuple[int, ...]
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,9 +149,25 @@ class MetadataDB:
         db_file: str = DEFAULT_NODE_DB_FILE,
         *,
         init_schema: bool = True,
+        access_mode: MetadataDBAccessMode | str = MetadataDBAccessMode.READ_WRITE,
+        busy_timeout_ms: int = _SQLITE_BUSY_TIMEOUT_MS,
     ) -> None:
-        self.db_file = db_file
-        self.conn: sqlite3.Connection = sqlite3.connect(self.db_file)
+        self.db_file = str(db_file)
+        self.access_mode = MetadataDBAccessMode(access_mode)
+        self.busy_timeout_ms = _require_non_negative_int(
+            "busy_timeout_ms",
+            busy_timeout_ms,
+        )
+
+        if self.access_mode is MetadataDBAccessMode.READ_ONLY and init_schema:
+            raise ValueError("una conexión read_only no puede inicializar el esquema")
+
+        connect_target, use_uri = self._connection_target()
+        self.conn = sqlite3.connect(
+            connect_target,
+            uri=use_uri,
+            timeout=self.busy_timeout_ms / 1000.0,
+        )
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
 
@@ -114,14 +178,30 @@ class MetadataDB:
     # Connection and lifecycle
     # ------------------------------------------------------------------
 
+    def _connection_target(self) -> tuple[str, bool]:
+        if self.access_mode is not MetadataDBAccessMode.READ_ONLY:
+            return self.db_file, False
+
+        if self.db_file == ":memory:":
+            raise ValueError("read_only requiere una base SQLite persistente")
+
+        db_uri = Path(self.db_file).expanduser().resolve().as_uri()
+        return f"{db_uri}?mode=ro", True
+
     def _configure_connection(self) -> None:
         """Aplica a cada conexión los ajustes de integridad, concurrencia y memoria."""
-        self.conn.execute("PRAGMA journal_mode = WAL")
-        self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute(f"PRAGMA cache_size = -{_SQLITE_CACHE_SIZE_KIB}")
         self.conn.execute("PRAGMA temp_store = MEMORY")
         self.conn.execute(f"PRAGMA mmap_size = {_SQLITE_MMAP_SIZE_BYTES}")
+
+        if self.access_mode is MetadataDBAccessMode.READ_ONLY:
+            self.conn.execute("PRAGMA query_only = ON")
+            return
+
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
 
     def commit(self) -> None:
         self.conn.commit()
@@ -130,8 +210,48 @@ class MetadataDB:
         self.conn.rollback()
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
-        with self.conn:
+    def transaction(
+        self,
+        *,
+        mode: MetadataDBTransactionMode | str | None = None,
+    ) -> Iterator[None]:
+        """Abre una transacción explícita y evita transacciones anidadas ambiguas."""
+        if self.conn.in_transaction:
+            raise MetadataDatabaseError("ya existe una transacción SQLite activa")
+
+        if mode is None:
+            mode = (
+                MetadataDBTransactionMode.EXCLUSIVE
+                if self.access_mode is MetadataDBAccessMode.REBUILD
+                else MetadataDBTransactionMode.DEFERRED
+            )
+        transaction_mode = MetadataDBTransactionMode(mode)
+
+        if (
+            self.access_mode is MetadataDBAccessMode.READ_ONLY
+            and transaction_mode is not MetadataDBTransactionMode.DEFERRED
+        ):
+            raise MetadataDatabaseError(
+                "una conexión read_only solo admite transacciones DEFERRED"
+            )
+
+        self.conn.execute(f"BEGIN {transaction_mode.value}")
+        try:
+            yield
+        except BaseException:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """Mantiene una vista estable del catálogo hasta abandonar el contexto."""
+        if self.access_mode is not MetadataDBAccessMode.READ_ONLY:
+            raise MetadataDatabaseError(
+                "read_snapshot requiere una conexión read_only"
+            )
+        with self.transaction(mode=MetadataDBTransactionMode.DEFERRED):
             yield
 
     def close(self) -> None:
@@ -343,11 +463,18 @@ class MetadataDB:
             return _require_vault_id("vault_id", row["value"])
 
         vault_id = uuid.uuid4().hex
-        with self.conn:
+        outer_transaction = self.conn.in_transaction
+        try:
             self.conn.execute(
                 "INSERT OR IGNORE INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
                 (vault_id,),
             )
+            if not outer_transaction:
+                self.conn.commit()
+        except BaseException:
+            if not outer_transaction:
+                self.conn.rollback()
+            raise
         row = self.conn.execute(
             "SELECT value FROM metadata_vault WHERE key = 'vault_id' LIMIT 1"
         ).fetchone()
@@ -368,11 +495,18 @@ class MetadataDB:
                 )
             return
 
-        with self.conn:
+        outer_transaction = self.conn.in_transaction
+        try:
             self.conn.execute(
                 "INSERT INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
                 (value,),
             )
+            if not outer_transaction:
+                self.conn.commit()
+        except BaseException:
+            if not outer_transaction:
+                self.conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Metadata pack publications
@@ -1071,6 +1205,34 @@ class MetadataDB:
 
         return [_erasure_shard_record(row) for row in rows]
 
+    def get_erasure_pack_shards_many(
+        self,
+        pack_hashes: Iterable[str],
+    ) -> dict[str, list[ErasureDataPackShardRecord]]:
+        """Recupera los shards de varios paquetes con consultas acotadas."""
+        hashes = _unique_hashes(pack_hashes)
+        grouped = {pack_hash: [] for pack_hash in hashes}
+        if not hashes:
+            return grouped
+
+        for batch in iter_batches(hashes, 500):
+            placeholders = ", ".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"""
+                SELECT pack_hash, shard_index, shard_hash, node_id, size,
+                       protection_state, last_push_at, last_verify_at, last_error
+                FROM erasure_data_pack_shards
+                WHERE pack_hash IN ({placeholders})
+                ORDER BY pack_hash ASC, shard_index ASC
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                record = _erasure_shard_record(row)
+                grouped[record.pack_hash].append(record)
+
+        return grouped
+
     def get_erasure_unprotected_chunks(self, *, limit: int | None = None) -> list[str]:
         query = """
             SELECT c.hash
@@ -1161,6 +1323,24 @@ class MetadataDB:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [_erasure_pack_record(row) for row in rows]
 
+    def apply_erasure_data_pack_verifications(
+        self,
+        updates: Iterable[ErasureDataPackVerificationUpdate],
+    ) -> int:
+        """Consolida verificaciones EC en una única transacción SQLite."""
+        normalized = list(updates)
+        if not normalized:
+            return 0
+
+        now = time.time()
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for update in normalized:
+                self._apply_erasure_data_pack_verification_update(
+                    update=update,
+                    verified_at=now,
+                )
+        return len(normalized)
+
     def mark_erasure_data_pack_verification(
         self,
         pack_hash: str,
@@ -1169,66 +1349,89 @@ class MetadataDB:
         verified_shard_indexes: Iterable[int],
         error: str | None = None,
     ) -> None:
-        pack_hash = _require_hash64("pack_hash", pack_hash)
-        state_value = _protection_state_value(protection_state)
+        self.apply_erasure_data_pack_verifications((
+            ErasureDataPackVerificationUpdate(
+                pack_hash=pack_hash,
+                protection_state=protection_state,
+                verified_shard_indexes=tuple(verified_shard_indexes),
+                error=error,
+            ),
+        ))
+
+    def _apply_erasure_data_pack_verification_update(
+        self,
+        *,
+        update: ErasureDataPackVerificationUpdate,
+        verified_at: float,
+    ) -> None:
+        pack_hash = _require_hash64("pack_hash", update.pack_hash)
+        protection_state = ProtectionState(update.protection_state)
+        if protection_state not in {
+            ProtectionState.VERIFIED,
+            ProtectionState.DEGRADED,
+            ProtectionState.FAILED,
+        }:
+            raise MetadataDatabaseValueError(
+                f"estado inválido para verificación EC: {protection_state.value}"
+            )
         verified_indexes = {
             _require_non_negative_int("verified_shard_index", index)
-            for index in verified_shard_indexes
+            for index in update.verified_shard_indexes
         }
-        now = time.time()
 
-        with self.conn:
-            self.conn.execute("""
-                UPDATE erasure_data_packs
-                SET protection_state = ?,
-                    last_verify_at = ?,
-                    last_error = ?
-                WHERE pack_hash = ?
-            """, (
-                state_value,
-                now,
-                error,
-                pack_hash,
-            ))
+        cursor = self.conn.execute("""
+            UPDATE erasure_data_packs
+            SET protection_state = ?,
+                last_verify_at = ?,
+                last_error = ?
+            WHERE pack_hash = ?
+        """, (
+            protection_state.value,
+            verified_at,
+            update.error,
+            pack_hash,
+        ))
+        if cursor.rowcount != 1:
+            raise MetadataDatabaseError(f"erasure data pack no registrado: {pack_hash}")
 
-            if verified_indexes:
-                placeholders = ", ".join("?" for _ in verified_indexes)
-                self.conn.execute(f"""
-                    UPDATE erasure_data_pack_shards
-                    SET protection_state = ?,
-                        last_verify_at = ?,
-                        last_error = NULL
-                    WHERE pack_hash = ?
-                      AND shard_index IN ({placeholders})
-                """, (
-                    ProtectionState.VERIFIED.value,
-                    now,
-                    pack_hash,
-                    *sorted(verified_indexes),
-                ))
-
-            missing_state = (
-                ProtectionState.FAILED
-                if protection_state == ProtectionState.FAILED
-                else ProtectionState.DEGRADED
-            )
-            self.conn.execute("""
+        if verified_indexes:
+            placeholders = ", ".join("?" for _ in verified_indexes)
+            self.conn.execute(f"""
                 UPDATE erasure_data_pack_shards
                 SET protection_state = ?,
                     last_verify_at = ?,
-                    last_error = ?
+                    last_error = NULL
                 WHERE pack_hash = ?
-            """ + (
-                ""
-                if not verified_indexes
-                else f" AND shard_index NOT IN ({', '.join('?' for _ in verified_indexes)})"
-            ), (
-                missing_state.value,
-                now,
-                error,
+                  AND shard_index IN ({placeholders})
+            """, (
+                ProtectionState.VERIFIED.value,
+                verified_at,
                 pack_hash,
                 *sorted(verified_indexes),
             ))
+
+        missing_state = (
+            ProtectionState.FAILED
+            if protection_state == ProtectionState.FAILED
+            else ProtectionState.DEGRADED
+        )
+        self.conn.execute("""
+            UPDATE erasure_data_pack_shards
+            SET protection_state = ?,
+                last_verify_at = ?,
+                last_error = ?
+            WHERE pack_hash = ?
+        """ + (
+            ""
+            if not verified_indexes
+            else f" AND shard_index NOT IN ({', '.join('?' for _ in verified_indexes)})"
+        ), (
+            missing_state.value,
+            verified_at,
+            update.error,
+            pack_hash,
+            *sorted(verified_indexes),
+        ))
 
     def mark_erasure_data_pack_state(
         self,
@@ -2258,6 +2461,75 @@ class MetadataDB:
                     current_epoch,
                 ))
 
+    def apply_chunk_push_updates(
+        self,
+        updates: Iterable[ChunkProtectionPushUpdate],
+    ) -> int:
+        """Consolida resultados de push de replicación en una sola transacción."""
+        normalized = list(updates)
+        if not normalized:
+            return 0
+
+        allowed_states = {
+            ProtectionState.PLACED,
+            ProtectionState.DEGRADED,
+            ProtectionState.FAILED,
+        }
+        now = time.time()
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for update in normalized:
+                state = ProtectionState(update.protection_state)
+                if state not in allowed_states:
+                    raise MetadataDatabaseValueError(
+                        f"estado inválido para push de replicación: {state.value}"
+                    )
+                self._upsert_chunk_protection_state(
+                    chunk_hash=_require_hash64("chunk_hash", update.chunk_hash),
+                    desired_rf=_require_non_negative_int("desired_rf", update.desired_rf),
+                    protection_state=state,
+                    protected_remote_copies=_require_non_negative_int(
+                        "protected_remote_copies",
+                        update.protected_remote_copies,
+                    ),
+                    placement_epoch=update.placement_epoch,
+                    last_push_at=now,
+                    last_verify_at=None,
+                    last_error=update.error,
+                )
+        return len(normalized)
+
+    def apply_chunk_verification_updates(
+        self,
+        updates: Iterable[ChunkProtectionVerificationUpdate],
+    ) -> int:
+        """Consolida resultados de verificación en una sola transacción."""
+        normalized = list(updates)
+        if not normalized:
+            return 0
+
+        allowed_states = {ProtectionState.VERIFIED, ProtectionState.DEGRADED}
+        now = time.time()
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for update in normalized:
+                state = ProtectionState(update.protection_state)
+                if state not in allowed_states:
+                    raise MetadataDatabaseValueError(
+                        f"estado inválido para verificación de replicación: {state.value}"
+                    )
+                self._upsert_chunk_verification_state(
+                    chunk_hash=_require_hash64("chunk_hash", update.chunk_hash),
+                    desired_rf=_require_non_negative_int("desired_rf", update.desired_rf),
+                    protection_state=state,
+                    protected_remote_copies=_require_non_negative_int(
+                        "protected_remote_copies",
+                        update.protected_remote_copies,
+                    ),
+                    placement_epoch=update.placement_epoch,
+                    last_verify_at=now,
+                    last_error=update.error,
+                )
+        return len(normalized)
+
     def mark_chunk_placed(
         self,
         chunk_hash: str,
@@ -2266,17 +2538,15 @@ class MetadataDB:
         protected_remote_copies: int,
         placement_epoch: str | None,
     ) -> None:
-        with self.conn:
-            self._upsert_chunk_protection_state(
+        self.apply_chunk_push_updates((
+            ChunkProtectionPushUpdate(
                 chunk_hash=chunk_hash,
                 desired_rf=desired_rf,
                 protection_state=ProtectionState.PLACED,
                 protected_remote_copies=protected_remote_copies,
                 placement_epoch=placement_epoch,
-                last_push_at=time.time(),
-                last_verify_at=None,
-                last_error=None,
-            )
+            ),
+        ))
 
     def mark_chunk_failed(
         self,
@@ -2287,17 +2557,16 @@ class MetadataDB:
         placement_epoch: str | None,
         error: str,
     ) -> None:
-        with self.conn:
-            self._upsert_chunk_protection_state(
+        self.apply_chunk_push_updates((
+            ChunkProtectionPushUpdate(
                 chunk_hash=chunk_hash,
                 desired_rf=desired_rf,
                 protection_state=ProtectionState.FAILED,
                 protected_remote_copies=protected_remote_copies,
                 placement_epoch=placement_epoch,
-                last_push_at=time.time(),
-                last_verify_at=None,
-                last_error=error,
-            )
+                error=error,
+            ),
+        ))
 
     def mark_chunk_push_degraded(
         self,
@@ -2309,17 +2578,16 @@ class MetadataDB:
         error: str,
     ) -> None:
         """Registra degradación observada durante push/replicación."""
-        with self.conn:
-            self._upsert_chunk_protection_state(
+        self.apply_chunk_push_updates((
+            ChunkProtectionPushUpdate(
                 chunk_hash=chunk_hash,
                 desired_rf=desired_rf,
                 protection_state=ProtectionState.DEGRADED,
                 protected_remote_copies=protected_remote_copies,
                 placement_epoch=placement_epoch,
-                last_push_at=time.time(),
-                last_verify_at=None,
-                last_error=error,
-            )
+                error=error,
+            ),
+        ))
 
     def mark_chunk_verified(
         self,
@@ -2329,16 +2597,15 @@ class MetadataDB:
         protected_remote_copies: int,
         placement_epoch: str | None,
     ) -> None:
-        with self.conn:
-            self._upsert_chunk_verification_state(
+        self.apply_chunk_verification_updates((
+            ChunkProtectionVerificationUpdate(
                 chunk_hash=chunk_hash,
                 desired_rf=desired_rf,
                 protection_state=ProtectionState.VERIFIED,
                 protected_remote_copies=protected_remote_copies,
                 placement_epoch=placement_epoch,
-                last_verify_at=time.time(),
-                last_error=None,
-            )
+            ),
+        ))
 
     def mark_chunk_degraded(
         self,
@@ -2349,16 +2616,16 @@ class MetadataDB:
         placement_epoch: str | None,
         error: str,
     ) -> None:
-        with self.conn:
-            self._upsert_chunk_verification_state(
+        self.apply_chunk_verification_updates((
+            ChunkProtectionVerificationUpdate(
                 chunk_hash=chunk_hash,
                 desired_rf=desired_rf,
                 protection_state=ProtectionState.DEGRADED,
                 protected_remote_copies=protected_remote_copies,
                 placement_epoch=placement_epoch,
-                last_verify_at=time.time(),
-                last_error=error,
-            )
+                error=error,
+            ),
+        ))
 
     def _upsert_chunk_protection_state(
         self,
@@ -2437,6 +2704,14 @@ _HASH64_ALPHABET = set("0123456789abcdef")
 
 def _unique_hashes(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_require_hash64("hash", value) for value in values))
+
+
+def _require_non_negative_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} debe ser int")
+    if value < 0:
+        raise ValueError(f"{name} debe ser >= 0")
+    return value
 
 
 def _require_vault_id(name: str, value: object) -> str:

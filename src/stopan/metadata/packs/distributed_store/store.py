@@ -12,11 +12,11 @@ import threading
 import time
 from pathlib import Path
 
-from stopan.common.fs import atomic_write_bytes, ensure_private_dir, fsync_dir
+from stopan.common.fs import atomic_copy_file, atomic_write_bytes, ensure_private_dir, fsync_dir
 from stopan.errors import StopanConfigValueError
 from stopan.metadata.identity import validate_owner_id, verify_metadata_pack_signature
 from stopan.metadata.packs.format import OBJECT_PACK_FILE_SUFFIX
-from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
+from stopan.metadata.packs.hashes import calculate_pack_hash, calculate_pack_hash_file, validate_pack_hash
 
 from .models import (
     MetadataPackCorruptionError,
@@ -141,7 +141,7 @@ class MetadataPackStore:
             pack_hash = validate_pack_hash(path.name.removesuffix(OBJECT_PACK_FILE_SUFFIX))
             owner_id = validate_owner_id(path.parent.parent.name)
             st = path.stat()
-            calculated = calculate_pack_hash(path.read_bytes())
+            calculated = calculate_pack_hash_file(path)
             if calculated != pack_hash:
                 return None
             public_key_b64, signature_b64 = self._read_signature_record(owner_id=owner_id, pack_hash=pack_hash)
@@ -437,10 +437,11 @@ class MetadataPackStore:
             path = self.pack_path(owner_id=owner, pack_hash=pack)
             if path.exists():
                 try:
-                    existing_data = path.read_bytes()
+                    existing_hash = calculate_pack_hash_file(path)
                 except OSError as exc:
-                    raise MetadataPackStoreError(f"No se pudo leer el metadata pack existente {path}: {exc}") from exc
-                existing_hash = calculate_pack_hash(existing_data)
+                    raise MetadataPackStoreError(
+                        f"No se pudo leer el metadata pack existente {path}: {exc}"
+                    ) from exc
                 if existing_hash != pack:
                     raise MetadataPackCorruptionError(
                         f"metadata pack existente corrupto: esperado={pack} calculado={existing_hash}"
@@ -515,27 +516,141 @@ class MetadataPackStore:
         owner_id: str,
         path: str | Path,
         expected_pack_hash: str | None = None,
+        expected_size_bytes: int | None = None,
         public_key_b64: str,
         signature_b64: str,
     ) -> StoreMetadataPackResult:
-        pack_path = Path(path).expanduser().resolve()
-        try:
-            data = pack_path.read_bytes()
-        except OSError as exc:
-            raise MetadataPackStoreError(f"No se pudo leer el metadata pack {pack_path}: {exc}") from exc
+        owner = validate_owner_id(owner_id)
+        source_path = Path(path).expanduser().resolve()
 
-        pack_hash = calculate_pack_hash(data)
-        if expected_pack_hash is not None and validate_pack_hash(expected_pack_hash) != pack_hash:
+        try:
+            source_stat = source_path.stat()
+        except OSError as exc:
             raise MetadataPackStoreError(
-                f"expected pack_hash no coincide con el archivo: esperado={expected_pack_hash} calculado={pack_hash}"
+                f"No se pudo inspeccionar el metadata pack {source_path}: {exc}"
+            ) from exc
+        if not source_path.is_file():
+            raise MetadataPackStoreError(f"metadata pack no es un archivo regular: {source_path}")
+
+        size_bytes = int(source_stat.st_size)
+        if size_bytes <= 0:
+            raise MetadataPackStoreError("metadata pack vacío rechazado")
+        if size_bytes > self.max_pack_bytes:
+            raise MetadataPackStoreError(
+                f"metadata pack demasiado grande: {size_bytes} bytes > {self.max_pack_bytes}"
             )
-        return self.put_pack_bytes(
-            owner_id=owner_id,
-            pack_hash=pack_hash,
-            data=data,
+        if expected_size_bytes is not None and int(expected_size_bytes) != size_bytes:
+            raise MetadataPackStoreError(
+                "el tamaño del metadata pack no coincide con el anunciado: "
+                f"esperado={int(expected_size_bytes)} recibido={size_bytes}"
+            )
+
+        try:
+            pack_hash = calculate_pack_hash_file(source_path)
+        except OSError as exc:
+            raise MetadataPackStoreError(
+                f"No se pudo leer el metadata pack {source_path}: {exc}"
+            ) from exc
+        if expected_pack_hash is not None:
+            expected = validate_pack_hash(expected_pack_hash)
+            if expected != pack_hash:
+                raise MetadataPackStoreError(
+                    "expected pack_hash no coincide con el archivo: "
+                    f"esperado={expected} calculado={pack_hash}"
+                )
+
+        if not public_key_b64 or not signature_b64:
+            raise MetadataPackSignatureError(
+                "public_key_b64 y signature_b64 son obligatorios para packs distribuidos"
+            )
+        if not verify_metadata_pack_signature(
+            owner_id=owner,
             public_key_b64=public_key_b64,
             signature_b64=signature_b64,
-        )
+            pack_hash=pack_hash,
+        ):
+            raise MetadataPackSignatureError("la firma del metadata pack es inválida")
+
+        with self._lock:
+            destination = self.pack_path(owner_id=owner, pack_hash=pack_hash)
+            if destination.exists():
+                try:
+                    existing_hash = calculate_pack_hash_file(destination)
+                except OSError as exc:
+                    raise MetadataPackStoreError(
+                        f"No se pudo leer el metadata pack existente {destination}: {exc}"
+                    ) from exc
+                if existing_hash != pack_hash:
+                    raise MetadataPackCorruptionError(
+                        "metadata pack existente corrupto: "
+                        f"esperado={pack_hash} calculado={existing_hash}"
+                    )
+
+                self._write_signature_record(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                    public_key_b64=public_key_b64,
+                    signature_b64=signature_b64,
+                )
+                try:
+                    os.utime(destination, None)
+                except OSError:
+                    pass
+                prune_result = self.prune_to_limits(dry_run=False)
+                existing_public, existing_signature = self._read_signature_record(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                )
+                return StoreMetadataPackResult(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                    path=destination,
+                    size_bytes=int(destination.stat().st_size),
+                    stored=False,
+                    already_present=True,
+                    public_key_b64=existing_public,
+                    signature_b64=existing_signature,
+                    pruned_packs=prune_result.pruned_packs,
+                    pruned_bytes=prune_result.pruned_bytes,
+                )
+
+            pruned_count, pruned_bytes = self._enforce_pre_store_quotas_unlocked(
+                owner_id=owner,
+                pack_hash=pack_hash,
+                incoming_size=size_bytes,
+            )
+
+            ensure_private_dir(destination.parent)
+            pack_written = False
+            try:
+                atomic_copy_file(source_path, destination, mode=0o600)
+                pack_written = True
+                self._write_signature_record(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                    public_key_b64=public_key_b64,
+                    signature_b64=signature_b64,
+                )
+            except Exception:
+                if pack_written:
+                    try:
+                        destination.unlink()
+                    except OSError:
+                        pass
+                raise
+
+            return StoreMetadataPackResult(
+                owner_id=owner,
+                pack_hash=pack_hash,
+                path=destination,
+                size_bytes=size_bytes,
+                stored=True,
+                already_present=False,
+                public_key_b64=public_key_b64,
+                signature_b64=signature_b64,
+                pruned_packs=pruned_count,
+                pruned_bytes=pruned_bytes,
+            )
 
     def get_pack_bytes(self, *, owner_id: str, pack_hash: str) -> bytes:
         path = self.pack_path(owner_id=owner_id, pack_hash=pack_hash)
@@ -562,10 +677,21 @@ class MetadataPackStore:
         pack_hash: str,
         out_path: str | Path,
     ) -> Path:
-        data = self.get_pack_bytes(owner_id=owner_id, pack_hash=pack_hash)
+        expected = validate_pack_hash(pack_hash)
+        source = self.pack_path(owner_id=owner_id, pack_hash=expected)
+        try:
+            calculated = calculate_pack_hash_file(source)
+        except OSError as exc:
+            raise MetadataPackStoreError(
+                f"No se pudo leer el metadata pack {source}: {exc}"
+            ) from exc
+        if calculated != expected:
+            raise MetadataPackCorruptionError(
+                f"hash de metadata pack no coincide: esperado={expected} calculado={calculated}"
+            )
+
         out = Path(out_path).expanduser().resolve()
-        ensure_private_dir(out.parent)
-        atomic_write_bytes(out, data, mode=0o600)
+        atomic_copy_file(source, out, mode=0o600)
         return out
 
     def list_packs(self, *, owner_id: str) -> list[StoredMetadataPackRecord]:

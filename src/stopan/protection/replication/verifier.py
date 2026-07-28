@@ -7,7 +7,12 @@ confirmar copias remotas sin descargar blobs completos.
 
 from __future__ import annotations
 
-from stopan.metadata.database import MetadataDB, VerificationCandidate
+from stopan.metadata.database import (
+    ChunkProtectionVerificationUpdate,
+    MetadataDB,
+    MetadataDBAccessMode,
+    VerificationCandidate,
+)
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
     export_after_successful_metadata_change,
@@ -105,29 +110,30 @@ class ChunkProtectionVerifier:
         degraded = 0
         rpc_failures = 0
 
+        updates: list[ChunkProtectionVerificationUpdate] = []
         for outcome in outcomes:
             state = replication_verify_state(
                 verified_remote_copies=outcome.verified_remote_copies,
                 required_remote_copies=outcome.required_remote_copies,
             )
-
-            if state == ProtectionState.VERIFIED:
-                self.db.mark_chunk_verified(
-                    outcome.chunk_hash,
+            error = None if state == ProtectionState.VERIFIED else (
+                outcome.error or "verificación fallida"
+            )
+            updates.append(
+                ChunkProtectionVerificationUpdate(
+                    chunk_hash=outcome.chunk_hash,
                     desired_rf=outcome.desired_rf,
+                    protection_state=state,
                     protected_remote_copies=outcome.verified_remote_copies,
                     placement_epoch=outcome.placement_epoch,
+                    error=error,
                 )
+            )
+
+            if state == ProtectionState.VERIFIED:
                 verified += 1
                 continue
 
-            self.db.mark_chunk_degraded(
-                outcome.chunk_hash,
-                desired_rf=outcome.desired_rf,
-                protected_remote_copies=outcome.verified_remote_copies,
-                placement_epoch=outcome.placement_epoch,
-                error=outcome.error or "verificación fallida",
-            )
             degraded += 1
             if outcome.error and "RPC" in outcome.error:
                 rpc_failures += 1
@@ -137,6 +143,7 @@ class ChunkProtectionVerifier:
                 f"error={outcome.error}"
             )
 
+        self.db.apply_chunk_verification_updates(updates)
         return VerificationStats(
             candidates=len(candidates),
             verified=verified,
@@ -306,7 +313,7 @@ def verify_remote_protection(
     o DEGRADED.
     """
 
-    db = MetadataDB(db_file)
+    db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     verifier: ChunkProtectionVerifier | None = None
     metadata_changed = False
 

@@ -205,7 +205,7 @@ max_message_bytes
 membership_seed
 ```
 
-`pack_hash` solo tiene sentido con `protection_mode: ec`. `probe_batch_hashes` solo aplica a replicación.
+`pack_hash` solo tiene sentido con `protection_mode: ec`. `probe_batch_hashes` limita el tamaño de los lotes remotos tanto en replicación como en EC.
 
 ## Data restore
 

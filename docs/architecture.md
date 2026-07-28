@@ -133,7 +133,7 @@ El servidor gRPC registra tres servicios:
 
 `Membership` expone `Join`, `Ping`, `PingReq` y `GetMembers`.
 
-`MetadataPackService` expone `StoreMetadataPack`, `ListMetadataPacks`, `RetrieveMetadataPack` y `ProbeMetadataPack`.
+`MetadataPackService` expone `StoreMetadataPack`, `ListMetadataPacks`, `RetrieveMetadataPack` y `ProbeMetadataPack`. La publicación recibe una cabecera seguida de bloques y la recuperación devuelve una cabecera seguida del contenido por bloques. El receptor valida tamaño, hash y firma antes de publicar el fichero de forma atómica.
 
 El almacenamiento remoto de chunks pasa por un commit engine interno con cola y workers. El servicio valida tamaño, hash y consistencia antes de aceptar blobs. Los shards EC usan un store separado bajo el store P2P del nodo.
 

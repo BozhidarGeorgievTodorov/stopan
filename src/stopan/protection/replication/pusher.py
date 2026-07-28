@@ -12,7 +12,11 @@ from dataclasses import dataclass
 
 from stopan.cas.repository import CASRepository
 from stopan.errors import StopanConfigValueError
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import (
+    ChunkProtectionPushUpdate,
+    MetadataDB,
+    MetadataDBAccessMode,
+)
 from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
     export_after_successful_metadata_change,
@@ -90,7 +94,7 @@ def push_to_network(
     cluster_token = str(cluster_token or "")
 
     repo = CASRepository(local_shard_dir)
-    db = MetadataDB(db_file)
+    db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     remote_client: RemoteChunkClientPool | None = None
     metadata_changed = False
     processed_bytes = 0
@@ -184,6 +188,14 @@ def push_to_network(
         stored_remote = 0
         already_present_remote = 0
 
+        pending_updates: list[ChunkProtectionPushUpdate] = []
+
+        def flush_updates() -> None:
+            if not pending_updates:
+                return
+            db.apply_chunk_push_updates(pending_updates)
+            pending_updates.clear()
+
         try:
             for outcome in push_chunk_replicas(
                 repo=repo,
@@ -203,16 +215,10 @@ def push_to_network(
                     protected_remote_copies=outcome.protected_remote_copies,
                     required_remote_copies=required_remote_copies,
                 )
+                error: str | None = None
 
                 if state == ProtectionState.PLACED:
-                    db.mark_chunk_placed(
-                        outcome.chunk_hash,
-                        desired_rf=desired_rf,
-                        protected_remote_copies=outcome.protected_remote_copies,
-                        placement_epoch=current_epoch,
-                    )
                     protected += 1
-
                 elif state == ProtectionState.DEGRADED:
                     error = (
                         f"placement parcial: protected_remote_copies="
@@ -221,33 +227,27 @@ def push_to_network(
                     )
                     if outcome.error:
                         error = f"{error}; {outcome.error}"
+                    degraded += 1
+                else:
+                    error = outcome.error or "replicación fallida sin copias remotas protegidas"
+                    failed += 1
 
-                    db.mark_chunk_push_degraded(
-                        outcome.chunk_hash,
+                pending_updates.append(
+                    ChunkProtectionPushUpdate(
+                        chunk_hash=outcome.chunk_hash,
                         desired_rf=desired_rf,
+                        protection_state=state,
                         protected_remote_copies=outcome.protected_remote_copies,
                         placement_epoch=current_epoch,
                         error=error,
                     )
-                    degraded += 1
-
-                else:
-                    error = outcome.error or "replicación fallida sin copias remotas protegidas"
-                    db.mark_chunk_failed(
-                        outcome.chunk_hash,
-                        desired_rf=desired_rf,
-                        protected_remote_copies=0,
-                        placement_epoch=current_epoch,
-                        error=error,
-                    )
-                    failed += 1
-
+                )
                 metadata_changed = True
 
-                if attempted % commit_every == 0:
-                    db.commit()
+                if len(pending_updates) >= commit_every:
+                    flush_updates()
 
-
+            flush_updates()
             return PushStats(
                 attempted=attempted,
                 protected=protected,
@@ -261,8 +261,8 @@ def push_to_network(
             )
 
         except KeyboardInterrupt:
+            flush_updates()
             print("\nPush interrumpido por el usuario.")
-            db.commit()
             return PushStats(
                 attempted=attempted,
                 protected=protected,
@@ -275,6 +275,9 @@ def push_to_network(
                 remote_candidates=remote_candidate_count,
                 interrupted=True,
             )
+        except BaseException:
+            flush_updates()
+            raise
 
     finally:
         if remote_client is not None:

@@ -67,8 +67,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
 
-    if args.protection_mode == "ec" and args.probe_batch_hashes is not None:
-        parser.error("--probe-batch-hashes solo aplica a --protection-mode replication")
     if args.protection_mode != "ec" and args.pack_hash is not None:
         parser.error("--pack-hash solo aplica a --protection-mode ec")
     if args.snapshot_id is not None and args.scope not in ("pending", "snapshot"):
@@ -104,6 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             snapshot_id=args.snapshot_id,
             pack_hash=args.pack_hash,
             target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
+            probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.verify.probe_batch_hashes)),
             probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
             max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
             metadata_object_graph_auto_export=metadata_object_graph_auto_export,

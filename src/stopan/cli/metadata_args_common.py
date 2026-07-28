@@ -48,6 +48,6 @@ def add_metadata_pack_push_args(parser: argparse.ArgumentParser) -> None:
         "--max-message-bytes",
         type=int,
         default=None,
-        help="Límite gRPC de mensaje para enviar el pack. Default: grpc.max_message_bytes.",
+        help="Límite gRPC por mensaje durante el flujo del pack. Default: grpc.max_message_bytes.",
     )
 

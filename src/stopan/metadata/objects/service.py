@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from stopan.errors import StopanUsageError
-from stopan.metadata.database import MetadataDB
+from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 from stopan.metadata.identity.passphrase import ScryptCost
 from stopan.metadata.objects.exchange.importer import (
     MetadataObjectGraphImporter,
@@ -62,11 +62,25 @@ class MetadataObjectGraphStoreService:
         passphrase: str | bytes,
         include_protection: bool = True,
     ) -> MetadataObjectGraphExportResult:
-        db = MetadataDB(self.db_file)
+        initializer = MetadataDB(
+            self.db_file,
+            access_mode=MetadataDBAccessMode.READ_WRITE,
+        )
         try:
-            graph = MetadataObjectGraphExporter(db).export_current_state(
-                include_protection=bool(include_protection),
-            )
+            initializer.get_or_create_vault_id()
+        finally:
+            initializer.close()
+
+        db = MetadataDB(
+            self.db_file,
+            init_schema=False,
+            access_mode=MetadataDBAccessMode.READ_ONLY,
+        )
+        try:
+            with db.read_snapshot():
+                graph = MetadataObjectGraphExporter(db).export_current_state(
+                    include_protection=bool(include_protection),
+                )
         finally:
             db.close()
 

@@ -112,6 +112,7 @@ def serve(config: StopanConfig) -> None:
         max_total_bytes_per_owner=config.metadata.max_distributed_pack_bytes_per_owner,
         max_total_store_bytes=config.metadata.max_distributed_pack_store_bytes,
         max_age_days=config.gc.received_metadata_pack_max_age_days,
+        max_message_bytes=config.grpc.max_message_bytes,
     )
 
     rpc_executor = futures.ThreadPoolExecutor(

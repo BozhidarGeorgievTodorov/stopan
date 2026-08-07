@@ -248,10 +248,16 @@ def backup_directory(
 
 
 def _is_unchanged_file(previous_item: dict, stat_info: os.stat_result) -> bool:
+    """Decide si una receta previa puede reutilizarse sin releer el archivo."""
     mtime_ns = getattr(
         stat_info,
         "st_mtime_ns",
         int(stat_info.st_mtime * 1_000_000_000),
+    )
+    ctime_ns = getattr(
+        stat_info,
+        "st_ctime_ns",
+        int(stat_info.st_ctime * 1_000_000_000),
     )
     return (
         previous_item["size"] == stat_info.st_size
@@ -259,6 +265,8 @@ def _is_unchanged_file(previous_item: dict, stat_info: os.stat_result) -> bool:
         and previous_item["uid"] == getattr(stat_info, "st_uid", None)
         and previous_item["gid"] == getattr(stat_info, "st_gid", None)
         and previous_item["mtime_ns"] == mtime_ns
+        and previous_item["ctime_ns"] is not None
+        and previous_item["ctime_ns"] == ctime_ns
         and previous_item["recipe_id"] is not None
     )
 

@@ -316,6 +316,7 @@ class MetadataDB:
                     mode INTEGER,
                     mtime REAL,
                     mtime_ns INTEGER,
+                    ctime_ns INTEGER,
                     uid INTEGER,
                     gid INTEGER,
                     recipe_id INTEGER,
@@ -703,12 +704,13 @@ class MetadataDB:
     def add_item(self, snapshot_id: int, rel_path: str, stat_info, item_type: str) -> int:
         """Registra un archivo o directorio dentro de un snapshot."""
         mtime_ns = getattr(stat_info, "st_mtime_ns", int(stat_info.st_mtime * 1_000_000_000))
+        ctime_ns = getattr(stat_info, "st_ctime_ns", int(stat_info.st_ctime * 1_000_000_000))
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO snapshot_items (
-                snapshot_id, path, item_type, size, mode, mtime, mtime_ns, uid, gid, recipe_id
+                snapshot_id, path, item_type, size, mode, mtime, mtime_ns, ctime_ns, uid, gid, recipe_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
         """, (
             snapshot_id,
             rel_path,
@@ -717,6 +719,7 @@ class MetadataDB:
             stat_info.st_mode,
             stat_info.st_mtime,
             mtime_ns,
+            ctime_ns,
             getattr(stat_info, "st_uid", None),
             getattr(stat_info, "st_gid", None),
         ))
@@ -737,7 +740,7 @@ class MetadataDB:
     def get_item_by_path(self, snapshot_id: int, rel_path: str) -> dict | None:
         """Devuelve un archivo de un snapshot anterior por ruta relativa."""
         row = self.conn.execute("""
-            SELECT id, size, mode, mtime_ns, uid, gid, recipe_id
+            SELECT id, size, mode, mtime_ns, ctime_ns, uid, gid, recipe_id
             FROM snapshot_items
             WHERE snapshot_id = ? AND path = ? AND item_type = 'file'
             LIMIT 1

@@ -144,7 +144,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
 
     print("Metadata vault status")
-    print(f"   db_file: {cfg.node.db_file}")
+    print(f"   catalog_file: {cfg.node.catalog_file}")
 
     print("Incremental metadata object graph")
     print(f"   auto_export: {bool(cfg.metadata.object_graph_auto_export)}")
@@ -152,7 +152,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"   object_store_dir_status: {dir_status(cfg.metadata.object_store_dir)}")
     print(f"   include_protection: {bool(cfg.metadata.object_graph_include_protection)}")
     print(f"   auto_pack: {bool(cfg.metadata.object_graph_auto_pack)}")
-    print(f"   pack_dir: {cfg.metadata.object_pack_dir or '<object_store_dir>/packs'}")
+    print(f"   generated_pack_dir: {cfg.metadata.generated_pack_dir}")
+    print(f"   generated_pack_dir_status: {dir_status(cfg.metadata.generated_pack_dir)}")
+    print(f"   recovered_pack_dir: {cfg.metadata.recovered_pack_dir}")
+    print(f"   recovered_pack_dir_status: {dir_status(cfg.metadata.recovered_pack_dir)}")
 
     print("Metadata secret material")
     print(f"   passphrase_file: {cfg.metadata.passphrase_file or '(not configured)'}")
@@ -184,8 +187,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"   identity_owner_id_error: {identity_owner_error}")
     print(f"   identity_file: {cfg.metadata.identity_file or '(not configured)'}")
     print(f"   identity_file_status: {file_status(cfg.metadata.identity_file)}")
-    print(f"   distributed_pack_store_dir: {cfg.metadata.distributed_pack_store_dir}")
-    print(f"   distributed_pack_store_status: {dir_status(cfg.metadata.distributed_pack_store_dir)}")
+    print(f"   custody_pack_store_dir: {cfg.metadata.custody_pack_store_dir}")
+    print(f"   custody_pack_store_status: {dir_status(cfg.metadata.custody_pack_store_dir)}")
     print(f"   pack_copies: {int(cfg.metadata.pack_copies)}")
     print(f"   strict_pack_copies: {bool(cfg.metadata.strict_pack_copies)}")
     print(f"   pack_discovery_max_candidates: {int(cfg.metadata.pack_discovery_max_candidates)}")
@@ -398,7 +401,7 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
 
     if bool(args.pack):
         pack_service = object_pack_service_from_config(args, cfg)
-        pack_dir = args.pack_dir or cfg.metadata.object_pack_dir or None
+        pack_dir = args.pack_dir or cfg.metadata.generated_pack_dir
         pack_result = pack_service.export_latest_pack(
             object_store_dir=object_store_dir,
             passphrase=passphrase,
@@ -443,7 +446,7 @@ def cmd_import_object_graph(args: argparse.Namespace) -> int:
     )
 
     print("Metadata object graph importado")
-    print(f"   db_file: {result.db_file}")
+    print(f"   catalog_file: {result.db_file}")
     print(f"   object_store: {result.object_store_dir}")
     print(f"   vault_id: {result.vault_id}")
     print(f"   catalog_hash: {result.catalog_hash}")
@@ -473,10 +476,8 @@ def cmd_list_object_packs(args: argparse.Namespace) -> int:
 
     if args.pack_dir:
         pack_dir = Path(args.pack_dir).expanduser().resolve()
-    elif args.object_store:
-        pack_dir = (Path(args.object_store).expanduser() / "packs").resolve()
     else:
-        pack_dir = (Path(cfg.metadata.object_store_dir).expanduser() / "packs").resolve()
+        pack_dir = Path(cfg.metadata.generated_pack_dir).expanduser().resolve()
 
     if not pack_dir.exists():
         raise StopanUsageError(f"Directorio de metadata object packs no existe: {pack_dir}")
@@ -557,11 +558,9 @@ def find_reusable_latest_object_pack(
     identity_file: str,
     passphrase: str | bytes,
 ):
-    resolved_pack_dir = (
-        Path(pack_dir).expanduser().resolve()
-        if pack_dir is not None
-        else (Path(object_store_dir).expanduser() / "packs").resolve()
-    )
+    resolved_pack_dir = Path(
+        pack_dir or cfg.metadata.generated_pack_dir
+    ).expanduser().resolve()
 
     if not resolved_pack_dir.exists():
         return None
@@ -621,7 +620,7 @@ def find_reusable_latest_object_pack(
 
 def metadata_pack_publication_maps(cfg, *, owner_id: str) -> tuple[dict[str, int], dict[str, float]]:
     db = MetadataDB(
-        cfg.node.db_file,
+        cfg.node.catalog_file,
         init_schema=False,
         access_mode=MetadataDBAccessMode.READ_ONLY,
     )
@@ -670,7 +669,7 @@ def record_metadata_pack_publication(cfg, result) -> None:
         return
 
     db = MetadataDB(
-        cfg.node.db_file,
+        cfg.node.catalog_file,
         access_mode=MetadataDBAccessMode.READ_WRITE,
     )
     try:
@@ -731,7 +730,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     passphrase = passphrase_for_decrypt(args, cfg)
     identity_file = identity_file_from_args(args, cfg)
     pack_service = object_pack_service_from_config(args, cfg)
-    pack_dir = args.pack_dir or cfg.metadata.object_pack_dir or None
+    pack_dir = args.pack_dir or cfg.metadata.generated_pack_dir
 
     reusable = None
     if not args.pack_out:
@@ -815,7 +814,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         **_metadata_pack_network_kwargs(args, cfg),
         max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),
         scrypt_cost=scrypt_cost_from_args(args, cfg),
-        db_file=cfg.node.db_file,
+        db_file=cfg.node.catalog_file,
         import_db=bool(args.import_db),
         include_protection=not bool(args.no_protection),
         download_only=bool(args.download_only),
@@ -824,7 +823,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
             if args.default_desired_remote_copies is not None
             else cfg.protection.remote_copies
         ),
-        download_dir=args.download_dir,
+        download_dir=args.download_dir or cfg.metadata.recovered_pack_dir,
         pack_out=args.pack_out,
         target_hash=args.target_hash,
         vault_id=args.vault_id,
@@ -876,7 +875,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     if result.db_import_result is not None:
         db_import = result.db_import_result
         print("Rebuilt local metadata DB")
-        print(f"   db_file: {db_import.db_file}")
+        print(f"   catalog_file: {db_import.db_file}")
         db_import_stats = db_import.stats
         print(f"   snapshots_imported: {db_import_stats.snapshots_imported}")
         print(f"   complete_snapshots_imported: {db_import_stats.complete_snapshots_imported}")
@@ -1007,7 +1006,7 @@ def cmd_pack_object_graph(args: argparse.Namespace) -> int:
         passphrase=passphrase_for_decrypt(args, cfg),
         identity_file=identity_file_from_args(args, cfg),
         out_path=args.out,
-        pack_dir=args.pack_dir,
+        pack_dir=args.pack_dir or cfg.metadata.generated_pack_dir,
     )
 
     print("Metadata object pack creado")

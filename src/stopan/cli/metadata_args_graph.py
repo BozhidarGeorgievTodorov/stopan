@@ -40,7 +40,7 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     export_parser = graph_subparsers.add_parser(
         "export",
         allow_abbrev=False,
-        help="Exporta el estado actual de _metadata.db a un object store incremental cifrado.",
+        help="Exporta el estado actual del catálogo SQLite a un object store incremental cifrado.",
     )
     export_parser.set_defaults(command="graph.export")
     add_config_args(export_parser)
@@ -79,7 +79,7 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
         default=None,
         help=(
             "Directorio de salida del pack si se usa --pack y se omite --pack-out. "
-            "Default: metadata.object_pack_dir o <object-store>/packs."
+            "Default: metadata.generated_pack_dir."
         ),
     )
     add_scrypt_override_args(export_parser)
@@ -87,7 +87,7 @@ def add_graph_group(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     import_parser = graph_subparsers.add_parser(
         "import",
         allow_abbrev=False,
-        help="Reconstruye una _metadata.db vacía desde el latest del object store cifrado.",
+        help="Reconstruye un catálogo SQLite vacío desde el latest del object store cifrado.",
     )
     import_parser.set_defaults(command="graph.import")
     add_config_args(import_parser)

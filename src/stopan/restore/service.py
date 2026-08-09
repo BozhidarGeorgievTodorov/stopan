@@ -31,8 +31,8 @@ def restore_snapshot(
     batch_target_parallelism: int,
     prefetch_window: int,
     db_file: str,
-    local_shard_dir: str,
-    repo_store_dir: str,
+    local_chunk_dir: str,
+    custody_chunk_dir: str,
     self_addr: str,
     cluster_token: str,
     membership_timeout_s: float,
@@ -70,8 +70,8 @@ def restore_snapshot(
                 "el snapshot no cumple el formato distribuido esperado."
             )
 
-        repo = CASRepository(local_shard_dir)
-        p2p_local_repo = CASRepository(repo_store_dir)
+        repo = CASRepository(local_chunk_dir)
+        p2p_local_repo = CASRepository(custody_chunk_dir)
         cluster_rf = normalize_remote_rf(rf)
 
         if use_remote_chunks or use_ec_recovery:

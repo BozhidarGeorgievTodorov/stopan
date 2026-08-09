@@ -10,7 +10,6 @@ from __future__ import annotations
 import signal
 import threading
 from concurrent import futures
-from pathlib import Path
 
 import grpc
 
@@ -57,15 +56,6 @@ def _restore_shutdown_handlers(previous_handlers) -> None:
             continue
 
 
-def _resolve_metadata_pack_store_dir(config: StopanConfig) -> str:
-    """Resuelve la ruta del almacén distribuido de metadata packs."""
-
-    path = Path(config.metadata.distributed_pack_store_dir).expanduser()
-    if path.is_absolute():
-        return str(path)
-    return str(Path(config.node.repo_store_dir).expanduser().resolve() / path)
-
-
 def serve(config: StopanConfig) -> None:
     """Arranca el nodo Stopan y bloquea hasta recibir señal de parada."""
     
@@ -73,7 +63,7 @@ def serve(config: StopanConfig) -> None:
     if not advertise_addr:
         raise StopanConfigError("Falta node.advertise_addr, por ejemplo node1:50051.")
 
-    identity_store = NodeIdentityStore(config.node.repo_store_dir)
+    identity_store = NodeIdentityStore(config.node.identity_file)
     identity = identity_store.load_for_startup()
 
     membership_settings = MembershipSettings(
@@ -98,14 +88,14 @@ def serve(config: StopanConfig) -> None:
         settings=membership_settings,
     )
     storage_servicer = StorageNodeServicer(
-        config.node.repo_store_dir,
+        config.storage.custody_dir,
         cluster_token=config.cluster.token,
         commit_workers=config.storage.commit_workers,
         commit_queue_items=config.storage.commit_queue_items,
         max_chunk_size=config.storage.max_chunk_size,
     )
     metadata_servicer = MetadataPackServiceServicer(
-        _resolve_metadata_pack_store_dir(config),
+        config.metadata.custody_pack_store_dir,
         cluster_token=config.cluster.token,
         max_pack_bytes=config.metadata.max_distributed_pack_bytes,
         max_packs_per_owner=config.metadata.max_distributed_packs_per_owner,

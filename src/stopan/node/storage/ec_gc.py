@@ -13,7 +13,7 @@ def collect_ec_shards(
     max_age_seconds: int | None,
     dry_run: bool,
 ) -> LocalFileGarbageCollectionResult:
-    root = Path(root_dir).expanduser().resolve() / "ec_shards"
+    root = Path(root_dir).expanduser().resolve()
     return collect_files_by_age(
         target=target,
         root_dir=root,

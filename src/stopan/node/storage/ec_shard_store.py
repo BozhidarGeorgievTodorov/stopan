@@ -36,7 +36,7 @@ class StoredDataPackShard:
 
 class DataPackShardStore:
     def __init__(self, root_dir: str | Path, *, max_shard_size: int):
-        self.root = Path(root_dir).expanduser().resolve() / "ec_shards"
+        self.root = Path(root_dir).expanduser().resolve()
         self.max_shard_size = _require_positive_int("max_shard_size", max_shard_size)
         try:
             self.root.mkdir(parents=True, exist_ok=True)

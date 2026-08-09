@@ -5,4 +5,4 @@ gc:
   target: received-metadata-packs
   apply: true
   # max_age_days: 30
-  # pack_store: /var/lib/stopan/metadata_distributed_packs
+  # pack_store: /var/lib/stopan/custody/metadata_packs

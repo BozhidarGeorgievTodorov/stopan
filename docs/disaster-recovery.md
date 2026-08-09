@@ -11,7 +11,7 @@ Este procedimiento aplica cuando se pierde la máquina que creó snapshots, pero
 El objetivo es reconstruir una máquina operativa que pueda:
 
 - contactar con el clúster
-- recuperar `_metadata.db`
+- recuperar el catálogo SQLite
 - conocer snapshots, recipes y chunks
 - restaurar datos desde CAS local recuperado, réplicas remotas o shards EC
 - volver a publicar metadata y protección tras la recuperación
@@ -137,7 +137,7 @@ sudo journalctl -u stopan-node.service
 
 ## Recuperar metadata
 
-La recuperación de metadata descarga un pack remoto válido, lo importa al object store local y reconstruye `_metadata.db`.
+La recuperación de metadata descarga un pack remoto válido, lo importa al object store local y reconstruye el catálogo SQLite.
 
 Primero comprueba qué packs son visibles:
 
@@ -165,7 +165,7 @@ stopan metadata graph status
 
 ## Restaurar datos
 
-Una vez reconstruida `_metadata.db`, Stopan vuelve a conocer snapshots, recipes y hashes de chunks. A partir de ahí, restaura el snapshot que quieras recuperar.
+Una vez reconstruido el catálogo SQLite, Stopan vuelve a conocer snapshots, recipes y hashes de chunks. A partir de ahí, restaura el snapshot que quieras recuperar.
 
 ```bash
 stopan restore <SNAPSHOT_ID>
@@ -198,7 +198,7 @@ Este paso es importante porque la máquina recuperada puede tener una nueva conf
 
 ## Casos especiales
 
-### Solo se perdió `_metadata.db`
+### Solo se perdió el catálogo SQLite
 
 Si el nodo sigue existiendo y conserva configuración, identidad, passphrase y stores locales, no hace falta reconstruir toda la máquina. Recupera metadata con:
 
@@ -253,7 +253,7 @@ Antes de dar por cerrada la recuperación, comprueba:
 - `metadata.passphrase` e `metadata_identity.json` son los originales
 - `stopan init metadata` no ha creado una identidad nueva
 - `metadata pack discover` ve packs remotos
-- `metadata pack recover` reconstruye `_metadata.db`
+- `metadata pack recover` reconstruye el catálogo SQLite
 - `restore --remote-recovery auto` completa el snapshot esperado
 - `verify` no muestra degradación inesperada
 - `metadata graph export --pack` funciona

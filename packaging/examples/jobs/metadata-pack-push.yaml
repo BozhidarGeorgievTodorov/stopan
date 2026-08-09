@@ -5,6 +5,6 @@ kind: metadata-pack
 metadata_pack:
   action: push
   passphrase_file: /etc/stopan/metadata.passphrase
-  # pack_in: /var/lib/stopan/metadata_packs/pack.stopanmetapack
+  # pack_in: /var/lib/stopan/metadata/packs/generated/pack.stopanmetapack
   # pack_copies: 3
   # strict_pack_copies: false

@@ -10,7 +10,6 @@ from stopan.config.defaults import (
     DEFAULT_CLUSTER_SEEDS,
     DEFAULT_CLUSTER_TOKEN,
     DEFAULT_GC_GENERATED_CHUNK_GRACE_HOURS,
-    DEFAULT_GC_GENERATED_EC_GRACE_HOURS,
     DEFAULT_GC_GENERATED_METADATA_GRAPH_GRACE_HOURS,
     DEFAULT_GC_GENERATED_METADATA_PACK_GRACE_HOURS,
     DEFAULT_GC_RECEIVED_CHUNK_MAX_AGE_DAYS,
@@ -29,7 +28,7 @@ from stopan.config.defaults import (
     DEFAULT_MEMBERSHIP_PROTOCOL_PERIOD_S,
     DEFAULT_MEMBERSHIP_RPC_TIMEOUT_S,
     DEFAULT_MEMBERSHIP_SUSPECT_TIMEOUT_S,
-    DEFAULT_METADATA_DISTRIBUTED_PACK_STORE_DIR,
+    DEFAULT_METADATA_CUSTODY_PACK_STORE_DIR,
     DEFAULT_METADATA_IDENTITY_FILE,
     DEFAULT_METADATA_KEY_LENGTH,
     DEFAULT_METADATA_MAX_DISTRIBUTED_PACK_BYTES,
@@ -39,7 +38,8 @@ from stopan.config.defaults import (
     DEFAULT_METADATA_OBJECT_GRAPH_AUTO_EXPORT,
     DEFAULT_METADATA_OBJECT_GRAPH_AUTO_PACK,
     DEFAULT_METADATA_OBJECT_GRAPH_INCLUDE_PROTECTION,
-    DEFAULT_METADATA_OBJECT_PACK_DIR,
+    DEFAULT_METADATA_GENERATED_PACK_DIR,
+    DEFAULT_METADATA_RECOVERED_PACK_DIR,
     DEFAULT_METADATA_OBJECT_STORE_DIR,
     DEFAULT_METADATA_OWNER_ID,
     DEFAULT_METADATA_PACK_COPIES,
@@ -54,9 +54,8 @@ from stopan.config.defaults import (
     DEFAULT_METADATA_SCRYPT_R,
     DEFAULT_NODE_ADVERTISE_ADDR,
     DEFAULT_NODE_BIND_ADDR,
-    DEFAULT_NODE_DB_FILE,
-    DEFAULT_NODE_LOCAL_SHARD_DIR,
-    DEFAULT_NODE_REPO_STORE_DIR,
+    DEFAULT_NODE_CATALOG_FILE,
+    DEFAULT_NODE_IDENTITY_FILE,
     DEFAULT_PROTECTION_EC_K,
     DEFAULT_PROTECTION_EC_M,
     DEFAULT_PROTECTION_REMOTE_COPIES,
@@ -71,6 +70,8 @@ from stopan.config.defaults import (
     DEFAULT_RESTORE_PREFETCH_WINDOW,
     DEFAULT_RESTORE_RPC_TIMEOUT_S,
     DEFAULT_STORAGE_COMMIT_QUEUE_ITEMS,
+    DEFAULT_STORAGE_CUSTODY_DIR,
+    DEFAULT_STORAGE_LOCAL_CHUNK_DIR,
     DEFAULT_STORAGE_COMMIT_WORKERS,
     DEFAULT_STORAGE_MAX_CHUNK_SIZE,
     DEFAULT_STORAGE_RPC_WORKERS,
@@ -128,16 +129,14 @@ def _require_hex64(name: str, value: str) -> None:
 class NodeConfig:
     bind_addr: str = DEFAULT_NODE_BIND_ADDR
     advertise_addr: str = DEFAULT_NODE_ADVERTISE_ADDR
-    repo_store_dir: str = DEFAULT_NODE_REPO_STORE_DIR
-    local_shard_dir: str = DEFAULT_NODE_LOCAL_SHARD_DIR
-    db_file: str = DEFAULT_NODE_DB_FILE
+    identity_file: str = DEFAULT_NODE_IDENTITY_FILE
+    catalog_file: str = DEFAULT_NODE_CATALOG_FILE
 
     def __post_init__(self) -> None:
         _require_str("node.bind_addr", self.bind_addr)
         _require_str("node.advertise_addr", self.advertise_addr, allow_empty=True)
-        _require_str("node.repo_store_dir", self.repo_store_dir)
-        _require_str("node.local_shard_dir", self.local_shard_dir)
-        _require_str("node.db_file", self.db_file)
+        _require_str("node.identity_file", self.identity_file)
+        _require_str("node.catalog_file", self.catalog_file)
 
 
 @dataclass(frozen=True)
@@ -190,12 +189,16 @@ class GrpcConfig:
 
 @dataclass(frozen=True)
 class StorageConfig:
+    local_chunk_dir: str = DEFAULT_STORAGE_LOCAL_CHUNK_DIR
+    custody_dir: str = DEFAULT_STORAGE_CUSTODY_DIR
     rpc_workers: int = DEFAULT_STORAGE_RPC_WORKERS
     commit_workers: int = DEFAULT_STORAGE_COMMIT_WORKERS
     commit_queue_items: int = DEFAULT_STORAGE_COMMIT_QUEUE_ITEMS
     max_chunk_size: int = DEFAULT_STORAGE_MAX_CHUNK_SIZE
 
     def __post_init__(self) -> None:
+        _require_str("storage.local_chunk_dir", self.local_chunk_dir)
+        _require_str("storage.custody_dir", self.custody_dir)
         _require_int("storage.rpc_workers", self.rpc_workers, min_value=1)
         _require_int("storage.commit_workers", self.commit_workers, min_value=1)
         _require_int("storage.commit_queue_items", self.commit_queue_items, min_value=1)
@@ -273,8 +276,9 @@ class MetadataConfig:
     object_store_dir: str = DEFAULT_METADATA_OBJECT_STORE_DIR
     object_graph_include_protection: bool = DEFAULT_METADATA_OBJECT_GRAPH_INCLUDE_PROTECTION
     object_graph_auto_pack: bool = DEFAULT_METADATA_OBJECT_GRAPH_AUTO_PACK
-    object_pack_dir: str = DEFAULT_METADATA_OBJECT_PACK_DIR
-    distributed_pack_store_dir: str = DEFAULT_METADATA_DISTRIBUTED_PACK_STORE_DIR
+    generated_pack_dir: str = DEFAULT_METADATA_GENERATED_PACK_DIR
+    recovered_pack_dir: str = DEFAULT_METADATA_RECOVERED_PACK_DIR
+    custody_pack_store_dir: str = DEFAULT_METADATA_CUSTODY_PACK_STORE_DIR
     pack_copies: int = DEFAULT_METADATA_PACK_COPIES
     strict_pack_copies: bool = DEFAULT_METADATA_STRICT_PACK_COPIES
     pack_discovery_max_candidates: int = DEFAULT_METADATA_PACK_DISCOVERY_MAX_CANDIDATES
@@ -300,8 +304,9 @@ class MetadataConfig:
         _require_str("metadata.object_store_dir", self.object_store_dir)
         _require_bool("metadata.object_graph_include_protection", self.object_graph_include_protection)
         _require_bool("metadata.object_graph_auto_pack", self.object_graph_auto_pack)
-        _require_str("metadata.object_pack_dir", self.object_pack_dir, allow_empty=True)
-        _require_str("metadata.distributed_pack_store_dir", self.distributed_pack_store_dir)
+        _require_str("metadata.generated_pack_dir", self.generated_pack_dir)
+        _require_str("metadata.recovered_pack_dir", self.recovered_pack_dir)
+        _require_str("metadata.custody_pack_store_dir", self.custody_pack_store_dir)
         _require_int("metadata.pack_copies", self.pack_copies, min_value=0)
         _require_bool("metadata.strict_pack_copies", self.strict_pack_copies)
         _require_int("metadata.pack_discovery_max_candidates", self.pack_discovery_max_candidates, min_value=1)
@@ -343,7 +348,6 @@ class MetadataConfig:
 class GcConfig:
     generated_chunk_grace_hours: float = DEFAULT_GC_GENERATED_CHUNK_GRACE_HOURS
     received_chunk_max_age_days: int = DEFAULT_GC_RECEIVED_CHUNK_MAX_AGE_DAYS
-    generated_ec_grace_hours: float = DEFAULT_GC_GENERATED_EC_GRACE_HOURS
     received_ec_max_age_days: int = DEFAULT_GC_RECEIVED_EC_MAX_AGE_DAYS
     generated_metadata_graph_grace_hours: float = DEFAULT_GC_GENERATED_METADATA_GRAPH_GRACE_HOURS
     generated_metadata_pack_grace_hours: float = DEFAULT_GC_GENERATED_METADATA_PACK_GRACE_HOURS
@@ -358,12 +362,6 @@ class GcConfig:
             inclusive=True,
         )
         _require_int("gc.received_chunk_max_age_days", self.received_chunk_max_age_days, min_value=0)
-        _require_float(
-            "gc.generated_ec_grace_hours",
-            self.generated_ec_grace_hours,
-            min_value=0.0,
-            inclusive=True,
-        )
         _require_int("gc.received_ec_max_age_days", self.received_ec_max_age_days, min_value=0)
         _require_float(
             "gc.generated_metadata_graph_grace_hours",

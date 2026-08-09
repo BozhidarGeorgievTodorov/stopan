@@ -374,14 +374,11 @@ def recover_metadata_from_network(
         selected_pack_path_base = Path(pack_out).expanduser().resolve()
         ensure_private_dir(selected_pack_path_base.parent)
     else:
-        if download_dir is not None:
-            base = Path(download_dir).expanduser().resolve()
-        elif object_store_path is not None:
-            base = object_store_path / "recovered_packs"
-        else:
+        if download_dir is None:
             raise MetadataPackRecoverError(
-                "Se requiere --pack-out, --download-dir o --object-store para guardar el pack recuperado."
+                "Se requiere pack_out o download_dir para guardar el pack recuperado."
             )
+        base = Path(download_dir).expanduser().resolve()
         ensure_private_dir(base)
         selected_pack_path_base = base / "recovered.stopanmetapack"
 

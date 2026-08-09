@@ -45,7 +45,7 @@ def backup_directory(
     cluster_token: str,
     membership_timeout_s: float,
     max_message_bytes: int,
-    local_shard_dir: str,
+    local_chunk_dir: str,
     db_file: str,
     node_id_file: str,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
@@ -177,7 +177,7 @@ def backup_directory(
                 future = executor.submit(
                     process_file_worker,
                     full_path,
-                    local_shard_dir=local_shard_dir,
+                    local_chunk_dir=local_chunk_dir,
                     db_file=db_file,
                     fast_local_enabled=policy.fast_local_enabled,
                     fast_remote_enabled=policy.fast_remote_enabled,

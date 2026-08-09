@@ -7,9 +7,8 @@
 node:
   bind_addr: "[::]:50051"
   advertise_addr: "node.example.net:50051"
-  repo_store_dir: "/var/lib/stopan/_node_store"
-  local_shard_dir: "/var/lib/stopan/_data_chunks"
-  db_file: "/var/lib/stopan/_metadata.db"
+  identity_file: "/var/lib/stopan/state/node_id.txt"
+  catalog_file: "/var/lib/stopan/state/catalog.sqlite"
 
 cluster:
   token: "change-me"
@@ -33,6 +32,8 @@ grpc:
   keepalive_permit_without_calls: false
 
 storage:
+  local_chunk_dir: "/var/lib/stopan/data/chunks"
+  custody_dir: "/var/lib/stopan/custody"
   rpc_workers: 64
   commit_workers: 16
   commit_queue_items: 256
@@ -70,11 +71,12 @@ metadata:
   owner_id: ""
   identity_file: "/etc/stopan/metadata_identity.json"
   object_graph_auto_export: false
-  object_store_dir: "/var/lib/stopan/metadata_object_store"
+  object_store_dir: "/var/lib/stopan/metadata/object_store"
   object_graph_include_protection: true
   object_graph_auto_pack: false
-  object_pack_dir: "/var/lib/stopan/metadata_packs"
-  distributed_pack_store_dir: "/var/lib/stopan/metadata_distributed_packs"
+  generated_pack_dir: "/var/lib/stopan/metadata/packs/generated"
+  recovered_pack_dir: "/var/lib/stopan/metadata/packs/recovered"
+  custody_pack_store_dir: "/var/lib/stopan/custody/metadata_packs"
   pack_copies: 3
   strict_pack_copies: false
   pack_discovery_max_candidates: 10
@@ -93,7 +95,6 @@ metadata:
 gc:
   generated_chunk_grace_hours: 48.0
   received_chunk_max_age_days: 0
-  generated_ec_grace_hours: 48.0
   received_ec_max_age_days: 0
   generated_metadata_graph_grace_hours: 48.0
   generated_metadata_pack_grace_hours: 48.0

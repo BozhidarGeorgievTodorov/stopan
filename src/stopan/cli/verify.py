@@ -95,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             self_addr=cfg.node.advertise_addr,
             cluster_token=cfg.cluster.token,
             membership_timeout_s=cfg.membership.rpc_timeout_s,
-            db_file=cfg.node.db_file,
+            db_file=cfg.node.catalog_file,
             include_verified=bool(args.reverify_verified),
             limit=args.limit,
             scope=args.scope,
@@ -120,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stats = verify_remote_protection(
         membership_seed=args.membership_seed or first_seed(cfg),
-        db_file=cfg.node.db_file,
+        db_file=cfg.node.catalog_file,
         self_addr=cfg.node.advertise_addr,
         cluster_token=cfg.cluster.token,
         membership_timeout_s=cfg.membership.rpc_timeout_s,

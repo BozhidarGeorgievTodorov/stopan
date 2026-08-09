@@ -10,7 +10,7 @@ from stopan.cli.metadata_args_common import (
 
 _OWNER_ID_HELP = "Owner ID 64-hex lowercase. Default: metadata.owner_id o metadata.identity_file."
 _IDENTITY_FILE_HELP = "Ruta de identity file. Default: metadata.identity_file."
-_PACK_STORE_HELP = "Directorio local de packs distribuidos. Default: metadata.distributed_pack_store_dir."
+_PACK_STORE_HELP = "Directorio local de packs distribuidos. Default: metadata.custody_pack_store_dir."
 _MEMBERSHIP_DISCOVERY_HELP = "Seed de membership para descubrir nodos remotos. Default: cluster.seeds[0]."
 _PACK_TARGET_PARALLELISM_HELP = (
     "Número de nodos remotos consultados en paralelo. Default: metadata.pack_target_parallelism."
@@ -67,12 +67,12 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     create_parser.add_argument(
         "--out",
         default=None,
-        help="Ruta exacta de salida .stopanmetapack. Si se omite, usa <object-store>/packs/pack-<hash>.stopanmetapack.",
+        help="Ruta exacta de salida .stopanmetapack. Si se omite, usa metadata.generated_pack_dir.",
     )
     create_parser.add_argument(
         "--pack-dir",
         default=None,
-        help="Directorio de salida si se omite --out. Default: <object-store>/packs.",
+        help="Directorio de salida si se omite --out. Default: metadata.generated_pack_dir.",
     )
     create_parser.add_argument(
         "--passphrase-file",
@@ -126,14 +126,9 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     list_parser.set_defaults(command="pack.list")
     add_config_args(list_parser)
     list_parser.add_argument(
-        "--object-store",
-        default=None,
-        help="Directorio del metadata object store. Si se usa, lista <object-store>/packs.",
-    )
-    list_parser.add_argument(
         "--pack-dir",
         default=None,
-        help="Directorio exacto de packs a listar. Tiene prioridad sobre --object-store.",
+        help="Directorio exacto de packs a listar. Default: metadata.generated_pack_dir.",
     )
 
     import_parser = pack_subparsers.add_parser(
@@ -199,7 +194,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         default=None,
         help=(
             "Directorio de salida del pack si se omite --pack-out y no se usa --pack-in. "
-            "Default: metadata.object_pack_dir o <object-store>/packs."
+            "Default: metadata.generated_pack_dir."
         ),
     )
     _add_owner_identity_args(push_parser)
@@ -290,7 +285,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     recover_parser.add_argument(
         "--download-dir",
         default=None,
-        help="Directorio donde guardar el pack descargado. Default: <object-store>/recovered_packs.",
+        help="Directorio donde guardar el pack descargado. Default: metadata.recovered_pack_dir.",
     )
     recover_parser.add_argument(
         "--pack-out",
@@ -300,7 +295,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     recover_parser.add_argument(
         "--download-only",
         action="store_true",
-        help="Solo descarga y valida el pack elegido; no importa el object store ni reconstruye _metadata.db.",
+        help="Solo descarga y valida el pack elegido; no importa el object store ni reconstruye el catálogo SQLite.",
     )
     recover_parser.add_argument(
         "--target-hash",
@@ -317,7 +312,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         dest="import_db",
         action="store_false",
         default=True,
-        help="Importa el pack recuperado al object store local, pero no reconstruye _metadata.db.",
+        help="Importa el pack recuperado al object store local, pero no reconstruye el catálogo SQLite.",
     )
     recover_parser.add_argument(
         "--no-protection",

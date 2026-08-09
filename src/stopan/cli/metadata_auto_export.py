@@ -106,7 +106,7 @@ def build_metadata_object_graph_auto_export(args: argparse.Namespace, cfg: Any) 
 
     object_store_dir = str(cli_store or cfg.metadata.object_store_dir)
     passphrase_file = str(getattr(args, "metadata_passphrase_file", None) or cfg.metadata.passphrase_file)
-    pack_dir = str(cli_pack_dir or cfg.metadata.object_pack_dir or "") or None
+    pack_dir = str(cli_pack_dir or cfg.metadata.generated_pack_dir)
     identity_file = str(getattr(args, "metadata_identity_file", None) or cfg.metadata.identity_file or "")
 
     return MetadataObjectGraphAutoExport(

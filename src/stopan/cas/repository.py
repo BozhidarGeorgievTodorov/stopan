@@ -16,7 +16,7 @@ from typing import Final
 import blake3
 import zstandard as zstd
 
-from stopan.config.defaults import DEFAULT_NODE_LOCAL_SHARD_DIR
+from stopan.config.defaults import DEFAULT_STORAGE_LOCAL_CHUNK_DIR
 from stopan.errors import StopanDataError, StopanStorageError
 
 
@@ -48,7 +48,7 @@ class CASRepository:
 
     _ZSTD_LEVEL: Final[int] = 3
 
-    def __init__(self, data_folder: str = DEFAULT_NODE_LOCAL_SHARD_DIR):
+    def __init__(self, data_folder: str = DEFAULT_STORAGE_LOCAL_CHUNK_DIR):
         self.data_folder = os.path.abspath(data_folder)
         try:
             os.makedirs(self.data_folder, exist_ok=True)

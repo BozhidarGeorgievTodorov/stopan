@@ -18,7 +18,7 @@ def collect_received_metadata_packs(
     max_age_days: int | None,
     dry_run: bool,
 ) -> PruneMetadataPackStoreResult:
-    root_dir = pack_store or cfg.metadata.distributed_pack_store_dir
+    root_dir = pack_store or cfg.metadata.custody_pack_store_dir
     store = MetadataPackStore(
         root_dir,
         max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),
@@ -38,8 +38,7 @@ def collect_recovered_metadata_packs(
     max_age_days: int | None,
     dry_run: bool,
 ) -> LocalFileGarbageCollectionResult:
-    object_store_dir = Path(object_store or cfg.metadata.object_store_dir)
-    root = Path(pack_dir or (object_store_dir / "recovered_packs")).expanduser().resolve()
+    root = Path(pack_dir or cfg.metadata.recovered_pack_dir).expanduser().resolve()
     days = int(cfg.gc.recovered_metadata_pack_max_age_days if max_age_days is None else max_age_days)
     return collect_files_by_age(
         target="recovered-metadata-packs",

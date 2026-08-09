@@ -182,9 +182,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
     "node": {
         "bind_addr": _as_str,
         "advertise_addr": _as_str,
-        "repo_store_dir": _as_str,
-        "local_shard_dir": _as_str,
-        "db_file": _as_str,
+        "identity_file": _as_str,
+        "catalog_file": _as_str,
     },
     "cluster": {
         "token": _as_str,
@@ -206,6 +205,8 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
         "keepalive_permit_without_calls": _as_bool,
     },
     "storage": {
+        "local_chunk_dir": _as_str,
+        "custody_dir": _as_str,
         "rpc_workers": _as_int,
         "commit_workers": _as_int,
         "commit_queue_items": _as_int,
@@ -246,8 +247,9 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
         "object_store_dir": _as_str,
         "object_graph_include_protection": _as_bool,
         "object_graph_auto_pack": _as_bool,
-        "object_pack_dir": _as_str,
-        "distributed_pack_store_dir": _as_str,
+        "generated_pack_dir": _as_str,
+        "recovered_pack_dir": _as_str,
+        "custody_pack_store_dir": _as_str,
         "pack_copies": _as_int,
         "strict_pack_copies": _as_bool,
         "pack_discovery_max_candidates": _as_int,
@@ -266,7 +268,6 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
     "gc": {
         "generated_chunk_grace_hours": _as_float,
         "received_chunk_max_age_days": _as_int,
-        "generated_ec_grace_hours": _as_float,
         "received_ec_max_age_days": _as_int,
         "generated_metadata_graph_grace_hours": _as_float,
         "generated_metadata_pack_grace_hours": _as_float,

@@ -108,14 +108,14 @@ def scrypt_cost_from_config(cfg: Any) -> ScryptCost:
 
 def object_graph_service_from_config(args: Namespace, cfg: Any) -> MetadataObjectGraphStoreService:
     return MetadataObjectGraphStoreService(
-        db_file=cfg.node.db_file,
+        db_file=cfg.node.catalog_file,
         scrypt_cost=scrypt_cost_from_args(args, cfg),
     )
 
 
 def object_graph_service_from_config_defaults(cfg: Any) -> MetadataObjectGraphStoreService:
     return MetadataObjectGraphStoreService(
-        db_file=cfg.node.db_file,
+        db_file=cfg.node.catalog_file,
         scrypt_cost=scrypt_cost_from_config(cfg),
     )
 
@@ -189,7 +189,7 @@ def owner_id_from_args(args: Namespace, cfg: Any) -> str:
 
 
 def distributed_pack_store_from_args(args: Namespace, cfg: Any) -> MetadataPackStore:
-    root_dir = getattr(args, "pack_store", None) or cfg.metadata.distributed_pack_store_dir
+    root_dir = getattr(args, "pack_store", None) or cfg.metadata.custody_pack_store_dir
     return MetadataPackStore(
         root_dir,
         max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),

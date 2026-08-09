@@ -20,6 +20,18 @@ install -d -o root -g stopan -m 0750 /etc/stopan
 install -d -o root -g stopan -m 0750 /etc/stopan/jobs
 install -d -o root -g stopan -m 0750 /etc/stopan/profiles
 install -d -o stopan -g stopan -m 0750 /var/lib/stopan
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/state
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/data
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/data/chunks
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/object_store
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/packs
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/packs/generated
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/packs/recovered
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody/chunks
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody/ec_shards
+install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody/metadata_packs
 install -d -o stopan -g stopan -m 0750 /var/log/stopan
 
 install_if_missing() {

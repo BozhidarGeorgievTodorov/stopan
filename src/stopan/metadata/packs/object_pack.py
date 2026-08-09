@@ -197,11 +197,9 @@ class MetadataObjectPackService:
             )
 
             if out_path is None:
-                base_dir = (
-                    Path(pack_dir).expanduser().resolve()
-                    if pack_dir is not None
-                    else Path(object_store_dir).expanduser().resolve() / "packs"
-                )
+                if pack_dir is None:
+                    raise StopanUsageError("export_latest_pack requiere pack_dir cuando no se proporciona out_path")
+                base_dir = Path(pack_dir).expanduser().resolve()
                 ensure_private_dir(base_dir)
                 path = base_dir / f"pack-{pack_hash}{OBJECT_PACK_FILE_SUFFIX}"
             else:

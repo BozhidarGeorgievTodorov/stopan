@@ -37,7 +37,7 @@ def _invalid_chunk_hash_detail(chunk_hash: str) -> str:
 class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
     def __init__(
         self,
-        repo_store_dir: str,
+        custody_dir: str,
         *,
         cluster_token: str,
         commit_workers: int,
@@ -51,7 +51,8 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         salientes se devuelven comprimidos y el cliente restore valida integridad.
         """
         self._cluster_token = str(cluster_token or "")
-        self.repo = CASRepository(repo_store_dir)
+        custody_root = os.path.abspath(custody_dir)
+        self.repo = CASRepository(os.path.join(custody_root, "chunks"))
         self.commit_engine = StorageCommitEngine(
             self.repo,
             max_chunk_size=max_chunk_size,
@@ -59,11 +60,11 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             max_pending=commit_queue_items,
         )
         self.ec_shard_store = DataPackShardStore(
-            repo_store_dir,
+            os.path.join(custody_root, "ec_shards"),
             max_shard_size=max_chunk_size,
         )
         self.ec_shard_rpc = DataPackShardRpcHandler(self.ec_shard_store)
-        print(f"Nodo P2P listo. Almacenando en: {os.path.abspath(repo_store_dir)}")
+        print(f"Nodo P2P listo. Custodia en: {custody_root}")
         print(
             f"Commit engine: workers={self.commit_engine.worker_count} "
             f"queue={self.commit_engine.max_pending} "

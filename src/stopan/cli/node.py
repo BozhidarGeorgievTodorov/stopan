@@ -51,8 +51,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return _build_parser().parse_args(argv)
 
 
-def _read_node_identity(repo_store_dir: str) -> tuple[str | None, int | None, str | None]:
-    path = Path(repo_store_dir) / "node_id.txt"
+def _read_node_identity(identity_file: str) -> tuple[str | None, int | None, str | None]:
+    path = Path(identity_file)
     if not path.exists():
         return None, None, f"missing ({path})"
 
@@ -197,7 +197,7 @@ def _status(args: argparse.Namespace) -> int:
 
     local_node_id: str | None = None
     if not remote_query:
-        local_node_id, incarnation, identity_status = _read_node_identity(cfg.node.repo_store_dir)
+        local_node_id, incarnation, identity_status = _read_node_identity(cfg.node.identity_file)
 
     print("Node status")
     print("Config")
@@ -217,9 +217,10 @@ def _status(args: argparse.Namespace) -> int:
         print(f"   identity_file: {identity_status}")
 
         print("Local storage")
-        print(f"   repo_store_dir: {_format_path_status(_path_status(cfg.node.repo_store_dir))}")
-        print(f"   local_shard_dir: {_format_path_status(_path_status(cfg.node.local_shard_dir))}")
-        print(f"   db_file: {cfg.node.db_file}")
+        print(f"   identity_file: {_format_path_status(_path_status(cfg.node.identity_file))}")
+        print(f"   local_chunk_dir: {_format_path_status(_path_status(cfg.storage.local_chunk_dir))}")
+        print(f"   custody_dir: {_format_path_status(_path_status(cfg.storage.custody_dir))}")
+        print(f"   catalog_file: {cfg.node.catalog_file}")
 
     if not address:
         print("RPC")

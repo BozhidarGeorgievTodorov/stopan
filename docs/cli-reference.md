@@ -540,9 +540,10 @@ Opciones:
 --bind-addr ADDR
 --token TOKEN
 --seed HOST:PORT
---repo-store-dir DIR
---local-shard-dir DIR
---db-file PATH
+--identity-file PATH
+--catalog-file PATH
+--local-chunk-dir DIR
+--custody-dir DIR
 --remote-copies N
 --strict-remote-copies
 --no-strict-remote-copies
@@ -554,7 +555,7 @@ Opciones:
 
 `--seed` puede repetirse. Si no se pasa ningún seed, Stopan usa `advertise_addr` como seed inicial.
 
-`--repo-store-dir`, `--local-shard-dir` y `--db-file` actualizan las rutas persistentes del nodo. El comando crea los directorios necesarios.
+`--identity-file` y `--catalog-file` fijan el estado operativo del nodo. `--local-chunk-dir` configura el CAS propio y `--custody-dir` la raíz de contenido recibido. El comando crea los directorios necesarios.
 
 `--remote-copies` actualiza `protection.remote_copies` y puede ser 0 o mayor.
 
@@ -725,7 +726,7 @@ Opciones:
 --metadata-key-length N
 ```
 
-Exporta el estado actual de `_metadata.db` a un metadata object graph incremental y cifrado. Por defecto incluye `chunk_protection`. Con `--no-protection` no la incluye.
+Exporta el estado actual del catálogo SQLite a un metadata object graph incremental y cifrado. Por defecto incluye `chunk_protection`. Con `--no-protection` no la incluye.
 
 Si se pasa `--pack`, además crea un `.stopanmetapack` transportable a partir del latest del object graph. En ese caso se usa `--identity-file` para cifrar el pack.
 
@@ -754,7 +755,7 @@ Opciones:
 --default-desired-remote-copies N
 ```
 
-Reconstruye una `_metadata.db` vacía desde el latest del metadata object store cifrado.
+Reconstruye un catálogo SQLite vacío desde el latest del metadata object store cifrado.
 
 Con protección incluida, importa también `chunk_protection`. Con `--no-protection`, o cuando el graph no tiene índice de protección, crea filas `PENDING` para chunks conocidos usando `--default-desired-remote-copies` o `protection.remote_copies`.
 
@@ -802,7 +803,7 @@ Opciones:
 --metadata-key-length N
 ```
 
-Crea un `.stopanmetapack` desde el latest del object store. Si no se pasa `--out`, escribe en `<object-store>/packs/pack-<hash>.stopanmetapack`, o en `--pack-dir` si se especifica.
+Crea un `.stopanmetapack` desde el latest del object store. Si no se pasa `--out`, escribe en `metadata.generated_pack_dir` o en `--pack-dir` si se especifica.
 
 Validación: `--out` y `--pack-dir` son incompatibles.
 
@@ -842,11 +843,10 @@ stopan metadata pack list [opciones]
 Opciones:
 
 ```bash
---object-store DIR
 --pack-dir DIR
 ```
 
-Lista packs locales sin descifrarlos. Si se pasa `--pack-dir`, tiene prioridad. Si se pasa `--object-store`, lista `<object-store>/packs`. Si no se pasa nada, usa `<metadata.object_store_dir>/packs`.
+Lista packs locales sin descifrarlos. Si se pasa `--pack-dir`, usa ese directorio. En caso contrario usa `metadata.generated_pack_dir`.
 
 ### `metadata pack import`
 
@@ -1021,7 +1021,7 @@ Opciones:
 --metadata-key-length N
 ```
 
-Recupera metadata desde packs distribuidos. Descubre packs remotos del owner, elige uno válido, lo descarga, valida firma/hash, lo importa al object store local y, por defecto, reconstruye `_metadata.db`.
+Recupera metadata desde packs distribuidos. Descubre packs remotos del owner, elige uno válido, lo descarga, valida firma/hash, lo importa al object store local y, por defecto, reconstruye el catálogo SQLite.
 
 `--target-parallelism`, `--rpc-timeout-s` y `--max-message-bytes` controlan la búsqueda y la descarga remota. El pack se recibe por bloques, se valida mientras se escribe en un temporal y solo se publica tras comprobar su tamaño, firma y hash.
 
@@ -1031,7 +1031,7 @@ Recupera metadata desde packs distribuidos. Descubre packs remotos del owner, el
 
 `--download-only` descarga y valida íntegramente el pack elegido, incluida la correspondencia entre hash, tipo, tamaño y bytes canónicos de cada objeto. No importa el object store ni reconstruye la DB.
 
-`--no-import-db` importa el pack al object store local pero no reconstruye `_metadata.db`.
+`--no-import-db` importa el pack al object store local pero no reconstruye el catálogo SQLite.
 
 `--no-protection` reconstruye DB sin importar `chunk_protection`, creando filas `PENDING` para chunks conocidos. `--default-desired-remote-copies` decide cuántas copias deseadas tendrán esas filas si hace falta.
 
@@ -1142,7 +1142,6 @@ La sección `gc` de `stopan.yaml` define edades y periodos de gracia. Esa config
 ```bash
 stopan gc generated-chunks [opciones]
 stopan gc received-chunks [opciones]
-stopan gc generated-ec [opciones]
 stopan gc received-ec [opciones]
 ```
 
@@ -1164,15 +1163,6 @@ Opciones de `received-chunks`:
 --apply
 ```
 
-Opciones de `generated-ec`:
-
-```bash
---ec-store DIR
---grace-hours HOURS
---dry-run
---apply
-```
-
 Opciones de `received-ec`:
 
 ```bash
@@ -1182,13 +1172,11 @@ Opciones de `received-ec`:
 --apply
 ```
 
-`generated-chunks` limpia chunks generados localmente en `node.local_shard_dir`. Usa periodo de gracia en horas.
+`generated-chunks` limpia chunks propios en `storage.local_chunk_dir`. Usa periodo de gracia en horas.
 
-`received-chunks` limpia chunks recibidos en `node.repo_store_dir`. Usa edad máxima en días. Valor `0` desactiva el borrado por edad.
+`received-chunks` limpia chunks recibidos bajo `storage.custody_dir/chunks`. Usa edad máxima en días. Valor `0` desactiva el borrado por edad.
 
-`generated-ec` limpia shards EC generados localmente bajo `node.local_shard_dir/ec_shards`. Usa periodo de gracia en horas.
-
-`received-ec` limpia shards EC recibidos bajo `node.repo_store_dir/ec_shards`. Usa edad máxima en días. Valor `0` desactiva el borrado por edad.
+`received-ec` limpia shards EC recibidos bajo `storage.custody_dir/ec_shards`. Usa edad máxima en días. Valor `0` desactiva el borrado por edad. Los shards EC creados para un push no se persisten localmente y no tienen un target `generated-ec`.
 
 ### Targets de metadata generada
 
@@ -1249,9 +1237,9 @@ Opciones de `recovered-metadata-packs`:
 --apply
 ```
 
-`received-metadata-packs` limpia packs recibidos en `metadata.distributed_pack_store_dir` aplicando límites de edad y cuotas del pack store.
+`received-metadata-packs` limpia packs recibidos en `metadata.custody_pack_store_dir` aplicando límites de edad y cuotas del pack store.
 
-`recovered-metadata-packs` limpia packs descargados por `metadata pack recover`. Por defecto usa `<object-store>/recovered_packs`.
+`recovered-metadata-packs` limpia packs descargados por `metadata pack recover`. Por defecto usa `metadata.recovered_pack_dir`.
 
 ### Target global
 
@@ -1273,7 +1261,6 @@ Opciones:
 ```text
 generated-chunks
 received-chunks
-generated-ec
 received-ec
 generated-metadata-graph
 generated-metadata-packs

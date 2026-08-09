@@ -2,25 +2,25 @@
 
 Este documento cubre únicamente la protección y recuperación de metadata. La recuperación completa de una máquina perdida se describe en [`docs/disaster-recovery.md`](disaster-recovery.md).
 
-La metadata es crítica para reconstruir un respaldo. Sin `_metadata.db` no basta con conservar los chunks en disco, porque faltan snapshots, rutas originales, recipes de reconstrucción y estado de protección.
+La metadata es crítica para reconstruir un respaldo. Sin el catálogo SQLite no basta con conservar los chunks en disco, porque faltan snapshots, rutas originales, recipes de reconstrucción y estado de protección.
 
 Los ejemplos usan `stopan` directamente. En instalaciones donde `/etc/stopan` o `/var/lib/stopan` solo sean accesibles por un usuario de servicio, ejecuta los comandos con un usuario que tenga permisos suficientes.
 
 ## Qué se protege
 
-Stopan no distribuye una copia binaria de `_metadata.db`. En su lugar, exporta la base de datos local a un metadata object graph cifrado. Ese graph contiene la información necesaria para reconstruir la metadata de snapshots, recetas, chunks y, si se incluye, estado de protección.
+Stopan no distribuye una copia binaria del catálogo SQLite. En su lugar, exporta la base de datos local a un metadata object graph cifrado. Ese graph contiene la información necesaria para reconstruir la metadata de snapshots, recetas, chunks y, si se incluye, estado de protección.
 
 A partir del latest del object graph se puede crear un `.stopanmetapack`. El pack es un artefacto transportable, cifrado y firmado con la identidad de metadata del nodo propietario.
 
 Flujo completo:
 
 ```text
-_metadata.db
+catálogo SQLite
 metadata object graph cifrado
 .stopanmetapack cifrado y firmado
 distribución remota
 recover/import
-_metadata.db reconstruida
+catálogo SQLite reconstruido
 ```
 
 Los nodos que almacenan metadata packs no necesitan descifrarlos. Solo guardan el artefacto y validan información como hash, firma, propietario, tamaño y cuotas.
@@ -215,7 +215,7 @@ stopan metadata pack recover \
   --download-dir /var/lib/stopan/recovered_metadata
 ```
 
-Importar el pack al object store local sin reconstruir `_metadata.db`:
+Importar el pack al object store local sin reconstruir el catálogo SQLite:
 
 ```bash
 stopan metadata pack recover --no-import-db
@@ -233,7 +233,7 @@ Esta última opción crea filas `PENDING` para los chunks conocidos. Es útil cu
 
 ## Importación manual del graph
 
-Si ya tienes un metadata object store recuperado localmente, puedes reconstruir `_metadata.db` desde su latest:
+Si ya tienes un metadata object store recuperado localmente, puedes reconstruir el catálogo SQLite desde su latest:
 
 ```bash
 stopan metadata graph import
@@ -243,7 +243,7 @@ Para importar desde una ruta concreta:
 
 ```bash
 stopan metadata graph import \
-  --object-store /var/lib/stopan/metadata_object_store
+  --object-store /var/lib/stopan/metadata/object_store
 ```
 
 Si el graph no incluye protection index, o si se quiere ignorarlo durante la importación:

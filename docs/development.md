@@ -71,9 +71,10 @@ Los comandos operativos buscan `/etc/stopan/stopan.yaml` por defecto. En desarro
 python -m stopan init node \
   --config local.stopan.yaml \
   --advertise-addr localhost:50051 \
-  --repo-store-dir .stopan/_node_store \
-  --local-shard-dir .stopan/_data_chunks \
-  --db-file .stopan/_metadata.db
+  --identity-file .stopan/state/node_id.txt \
+  --catalog-file .stopan/state/catalog.sqlite \
+  --local-chunk-dir .stopan/data/chunks \
+  --custody-dir .stopan/custody
 ```
 
 ## Validaciones útiles

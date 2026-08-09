@@ -10,7 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from stopan.common.batching import iter_batches
-from stopan.config.defaults import DEFAULT_NODE_DB_FILE
+from stopan.config.defaults import DEFAULT_NODE_CATALOG_FILE
 from stopan.errors import StopanDataError
 from stopan.protection.policy import ProtectionRecord, ProtectionState, is_record_sufficient
 
@@ -146,7 +146,7 @@ class MetadataDB:
 
     def __init__(
         self,
-        db_file: str = DEFAULT_NODE_DB_FILE,
+        db_file: str = DEFAULT_NODE_CATALOG_FILE,
         *,
         init_schema: bool = True,
         access_mode: MetadataDBAccessMode | str = MetadataDBAccessMode.READ_WRITE,

@@ -121,9 +121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         cluster_token=cfg.cluster.token,
         membership_timeout_s=cfg.membership.rpc_timeout_s,
         max_message_bytes=cfg.grpc.max_message_bytes,
-        local_shard_dir=cfg.node.local_shard_dir,
-        db_file=cfg.node.db_file,
-        node_id_file=os.path.join(cfg.node.repo_store_dir, "node_id.txt"),
+        local_chunk_dir=cfg.storage.local_chunk_dir,
+        db_file=cfg.node.catalog_file,
+        node_id_file=cfg.node.identity_file,
         metadata_object_graph_auto_export=metadata_object_graph_auto_export,
     )
     return 0 if result is not False else 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import grp
 import os
+import pwd
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -16,11 +17,12 @@ from stopan.common.fs import atomic_write_bytes
 from stopan.config.defaults import (
     DEFAULT_CLUSTER_TOKEN,
     DEFAULT_NODE_BIND_ADDR,
+    DEFAULT_NODE_CATALOG_FILE,
+    DEFAULT_NODE_IDENTITY_FILE,
     DEFAULT_PROTECTION_REMOTE_COPIES,
     DEFAULT_STOPAN_CONFIG,
-    DEFAULT_SYSTEM_DB_FILE,
-    DEFAULT_SYSTEM_LOCAL_SHARD_DIR,
-    DEFAULT_SYSTEM_REPO_STORE_DIR,
+    DEFAULT_STORAGE_CUSTODY_DIR,
+    DEFAULT_STORAGE_LOCAL_CHUNK_DIR,
 )
 from stopan.config.loader import load_config
 from stopan.config.model import StopanConfig
@@ -39,7 +41,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     node = sub.add_parser(
         "node",
         allow_abbrev=False,
-        help="Configura la sección node/cluster del fichero principal de Stopan.",
+        help="Configura identidad, almacenamiento y pertenencia del nodo.",
     )
     node.add_argument(
         "--config",
@@ -68,19 +70,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Seed de membership. Puede repetirse. Si se omite, se usa advertise-addr.",
     )
     node.add_argument(
-        "--repo-store-dir",
-        default=DEFAULT_SYSTEM_REPO_STORE_DIR,
-        help=f"Directorio del almacén P2P del nodo. Por defecto: {DEFAULT_SYSTEM_REPO_STORE_DIR}.",
+        "--identity-file",
+        default=DEFAULT_NODE_IDENTITY_FILE,
+        help=f"Ruta de la identidad operativa del nodo. Por defecto: {DEFAULT_NODE_IDENTITY_FILE}.",
     )
     node.add_argument(
-        "--local-shard-dir",
-        default=DEFAULT_SYSTEM_LOCAL_SHARD_DIR,
-        help=f"Directorio del CAS local. Por defecto: {DEFAULT_SYSTEM_LOCAL_SHARD_DIR}.",
+        "--catalog-file",
+        default=DEFAULT_NODE_CATALOG_FILE,
+        help=f"Ruta del catálogo operativo SQLite. Por defecto: {DEFAULT_NODE_CATALOG_FILE}.",
     )
     node.add_argument(
-        "--db-file",
-        default=DEFAULT_SYSTEM_DB_FILE,
-        help=f"Ruta de metadata local. Por defecto: {DEFAULT_SYSTEM_DB_FILE}.",
+        "--local-chunk-dir",
+        default=DEFAULT_STORAGE_LOCAL_CHUNK_DIR,
+        help=f"Directorio del CAS de chunks propios. Por defecto: {DEFAULT_STORAGE_LOCAL_CHUNK_DIR}.",
+    )
+    node.add_argument(
+        "--custody-dir",
+        default=DEFAULT_STORAGE_CUSTODY_DIR,
+        help=f"Raíz de los datos recibidos en custodia. Por defecto: {DEFAULT_STORAGE_CUSTODY_DIR}.",
     )
     node.add_argument(
         "--remote-copies",
@@ -140,9 +147,12 @@ def _build_node_config(args: argparse.Namespace, base_cfg: StopanConfig | None =
         node={
             "bind_addr": args.bind_addr,
             "advertise_addr": args.advertise_addr,
-            "repo_store_dir": args.repo_store_dir,
-            "local_shard_dir": args.local_shard_dir,
-            "db_file": args.db_file,
+            "identity_file": args.identity_file,
+            "catalog_file": args.catalog_file,
+        },
+        storage={
+            "local_chunk_dir": args.local_chunk_dir,
+            "custody_dir": args.custody_dir,
         },
         cluster={
             "token": args.token,
@@ -157,6 +167,59 @@ def _stopan_group_gid() -> int | None:
         return grp.getgrnam("stopan").gr_gid
     except KeyError:
         return None
+
+
+def _stopan_service_ids() -> tuple[int, int] | None:
+    try:
+        user = pwd.getpwnam("stopan")
+    except KeyError:
+        return None
+
+    gid = _stopan_group_gid()
+    return user.pw_uid, (user.pw_gid if gid is None else gid)
+
+
+def _directory_is_writable_by(path: Path, *, uid: int, gid: int) -> bool:
+    st = path.stat()
+    mode = st.st_mode
+    if st.st_uid == uid:
+        access_bits = (mode >> 6) & 0o7
+    elif st.st_gid == gid:
+        access_bits = (mode >> 3) & 0o7
+    else:
+        access_bits = mode & 0o7
+    return (access_bits & 0o3) == 0o3
+
+
+def _apply_service_directory_permissions(path: Path, *, created: bool, mode: int = 0o750) -> None:
+    service_ids = _stopan_service_ids() if os.geteuid() == 0 else None
+
+    try:
+        if service_ids is None:
+            if created:
+                os.chmod(path, mode)
+            return
+
+        uid, gid = service_ids
+        managed_root = Path("/var/lib/stopan")
+        resolved = path.resolve()
+        managed_by_stopan = resolved == managed_root or managed_root in resolved.parents
+
+        if created or managed_by_stopan:
+            os.chown(path, uid, gid)
+            os.chmod(path, mode)
+            return
+
+        if not _directory_is_writable_by(path, uid=uid, gid=gid):
+            raise StopanStorageError(
+                f"El directorio configurado {path} ya existe fuera de /var/lib/stopan "
+                "y no es escribible por el usuario de servicio stopan. "
+                "Ajusta su propietario o permisos antes de ejecutar Stopan."
+            )
+    except StopanStorageError:
+        raise
+    except OSError as exc:
+        raise StopanStorageError(f"No se pudieron ajustar permisos de {path}: {exc}") from exc
 
 
 def _apply_service_file_permissions(path: Path, *, mode: int = 0o640) -> None:
@@ -239,16 +302,20 @@ def _ensure_mapping(root: dict[str, Any], section: str) -> dict[str, Any]:
 
 
 def _prepare_node_directories(cfg: StopanConfig) -> list[Path]:
-    directories = [
-        Path(cfg.node.repo_store_dir),
-        Path(cfg.node.local_shard_dir),
-        Path(cfg.node.db_file).parent,
-    ]
+    directories = list(dict.fromkeys([
+        Path(cfg.node.identity_file).parent,
+        Path(cfg.node.catalog_file).parent,
+        Path(cfg.storage.local_chunk_dir),
+        Path(cfg.storage.custody_dir) / "chunks",
+        Path(cfg.storage.custody_dir) / "ec_shards",
+    ]))
     for directory in directories:
+        created = not directory.exists()
         try:
             directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise StopanStorageError(f"No se pudo preparar el directorio {directory}: {exc}") from exc
+        _apply_service_directory_permissions(directory, created=created)
     return directories
 
 
@@ -263,9 +330,15 @@ def _init_node(args: argparse.Namespace) -> int:
         {
             "bind_addr": args.bind_addr,
             "advertise_addr": args.advertise_addr,
-            "repo_store_dir": args.repo_store_dir,
-            "local_shard_dir": args.local_shard_dir,
-            "db_file": args.db_file,
+            "identity_file": args.identity_file,
+            "catalog_file": args.catalog_file,
+        }
+    )
+    storage = _ensure_mapping(data, "storage")
+    storage.update(
+        {
+            "local_chunk_dir": args.local_chunk_dir,
+            "custody_dir": args.custody_dir,
         }
     )
     cluster = _ensure_mapping(data, "cluster")

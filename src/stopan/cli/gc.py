@@ -28,37 +28,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _add_file_target(
         subparsers,
         "generated-chunks",
-        help_text="Limpia chunks generados localmente en node.local_shard_dir.",
+        help_text="Limpia chunks propios en storage.local_chunk_dir.",
         path_arg="chunk_store",
         path_option="--chunk-store",
-        path_help="CAS de chunks generados. Default: node.local_shard_dir.",
+        path_help="CAS de chunks propios. Default: storage.local_chunk_dir.",
         age_kind="grace-hours",
     )
     _add_file_target(
         subparsers,
         "received-chunks",
-        help_text="Limpia chunks recibidos en node.repo_store_dir.",
+        help_text="Limpia chunks recibidos en storage.custody_dir/chunks.",
         path_arg="chunk_store",
         path_option="--chunk-store",
-        path_help="CAS de chunks recibidos. Default: node.repo_store_dir.",
+        path_help="CAS de chunks recibidos. Default: storage.custody_dir/chunks.",
         age_kind="max-age-days",
     )
     _add_file_target(
         subparsers,
-        "generated-ec",
-        help_text="Limpia shards EC generados localmente bajo node.local_shard_dir/ec_shards.",
-        path_arg="ec_store",
-        path_option="--ec-store",
-        path_help="Raíz del almacén EC generado. Default: node.local_shard_dir.",
-        age_kind="grace-hours",
-    )
-    _add_file_target(
-        subparsers,
         "received-ec",
-        help_text="Limpia shards EC recibidos bajo node.repo_store_dir/ec_shards.",
+        help_text="Limpia shards EC recibidos en storage.custody_dir/ec_shards.",
         path_arg="ec_store",
         path_option="--ec-store",
-        path_help="Raíz del almacén EC recibido. Default: node.repo_store_dir.",
+        path_help="Almacén EC recibido. Default: storage.custody_dir/ec_shards.",
         age_kind="max-age-days",
     )
 
@@ -120,7 +111,7 @@ def _add_file_target(
             "--grace-hours",
             type=float,
             default=None,
-            help="Periodo de gracia antes de borrar ficheros antiguos. Default: gc.generated_chunk_grace_hours o gc.generated_ec_grace_hours según target.",
+            help="Periodo de gracia antes de borrar ficheros antiguos. Default: gc.generated_chunk_grace_hours.",
         )
     else:
         parser.add_argument(
@@ -176,7 +167,7 @@ def _add_metadata_graph_target(
         parser.add_argument(
             "--pack-dir",
             default=None,
-            help="Directorio de packs generados a limpiar. Default: metadata.object_pack_dir o <object-store>/packs.",
+            help="Directorio de packs generados a limpiar. Default: metadata.generated_pack_dir.",
         )
     _add_apply_args(parser)
 
@@ -194,7 +185,7 @@ def _add_received_metadata_packs_target(
     parser.add_argument(
         "--pack-store",
         default=None,
-        help="Directorio del distributed metadata pack store. Default: metadata.distributed_pack_store_dir.",
+        help="Directorio del distributed metadata pack store. Default: metadata.custody_pack_store_dir.",
     )
     parser.add_argument(
         "--max-age-days",
@@ -223,7 +214,7 @@ def _add_recovered_metadata_packs_target(
     parser.add_argument(
         "--pack-dir",
         default=None,
-        help="Directorio de packs recuperados. Default: <object-store>/recovered_packs.",
+        help="Directorio de packs recuperados. Default: metadata.recovered_pack_dir.",
     )
     parser.add_argument(
         "--max-age-days",
@@ -283,7 +274,6 @@ def _command_handlers() -> dict[str, GcCommandHandler]:
     return {
         "generated-chunks": _cmd_generated_chunks,
         "received-chunks": _cmd_received_chunks,
-        "generated-ec": _cmd_generated_ec,
         "received-ec": _cmd_received_ec,
         "generated-metadata-graph": _cmd_metadata_object_store,
         "generated-metadata-packs": _cmd_metadata_object_store,
@@ -299,7 +289,7 @@ def _cmd_generated_chunks(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     result = collect_cas_chunks(
         target=args.command,
-        root_dir=args.chunk_store or cfg.node.local_shard_dir,
+        root_dir=args.chunk_store or cfg.storage.local_chunk_dir,
         max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_chunk_grace_hours)) * _SECONDS_PER_HOUR),
         dry_run=bool(args.dry_run),
     )
@@ -313,22 +303,8 @@ def _cmd_received_chunks(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     result = collect_cas_chunks(
         target=args.command,
-        root_dir=args.chunk_store or cfg.node.repo_store_dir,
+        root_dir=args.chunk_store or (Path(cfg.storage.custody_dir) / "chunks"),
         max_age_seconds=int(choose(args.max_age_days, cfg.gc.received_chunk_max_age_days)) * _SECONDS_PER_DAY,
-        dry_run=bool(args.dry_run),
-    )
-    _print_local_file_result(result)
-    return 0
-
-
-def _cmd_generated_ec(args: argparse.Namespace) -> int:
-    from stopan.node.storage.ec_gc import collect_ec_shards
-
-    cfg = load_runtime_config(args)
-    result = collect_ec_shards(
-        target=args.command,
-        root_dir=args.ec_store or cfg.node.local_shard_dir,
-        max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_ec_grace_hours)) * _SECONDS_PER_HOUR),
         dry_run=bool(args.dry_run),
     )
     _print_local_file_result(result)
@@ -341,7 +317,7 @@ def _cmd_received_ec(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     result = collect_ec_shards(
         target=args.command,
-        root_dir=args.ec_store or cfg.node.repo_store_dir,
+        root_dir=args.ec_store or (Path(cfg.storage.custody_dir) / "ec_shards"),
         max_age_seconds=int(choose(args.max_age_days, cfg.gc.received_ec_max_age_days)) * _SECONDS_PER_DAY,
         dry_run=bool(args.dry_run),
     )
@@ -373,7 +349,7 @@ def _cmd_metadata_object_store(args: argparse.Namespace) -> int:
 
     include_objects = bool(args.include_objects)
     include_packs = bool(args.include_packs)
-    pack_dir = (getattr(args, "pack_dir", None) or cfg.metadata.object_pack_dir or None) if include_packs else None
+    pack_dir = (getattr(args, "pack_dir", None) or cfg.metadata.generated_pack_dir) if include_packs else None
     identity_file = identity_file_from_args(args, cfg) if include_packs else (cfg.metadata.identity_file or "")
     object_grace_default = cfg.gc.generated_metadata_graph_grace_hours
     object_grace_hours = float(choose(getattr(args, "object_grace_hours", None), object_grace_default))
@@ -447,7 +423,6 @@ def _all_target_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     targets = [
         argparse.Namespace(**base, command="generated-chunks", chunk_store=None, grace_hours=None),
         argparse.Namespace(**base, command="received-chunks", chunk_store=None, max_age_days=None),
-        argparse.Namespace(**base, command="generated-ec", ec_store=None, grace_hours=None),
         argparse.Namespace(**base, command="received-ec", ec_store=None, max_age_days=None),
         argparse.Namespace(
             **base,
@@ -516,7 +491,7 @@ def _print_metadata_object_gc_result(target: str, result) -> None:
     print(f"   object_files_malformed: {result.object_files_malformed}")
     print(f"   object_bytes_deleted: {format_bytes(result.object_bytes_deleted)}")
     print("Packs")
-    print(f"   pack_dir: {result.pack_dir}")
+    print(f"   pack_dir: {result.pack_dir if result.pack_dir is not None else '(not used)'}")
     print(f"   pack_files_seen: {result.pack_files_seen}")
     print(f"   pack_files_latest: {result.pack_files_latest}")
     print(f"   pack_files_collectable: {result.pack_files_collectable}")

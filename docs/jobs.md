@@ -246,8 +246,8 @@ metadata_graph:
   action: export
   pack: true
   passphrase_file: /etc/stopan/metadata.passphrase
-  object_store: /var/lib/stopan/metadata_object_store
-  pack_dir: /var/lib/stopan/metadata_packs
+  object_store: /var/lib/stopan/metadata/object_store
+  pack_dir: /var/lib/stopan/metadata/packs/generated
 ```
 
 Importar graph:
@@ -258,7 +258,7 @@ kind: metadata-graph
 metadata_graph:
   action: import
   passphrase_file: /etc/stopan/metadata.passphrase
-  object_store: /var/lib/stopan/metadata_object_store
+  object_store: /var/lib/stopan/metadata/object_store
   no_protection: false
 ```
 
@@ -389,7 +389,7 @@ gc:
   target: received-metadata-packs
   apply: true
   max_age_days: 30
-  pack_store: /var/lib/stopan/metadata_distributed_packs
+  pack_store: /var/lib/stopan/custody/metadata_packs
 ```
 
 Campos soportados:

@@ -55,23 +55,20 @@ class NodeIdentityStore:
     """
     Guarda la identidad estable de un nodo P2P.
 
-    El archivo node_id.txt contiene dos datos:
-    - node_id: identifica de forma estable este nodo mientras exista su carpeta de estado;
+    El archivo configurado contiene dos datos:
+    - node_id: identifica de forma estable este nodo mientras exista su estado persistente;
     - incarnation: número de arranque usado por el protocolo de membership.
 
     Cada vez que el nodo arranca, incrementa incarnation. Así otros nodos pueden distinguir
     un proceso nuevo de una ejecución anterior que quizá habían marcado como sospechosa o caída.
 
-    Formato de node_id.txt:
+    Formato del archivo:
         <node_id>
         <incarnation>
     """
 
-    _FILENAME = "node_id.txt"
-
-    def __init__(self, root_path: str):
-        self.root_path = os.path.abspath(root_path)
-        self.file_path = os.path.join(self.root_path, self._FILENAME)
+    def __init__(self, file_path: str | Path):
+        self.file_path = str(Path(file_path).expanduser().resolve())
         self._lock = threading.Lock()
 
     def load_for_startup(self) -> NodeIdentity:

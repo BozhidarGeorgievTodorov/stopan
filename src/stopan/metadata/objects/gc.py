@@ -48,7 +48,7 @@ class MetadataObjectGarbageCollectionResult:
     object_files_malformed: int
     object_bytes_deleted: int
 
-    pack_dir: Path
+    pack_dir: Path | None
     pack_files_seen: int
     pack_files_latest: int
     pack_files_collectable: int
@@ -126,8 +126,12 @@ class MetadataObjectGarbageCollector:
             resolved_pack_dir = (
                 Path(pack_dir).expanduser().resolve()
                 if pack_dir is not None
-                else root / "packs"
+                else None
             )
+            if include_packs and resolved_pack_dir is None:
+                raise MetadataObjectGarbageCollectionError(
+                    "GC de metadata packs requiere pack_dir cuando include_packs está activo"
+                )
             pack_stats = _sweep_packs(
                 pack_dir=resolved_pack_dir,
                 latest_vault_id=latest.vault_id,
@@ -257,7 +261,7 @@ def _sweep_objects(
 
 def _sweep_packs(
     *,
-    pack_dir: Path,
+    pack_dir: Path | None,
     latest_vault_id: str,
     latest_catalog_hash: str,
     latest_state_digest: str,
@@ -270,7 +274,13 @@ def _sweep_packs(
     errors: list[str],
 ) -> _PackSweepStats:
     stats = _PackSweepStats()
-    if not enabled or not pack_dir.exists():
+    if not enabled:
+        return stats
+    if pack_dir is None:
+        raise MetadataObjectGarbageCollectionError(
+            "GC de metadata packs requiere pack_dir cuando está activo"
+        )
+    if not pack_dir.exists():
         return stats
     if not pack_dir.is_dir():
         errors.append(f"pack_dir no es un directorio: {pack_dir}")

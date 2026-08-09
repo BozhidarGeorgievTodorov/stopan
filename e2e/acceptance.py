@@ -414,8 +414,9 @@ def yaml_list(values: list[str], indent: int = 14) -> str:
 
 
 def write_node_config(path: Path, *, scenario: Scenario, alias: str) -> None:
-    repo_dir = CONTAINER_ROOT / "nodes" / alias / "repo"
     state_dir = CONTAINER_ROOT / "nodes" / alias / "state"
+    data_dir = CONTAINER_ROOT / "nodes" / alias / "data"
+    custody_dir = CONTAINER_ROOT / "nodes" / alias / "custody"
 
     write_text_file(
         path,
@@ -424,9 +425,8 @@ def write_node_config(path: Path, *, scenario: Scenario, alias: str) -> None:
             node:
               bind_addr: "[::]:50051"
               advertise_addr: "{scenario.addr(alias)}"
-              repo_store_dir: "{repo_dir}"
-              local_shard_dir: "{state_dir / '_data_chunks'}"
-              db_file: "{state_dir / '_metadata.db'}"
+              identity_file: "{state_dir / 'node_id.txt'}"
+              catalog_file: "{state_dir / 'catalog.sqlite'}"
 
             cluster:
               token: "{scenario.cluster_token}"
@@ -438,8 +438,12 @@ def write_node_config(path: Path, *, scenario: Scenario, alias: str) -> None:
               ec_k: {scenario.ec_k or 2}
               ec_m: {scenario.ec_m or 1}
 
+            storage:
+              local_chunk_dir: "{data_dir / 'chunks'}"
+              custody_dir: "{custody_dir}"
+
             metadata:
-              distributed_pack_store_dir: "{repo_dir / 'metadata_packs'}"
+              custody_pack_store_dir: "{custody_dir / 'metadata_packs'}"
             """
         ).lstrip(),
     )
@@ -455,9 +459,8 @@ def write_client_config(path: Path, *, scenario: Scenario) -> None:
             node:
               bind_addr: "127.0.0.1:0"
               advertise_addr: "{scenario.origin_addr}"
-              repo_store_dir: "{client_dir / 'repo'}"
-              local_shard_dir: "{client_dir / '_data_chunks'}"
-              db_file: "{client_dir / '_metadata.db'}"
+              identity_file: "{client_dir / 'state' / 'node_id.txt'}"
+              catalog_file: "{client_dir / 'state' / 'catalog.sqlite'}"
 
             cluster:
               token: "{scenario.cluster_token}"
@@ -469,15 +472,38 @@ def write_client_config(path: Path, *, scenario: Scenario) -> None:
               ec_k: {scenario.ec_k or 2}
               ec_m: {scenario.ec_m or 1}
 
+            storage:
+              local_chunk_dir: "{client_dir / 'data' / 'chunks'}"
+              custody_dir: "{client_dir / 'custody'}"
+
             metadata:
               passphrase_file: "{client_dir / 'metadata.passphrase'}"
               identity_file: "{client_dir / 'metadata_identity.json'}"
-              object_store_dir: "{client_dir / 'metadata_object_store'}"
-              object_pack_dir: "{client_dir / 'packs'}"
-              distributed_pack_store_dir: "{client_dir / 'local_metadata_pack_store'}"
+              object_store_dir: "{client_dir / 'metadata' / 'object_store'}"
+              generated_pack_dir: "{client_dir / 'metadata' / 'packs' / 'generated'}"
+              recovered_pack_dir: "{client_dir / 'metadata' / 'packs' / 'recovered'}"
+              custody_pack_store_dir: "{client_dir / 'custody' / 'metadata_packs'}"
             """
         ).lstrip(),
     )
+
+
+def prepare_client_node_layout(client_dir: Path) -> None:
+    """Prepara el layout que normalmente crea ``stopan init node``.
+
+    El E2E escribe la configuración del cliente directamente para controlar sus
+    rutas temporales. Por ello debe reproducir explícitamente la preparación de
+    directorios que realizaría la inicialización normal antes de abrir el
+    catálogo SQLite.
+    """
+    directories = (
+        client_dir / "state",
+        client_dir / "data" / "chunks",
+        client_dir / "custody" / "chunks",
+        client_dir / "custody" / "ec_shards",
+    )
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 def remove_path(path: Path) -> None:
@@ -719,7 +745,7 @@ def export_and_push_metadata_pack(
     client_config: str,
 ) -> None:
     print("Exportando metadata graph, creando pack y distribuyéndolo...")
-    pack_path = CONTAINER_ROOT / "client" / "packs" / f"{scenario.name}.stopanmetapack"
+    pack_path = CONTAINER_ROOT / "client" / "metadata" / "packs" / "generated" / f"{scenario.name}.stopanmetapack"
     docker_stopan(
         tmp,
         image_tag=image_tag,
@@ -731,7 +757,7 @@ def export_and_push_metadata_pack(
             "--config",
             client_config,
             "--object-store",
-            str(CONTAINER_ROOT / "client" / "metadata_object_store"),
+            str(CONTAINER_ROOT / "client" / "metadata" / "object_store"),
             "--passphrase-file",
             str(CONTAINER_ROOT / "client" / "metadata.passphrase"),
             "--identity-file",
@@ -792,12 +818,12 @@ def verify_metadata_pack_distribution(
 
 def simulate_client_disaster(client_dir: Path, restore_base: Path) -> None:
     print("Simulando desastre local: se conservan solo identidad y passphrase de metadata...")
-    remove_sqlite_family(client_dir / "_metadata.db")
-    remove_path(client_dir / "_data_chunks")
-    remove_path(client_dir / "repo")
-    remove_path(client_dir / "metadata_object_store")
-    remove_path(client_dir / "packs")
-    remove_path(client_dir / "local_metadata_pack_store")
+    remove_sqlite_family(client_dir / "state" / "catalog.sqlite")
+    remove_path(client_dir / "state" / "node_id.txt")
+    remove_path(client_dir / "data" / "chunks")
+    remove_path(client_dir / "custody")
+    remove_path(client_dir / "metadata" / "object_store")
+    remove_path(client_dir / "metadata" / "packs")
     remove_path(client_dir / "recovered_object_store")
     remove_path(client_dir / "recovered.stopanmetapack")
     remove_path(restore_base)
@@ -891,6 +917,7 @@ def run_scenario(
         for alias in scenario.aliases:
             write_node_config(config_dir / f"{alias}.yaml", scenario=scenario, alias=alias)
         write_client_config(client_config_host, scenario=scenario)
+        prepare_client_node_layout(client_dir)
         write_text_file(client_dir / "metadata.passphrase", PASSPHRASE + "\n", mode=0o600)
         create_source_tree(source_dir, dataset_mb=dataset_mb)
 
@@ -921,12 +948,12 @@ def run_scenario(
             scenario=scenario,
             client_config=client_config,
         )
-        assert_metadata_has_backup(client_dir / "_metadata.db", context="después de backup")
+        assert_metadata_has_backup(client_dir / "state" / "catalog.sqlite", context="después de backup")
 
         push_chunks(tmp, image_tag=image_tag, network=network, scenario=scenario, client_config=client_config)
         verify_protection(tmp, image_tag=image_tag, network=network, scenario=scenario, client_config=client_config)
         if scenario.protection_mode == "ec":
-            assert_ec_metadata_complete(client_dir / "_metadata.db", context="después de push/verify EC")
+            assert_ec_metadata_complete(client_dir / "state" / "catalog.sqlite", context="después de push/verify EC")
 
         export_and_push_metadata_pack(
             tmp,
@@ -944,9 +971,9 @@ def run_scenario(
 
         simulate_client_disaster(client_dir, restore_base)
         recover_metadata(tmp, image_tag=image_tag, network=network, client_config=client_config)
-        assert_metadata_has_backup(client_dir / "_metadata.db", context="después de recuperar metadata")
+        assert_metadata_has_backup(client_dir / "state" / "catalog.sqlite", context="después de recuperar metadata")
         if scenario.protection_mode == "ec":
-            assert_ec_metadata_complete(client_dir / "_metadata.db", context="después de recuperar metadata EC")
+            assert_ec_metadata_complete(client_dir / "state" / "catalog.sqlite", context="después de recuperar metadata EC")
 
         restore_snapshot_and_compare(
             tmp,

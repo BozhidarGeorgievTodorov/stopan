@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import argparse
 from collections.abc import Sequence
 
@@ -98,9 +100,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         rf=replication_targets,
         batch_target_parallelism=int(choose(args.batch_target_parallelism, cfg.restore.batch_target_parallelism)),
         prefetch_window=int(choose(args.prefetch_window, cfg.restore.prefetch_window)),
-        db_file=cfg.node.db_file,
-        local_shard_dir=cfg.node.local_shard_dir,
-        repo_store_dir=cfg.node.repo_store_dir,
+        db_file=cfg.node.catalog_file,
+        local_chunk_dir=cfg.storage.local_chunk_dir,
+        custody_chunk_dir=str(Path(cfg.storage.custody_dir) / "chunks"),
         self_addr=cfg.node.advertise_addr,
         cluster_token=cfg.cluster.token,
         membership_timeout_s=cfg.membership.rpc_timeout_s,

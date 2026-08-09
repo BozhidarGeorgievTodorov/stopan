@@ -5,5 +5,5 @@ metadata_graph:
   action: export
   pack: true
   passphrase_file: /etc/stopan/metadata.passphrase
-  # object_store: /var/lib/stopan/metadata_object_store
-  # pack_dir: /var/lib/stopan/metadata_packs
+  # object_store: /var/lib/stopan/metadata/object_store
+  # pack_dir: /var/lib/stopan/metadata/packs/generated

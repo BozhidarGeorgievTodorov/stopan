@@ -54,17 +54,17 @@ El árbol principal vive bajo `src/stopan`.
 
 ## Capas persistentes
 
-Stopan trabaja con varias capas persistentes separadas.
+Stopan separa el estado operativo, los datos propios y el contenido recibido en custodia.
 
-El CAS local principal está configurado por `node.local_shard_dir`. Guarda chunks generados por backup, comprimidos con Zstandard y direccionados por BLAKE3. Es la primera fuente que consulta restore.
+La identidad operativa del nodo vive en `node.identity_file` y el catálogo SQLite en `node.catalog_file`. El catálogo conserva snapshots, items, recipes, chunks conocidos, estado de protección, data packs EC y publicaciones locales de metadata packs.
 
-La metadata SQLite está configurada por `node.db_file`. Guarda snapshots, items, recipes, chunks conocidos, estado de protección, data packs EC y publicaciones locales de metadata packs.
+El CAS local de chunks propios está configurado por `storage.local_chunk_dir`. Guarda los chunks materializados por backup o recuperados durante restore, comprimidos con Zstandard y direccionados por BLAKE3.
 
-El store P2P del nodo está configurado por `node.repo_store_dir` Guarda la identidad del nodo en `node_id.txt`, chunks recibidos por replicación y shards EC recibidos por el servicio remoto.
+La custodia de datos recibidos parte de `storage.custody_dir`: los chunks completos se almacenan en `chunks/` y los shards EC en `ec_shards/`. Estos artefactos no se incorporan al catálogo operativo del receptor.
 
-La metadata distribuida usa tres rutas independientes: `metadata.object_store_dir` para el object graph cifrado, `metadata.object_pack_dir` para packs generados localmente y `metadata.distributed_pack_store_dir` para packs recibidos por el servicio remoto.
+La metadata recuperable usa `metadata.object_store_dir` para el object graph cifrado, `metadata.generated_pack_dir` para packs generados, `metadata.recovered_pack_dir` para packs descargados durante recuperación y `metadata.custody_pack_store_dir` para packs custodiados por el servicio remoto.
 
-Esta separación evita mezclar el CAS generado por el nodo origen con los datos recibidos como servidor P2P y permite aplicar GC distinto a cada familia.
+Esta organización permite aplicar ciclos de vida y políticas de GC distintos a cada familia sin mezclar el estado propio con la custodia remota.
 
 ## Snapshots, items y recipes
 
@@ -237,7 +237,7 @@ Las rutas restauradas pasan por una normalización que rechaza rutas absolutas, 
 
 ## Metadata object graph
 
-La metadata distribuida no copia `_metadata.db` como fichero SQLite. Exporta el estado operacional a un metadata object graph cifrado.
+La metadata distribuida no copia el catálogo SQLite como fichero SQLite. Exporta el estado operacional a un metadata object graph cifrado.
 
 El exporter construye objetos canónicos para snapshots, árboles, archivos, recipes, chunks conocidos, protection index y, si se incluye protección, data packs EC. Los hashes de objeto se calculan sobre bytes canónicos plaintext antes de cifrar o almacenar.
 
@@ -261,7 +261,7 @@ Las publicaciones locales de metadata packs se guardan en SQLite para que discov
 
 En `metadata pack discover`, esta comparación es de mejor esfuerzo. Un fallo al abrir o consultar la SQLite local no impide listar y validar referencias remotas. El comando informa de la incidencia y deja la presencia en `UNKNOWN` cuando no dispone de una expectativa local utilizable.
 
-La recuperación de metadata lista packs remotos del owner, descarga candidatos, valida firma y hash, descifra con la identidad local y comprueba todos los objetos del paquete antes de considerarlo seleccionable. Después, salvo en `--download-only`, importa el pack al object store y, si se solicita, reconstruye `_metadata.db`.
+La recuperación de metadata lista packs remotos del owner, descarga candidatos, valida firma y hash, descifra con la identidad local y comprueba todos los objetos del paquete antes de considerarlo seleccionable. Después, salvo en `--download-only`, importa el pack al object store y, si se solicita, reconstruye el catálogo SQLite.
 
 ## Verificación y estados
 

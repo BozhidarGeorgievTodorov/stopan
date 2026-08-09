@@ -69,7 +69,7 @@ def push_to_network(
     commit_every: int,
     strict_rf: bool,
     db_file: str,
-    local_shard_dir: str,
+    local_chunk_dir: str,
     self_addr: str,
     cluster_token: str,
     membership_timeout_s: float,
@@ -93,7 +93,7 @@ def push_to_network(
     self_addr = str(self_addr or "").strip()
     cluster_token = str(cluster_token or "")
 
-    repo = CASRepository(local_shard_dir)
+    repo = CASRepository(local_chunk_dir)
     db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     remote_client: RemoteChunkClientPool | None = None
     metadata_changed = False

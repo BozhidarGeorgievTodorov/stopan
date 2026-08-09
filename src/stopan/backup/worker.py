@@ -21,14 +21,14 @@ from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 _thread_local = threading.local()
 
 
-def get_thread_local_tools(*, local_shard_dir: str, db_file: str):
+def get_thread_local_tools(*, local_chunk_dir: str, db_file: str):
     """
     Devuelve herramientas reutilizables por hilo.
 
     Si cambia el CAS o la base de metadata, se cierra la conexión anterior y se
     inicializa un nuevo conjunto de herramientas para ese hilo.
     """
-    key = (os.path.abspath(local_shard_dir), os.path.abspath(db_file))
+    key = (os.path.abspath(local_chunk_dir), os.path.abspath(db_file))
     if getattr(_thread_local, "tools_key", None) != key:
         old_db = getattr(_thread_local, "db_ro", None)
         if old_db is not None:
@@ -39,7 +39,7 @@ def get_thread_local_tools(*, local_shard_dir: str, db_file: str):
 
         _thread_local.tools_key = key
         _thread_local.chunker = FileChunker()
-        _thread_local.repo = CASRepository(local_shard_dir)
+        _thread_local.repo = CASRepository(local_chunk_dir)
         _thread_local.db_ro = MetadataDB(
             db_file,
             init_schema=False,
@@ -52,7 +52,7 @@ def get_thread_local_tools(*, local_shard_dir: str, db_file: str):
 def process_file_worker(
     full_path: str,
     *,
-    local_shard_dir: str,
+    local_chunk_dir: str,
     db_file: str,
     fast_local_enabled: bool,
     fast_remote_enabled: bool,
@@ -69,7 +69,7 @@ def process_file_worker(
     coordinador actualice SQLite.
     """
     chunker, repo, db_ro = get_thread_local_tools(
-        local_shard_dir=local_shard_dir,
+        local_chunk_dir=local_chunk_dir,
         db_file=db_file,
     )
 

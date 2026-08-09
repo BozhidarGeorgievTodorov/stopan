@@ -36,17 +36,15 @@ El loader de configuración es estricto: rechaza secciones desconocidas, campos 
 
 ## Sección `node`
 
-`node` define la identidad operativa del proceso local y las rutas persistentes principales.
+`node` define la identidad operativa del nodo, su catálogo y las direcciones usadas por el proceso persistente.
 
 `bind_addr` es la dirección donde escucha el servidor gRPC local. En máquinas con IPv4 e IPv6 suele bastar con `[::]:50051`.
 
 `advertise_addr` es la dirección que otros nodos deben usar para contactar con este nodo. Debe ser alcanzable desde el resto del cluster. El servicio `stopan node` requiere que esté configurada para arrancar.
 
-`repo_store_dir` es el store P2P del nodo. Ahí vive la identidad del nodo (`node_id.txt`) y los datos recibidos desde otros nodos: chunks replicados, shards EC recibidos y otros artefactos asociados al nodo servidor.
+`identity_file` contiene la identidad operativa estable del nodo y su `incarnation`.
 
-`local_shard_dir` es el CAS local principal usado por `backup` para chunks generados localmente. Contiene chunks locales comprimidos y direccionados por hash. `restore` consulta primero este CAS.
-
-`db_file` es la SQLite local de metadata. Contiene snapshots, items, recipes, chunks conocidos, estados de protección, data packs EC y publicaciones locales de metadata packs.
+`catalog_file` es el catálogo SQLite local. Contiene snapshots, items, recipes, chunks conocidos, estados de protección, data packs EC y publicaciones locales de metadata packs.
 
 Ejemplo:
 
@@ -54,9 +52,8 @@ Ejemplo:
 node:
   bind_addr: "[::]:50051"
   advertise_addr: "node1.lan:50051"
-  repo_store_dir: "/var/lib/stopan/_node_store"
-  local_shard_dir: "/var/lib/stopan/_data_chunks"
-  db_file: "/var/lib/stopan/_metadata.db"
+  identity_file: "/var/lib/stopan/state/node_id.txt"
+  catalog_file: "/var/lib/stopan/state/catalog.sqlite"
 ```
 
 ## Sección `cluster`
@@ -133,11 +130,15 @@ grpc:
 
 ## Sección `storage`
 
-`storage` configura el servidor de almacenamiento del nodo.
+`storage` configura los repositorios de datos y los límites del servicio que recibe contenido remoto.
+
+`local_chunk_dir` es el CAS local de chunks propios. `backup` materializa aquí los chunks que necesita conservar localmente y `restore` lo consulta como primera fuente.
+
+`custody_dir` es la raíz del contenido recibido de otros nodos. El servicio deriva de ella `chunks/` para fragmentos completos y `ec_shards/` para fragmentos codificados.
 
 `rpc_workers` controla la concurrencia del servidor gRPC.
 
-`commit_workers` y `commit_queue_items` controlan la cola interna que materializa escrituras recibidas.
+`commit_workers` y `commit_queue_items` controlan la cola interna que materializa escrituras de chunks recibidos.
 
 `max_chunk_size` es el tamaño máximo aceptado para chunks o payloads de almacenamiento. Debe mantenerse coherente con `grpc.max_message_bytes`.
 
@@ -145,6 +146,8 @@ Ejemplo:
 
 ```yaml
 storage:
+  local_chunk_dir: "/var/lib/stopan/data/chunks"
+  custody_dir: "/var/lib/stopan/custody"
   rpc_workers: 64
   commit_workers: 16
   commit_queue_items: 256
@@ -260,15 +263,17 @@ membership:
 
 `object_graph_auto_export` activa export automático del metadata object graph en comandos que soportan auto-export, como `backup`, `push` y `verify`, salvo que el CLI lo sobrescriba.
 
-`object_store_dir` es el metadata object store cifrado. Contiene objetos del graph exportado desde SQLite.
+`object_store_dir` es el metadata object store cifrado. Contiene los objetos del graph, sus punteros de estado y el contador de generaciones del vault.
 
 `object_graph_include_protection` decide si el graph incluye estado de protección remoto. Para recuperación completa de snapshots y política distribuida, normalmente debe quedar en `true`.
 
 `object_graph_auto_pack` crea también un metadata pack cuando se hace auto-export del graph.
 
-`object_pack_dir` es el directorio de packs generados localmente.
+`generated_pack_dir` es el directorio de packs generados localmente.
 
-`distributed_pack_store_dir` es el store local donde el servicio remoto guarda metadata packs recibidos de otros nodos.
+`recovered_pack_dir` es el directorio donde se conservan los packs descargados durante recuperación.
+
+`custody_pack_store_dir` es el store donde el servicio remoto conserva metadata packs recibidos de otros nodos.
 
 `pack_copies` es el número de copias remotas deseadas para metadata packs.
 
@@ -294,11 +299,12 @@ metadata:
   owner_id: ""
   identity_file: "/etc/stopan/metadata_identity.json"
   object_graph_auto_export: false
-  object_store_dir: "/var/lib/stopan/metadata_object_store"
+  object_store_dir: "/var/lib/stopan/metadata/object_store"
   object_graph_include_protection: true
   object_graph_auto_pack: false
-  object_pack_dir: "/var/lib/stopan/metadata_packs"
-  distributed_pack_store_dir: "/var/lib/stopan/metadata_distributed_packs"
+  generated_pack_dir: "/var/lib/stopan/metadata/packs/generated"
+  recovered_pack_dir: "/var/lib/stopan/metadata/packs/recovered"
+  custody_pack_store_dir: "/var/lib/stopan/custody/metadata_packs"
   pack_copies: 3
   strict_pack_copies: false
   pack_discovery_max_candidates: 10
@@ -323,13 +329,11 @@ Los campos `generated_*_grace_hours` son periodos de gracia para artefactos gene
 
 Los campos `received_*_max_age_days` y `recovered_metadata_pack_max_age_days` son políticas de edad para artefactos recibidos o recuperados. En los targets de edad máxima, `0` desactiva el borrado por edad.
 
-`generated_chunk_grace_hours` se aplica a chunks generados localmente en `node.local_shard_dir`.
+`generated_chunk_grace_hours` se aplica a chunks propios en `storage.local_chunk_dir`.
 
-`received_chunk_max_age_days` se aplica a chunks recibidos en `node.repo_store_dir`.
+`received_chunk_max_age_days` se aplica a chunks recibidos bajo `storage.custody_dir/chunks`.
 
-`generated_ec_grace_hours` se aplica a shards EC generados bajo `node.local_shard_dir`.
-
-`received_ec_max_age_days` se aplica a shards EC recibidos bajo `node.repo_store_dir`.
+`received_ec_max_age_days` se aplica a shards EC recibidos bajo `storage.custody_dir/ec_shards`. Los shards EC generados para un push no forman una familia persistente local y no tienen un target de GC propio.
 
 `generated_metadata_graph_grace_hours` se aplica a objetos huérfanos del metadata object graph.
 
@@ -345,7 +349,6 @@ Ejemplo:
 gc:
   generated_chunk_grace_hours: 48.0
   received_chunk_max_age_days: 0
-  generated_ec_grace_hours: 48.0
   received_ec_max_age_days: 0
   generated_metadata_graph_grace_hours: 48.0
   generated_metadata_pack_grace_hours: 48.0

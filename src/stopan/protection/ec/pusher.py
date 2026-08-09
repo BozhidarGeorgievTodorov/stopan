@@ -68,7 +68,7 @@ def push_erasure_data_packs_to_network(
     max_message_bytes: int,
     commit_every: int,
     db_file: str,
-    local_shard_dir: str,
+    local_chunk_dir: str,
     self_addr: str,
     cluster_token: str,
     membership_timeout_s: float,
@@ -82,7 +82,7 @@ def push_erasure_data_packs_to_network(
     self_addr = str(self_addr or "").strip()
     cluster_token = str(cluster_token or "")
 
-    repo = CASRepository(local_shard_dir)
+    repo = CASRepository(local_chunk_dir)
     db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     pool: RemoteDataPackShardClientPool | None = None
     metadata_changed = False

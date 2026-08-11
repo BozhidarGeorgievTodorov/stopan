@@ -14,7 +14,8 @@ node:
   catalog_file: "/var/lib/stopan/state/catalog.sqlite"
 
 cluster:
-  token: "change-me"
+  # Obligatorio para arrancar stopan node. Configúralo mediante stopan init node --token.
+  token: ""
   seeds:
     - "node.example.net:50051"
 

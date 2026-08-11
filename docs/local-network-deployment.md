@@ -33,7 +33,7 @@ sudo stopan config validate /etc/stopan/stopan.yaml
 
 ## Inicializar nodos
 
-La forma recomendada de preparar una máquina es usar `stopan init node`, porque actualiza el YAML de forma controlada y crea los directorios principales.
+La forma recomendada de preparar una máquina es usar `stopan init node`, porque actualiza el YAML de forma controlada y crea los directorios principales. El comando exige un `--token` no vacío y `stopan node` rechaza el arranque si la credencial no está configurada.
 
 Nodo 1:
 

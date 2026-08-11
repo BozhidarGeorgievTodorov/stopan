@@ -60,7 +60,7 @@ node:
 
 `cluster` configura la pertenencia lógica a la red.
 
-`token` es un token compartido por los nodos que deben verse entre sí. Los RPC de membership, almacenamiento y metadata packs lo usan como barrera lógica. No sustituye a TLS, VPN, firewall ni control de red.
+`token` es un token compartido por los nodos que deben verse entre sí. Los RPC de membership, almacenamiento y metadata packs lo usan como barrera lógica. `stopan node` exige que sea no vacío y rechaza el arranque si la credencial no está configurada. No sustituye a TLS, VPN, firewall ni control de red.
 
 `seeds` es la lista de direcciones iniciales usadas para descubrir miembros. En una instalación estable conviene poner varios nodos que normalmente estén encendidos. Si `stopan init node` se ejecuta sin `--seed`, escribe como seed el propio `advertise_addr`.
 

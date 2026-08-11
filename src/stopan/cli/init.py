@@ -15,7 +15,6 @@ import yaml
 from stopan.cli.validation import IntRange, validate_int_ranges
 from stopan.common.fs import atomic_write_bytes
 from stopan.config.defaults import (
-    DEFAULT_CLUSTER_TOKEN,
     DEFAULT_NODE_BIND_ADDR,
     DEFAULT_NODE_CATALOG_FILE,
     DEFAULT_NODE_IDENTITY_FILE,
@@ -60,8 +59,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     node.add_argument(
         "--token",
-        default=DEFAULT_CLUSTER_TOKEN,
-        help="Token lógico del cluster. Si se omite, queda vacío.",
+        required=True,
+        help="Token lógico compartido del clúster. Debe ser no vacío.",
     )
     node.add_argument(
         "--seed",
@@ -118,8 +117,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
 
-    if args.target == "node" and args.remote_copies is not None:
-        validate_int_ranges(parser, args, (IntRange("remote_copies", "--remote-copies", 0),))
+    if args.target == "node":
+        if not str(args.token or "").strip():
+            parser.error("--token debe ser no vacío")
+        if args.remote_copies is not None:
+            validate_int_ranges(parser, args, (IntRange("remote_copies", "--remote-copies", 0),))
 
     return args
 
@@ -364,7 +366,7 @@ def _init_node(args: argparse.Namespace) -> int:
     print(f"   bind_addr: {cfg.node.bind_addr}")
     print(f"   advertise_addr: {cfg.node.advertise_addr}")
     print("Cluster")
-    print(f"   token: {'configured' if cfg.cluster.token else '(empty)'}")
+    print("   token: configured")
     print("   seeds:")
     for seed in cfg.cluster.seeds:
         print(f"      - {seed}")

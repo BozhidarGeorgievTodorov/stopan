@@ -36,7 +36,7 @@ stopan backup --help
 | `restore` | Sí | Opcional | Reconstruye un snapshot | Usa red solo si `--remote-recovery` no es `none`. |
 | `node` | Sí | Sí | Arranca el servidor gRPC | Requiere `node.advertise_addr`. |
 | `node status` | No | Opcional | Diagnostica el nodo | Puede consultar una dirección explícita. |
-| `init node` | Sí | No | Inicializa configuración de nodo | Requiere `--advertise-addr`. |
+| `init node` | Sí | No | Inicializa configuración de nodo | Requiere `--advertise-addr` y `--token`. |
 | `init metadata` | Sí | No | Inicializa identidad de metadata | Necesario para crear o descifrar packs. |
 | `config example` | Opcional | No | Genera configuración de ejemplo | Solo escribe si se pasa `--out`. |
 | `config validate` | No | No | Valida un YAML | No arranca servicios. |
@@ -549,7 +549,7 @@ Opciones:
 --no-strict-remote-copies
 ```
 
-`--advertise-addr` es obligatorio. Es la dirección pública o anunciada del nodo.
+`--advertise-addr` y `--token` son obligatorios. El primero fija la dirección pública o anunciada del nodo y el segundo establece la credencial compartida del clúster.
 
 `--bind-addr` define dónde escucha localmente el servidor gRPC. Su default es `[::]:50051`.
 
@@ -564,7 +564,7 @@ Opciones:
 Ejemplo:
 
 ```bash
-stopan init node --advertise-addr HOST:PORT
+stopan init node --advertise-addr HOST:PORT --token TOKEN
 ```
 
 En instalaciones de sistema puede requerir permisos de administrador para escribir en `/etc/stopan` o `/var/lib/stopan`.

@@ -95,7 +95,9 @@ def limited_gossip(events: Iterable[membership_pb2.MemberEvent], limit: int):
 
 def is_authorized_cluster_token(expected_token: str, provided_token: str) -> bool:
     expected_token = str(expected_token or "")
-    return not expected_token or str(provided_token) == expected_token
+    if not expected_token.strip():
+        return False
+    return str(provided_token) == expected_token
 
 
 def require_authorized_cluster_token(expected_token: str, provided_token: str, context) -> None:

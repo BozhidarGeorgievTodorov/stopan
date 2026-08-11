@@ -34,7 +34,7 @@ def load_runtime_config(args: argparse.Namespace) -> StopanConfig:
         raise StopanConfigError(
             f"No existe el fichero de configuración por defecto: {DEFAULT_STOPAN_CONFIG}. "
             "Crea la configuración permanente con: sudo stopan init node "
-            "--advertise-addr HOST:50051 [--token TOKEN] [--seed HOST:50051]"
+            "--advertise-addr HOST:50051 --token TOKEN [--seed HOST:50051]"
         )
     return load_config(config_path)
 

@@ -143,7 +143,7 @@ El proceso de nodo mantiene membership con un protocolo tipo SWIM. Los clientes 
 
 `ClusterView` representa la vista canónica usada por placement. Contiene miembros elegibles y, si se pudo resolver, el `self_node_id`.
 
-El token de clúster forma parte de la separación lógica entre clústeres. Membership y metadata packs lo transportan dentro de sus mensajes. `P2PStorage` lo transporta mediante metadata binaria de gRPC para cubrir de forma uniforme las consultas de presencia, la replicación y la recuperación de chunks y shards EC. Un token vacío desactiva esta barrera lógica. El mecanismo no identifica criptográficamente al nodo y no sustituye a TLS, una VPN, un cortafuegos ni otro control de red.
+El token de clúster forma parte de la separación lógica entre clústeres. Membership y metadata packs lo transportan dentro de sus mensajes. `P2PStorage` lo transporta mediante metadata binaria de gRPC para cubrir de forma uniforme las consultas de presencia, la replicación y la recuperación de chunks y shards EC. El proceso `stopan node` exige un token no vacío y rechaza el arranque antes de abrir el listener gRPC si falta esta credencial. El mecanismo no identifica criptográficamente al nodo y no sustituye a TLS, una VPN, un cortafuegos ni otro control de red.
 
 ## Placement remoto
 

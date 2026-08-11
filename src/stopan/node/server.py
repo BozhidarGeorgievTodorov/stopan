@@ -63,11 +63,18 @@ def serve(config: StopanConfig) -> None:
     if not advertise_addr:
         raise StopanConfigError("Falta node.advertise_addr, por ejemplo node1:50051.")
 
+    cluster_token = str(config.cluster.token or "")
+    if not cluster_token.strip():
+        raise StopanConfigError(
+            "Falta cluster.token. El nodo no puede publicar servicios gRPC sin una "
+            "credencial de clúster no vacía."
+        )
+
     identity_store = NodeIdentityStore(config.node.identity_file)
     identity = identity_store.load_for_startup()
 
     membership_settings = MembershipSettings(
-        cluster_token=config.cluster.token,
+        cluster_token=cluster_token,
         protocol_period_s=config.membership.protocol_period_s,
         ping_timeout_s=config.membership.ping_timeout_s,
         rpc_timeout_s=config.membership.rpc_timeout_s,
@@ -89,14 +96,14 @@ def serve(config: StopanConfig) -> None:
     )
     storage_servicer = StorageNodeServicer(
         config.storage.custody_dir,
-        cluster_token=config.cluster.token,
+        cluster_token=cluster_token,
         commit_workers=config.storage.commit_workers,
         commit_queue_items=config.storage.commit_queue_items,
         max_chunk_size=config.storage.max_chunk_size,
     )
     metadata_servicer = MetadataPackServiceServicer(
         config.metadata.custody_pack_store_dir,
-        cluster_token=config.cluster.token,
+        cluster_token=cluster_token,
         max_pack_bytes=config.metadata.max_distributed_pack_bytes,
         max_packs_per_owner=config.metadata.max_distributed_packs_per_owner,
         max_total_bytes_per_owner=config.metadata.max_distributed_pack_bytes_per_owner,

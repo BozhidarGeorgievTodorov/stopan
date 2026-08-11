@@ -103,6 +103,11 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
         """Valida el cluster_token de una request entrante."""
 
         expected = self._cluster_token
+        if not expected.strip():
+            context.set_code(grpc.StatusCode.UNAUTHENTICATED)
+            context.set_details("cluster_token no configurado")
+            return False
+
         received = str(getattr(request, "cluster_token", "") or "")
         if received != expected:
             context.set_code(grpc.StatusCode.PERMISSION_DENIED)

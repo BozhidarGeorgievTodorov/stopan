@@ -18,8 +18,9 @@ CLUSTER_TOKEN_METADATA_KEY = "x-stopan-cluster-token-bin"
 def cluster_token_metadata(cluster_token: str) -> tuple[tuple[str, bytes], ...]:
     """Construye la metadata gRPC usada por los clientes de ``P2PStorage``.
 
-    Un token vacío no añade metadata. Esto conserva el modo sin aislamiento
-    lógico, pero evita intentar enviar un valor binario vacío innecesario.
+    Un token vacío no añade metadata. Los nodos servidos rechazan una
+    configuración sin token, por lo que este caso solo representa una
+    configuración incompleta del cliente.
     """
 
     token = str(cluster_token or "")
@@ -34,14 +35,13 @@ def require_cluster_token_metadata(
 ) -> None:
     """Exige que la llamada contenga el token configurado en metadata.
 
-    Cuando el token esperado está vacío, la barrera lógica queda desactivada de
-    forma explícita, igual que ocurre en los despliegues que conservan el valor
-    predeterminado de ``cluster.token``.
+    Un servicio configurado sin token falla de forma cerrada. El proceso de nodo
+    rechaza además esa configuración antes de abrir el listener gRPC.
     """
 
     expected = str(expected_token or "")
-    if not expected:
-        return
+    if not expected.strip():
+        context.abort(grpc.StatusCode.UNAUTHENTICATED, "cluster_token no configurado")
 
     received = _metadata_value(
         context.invocation_metadata(),

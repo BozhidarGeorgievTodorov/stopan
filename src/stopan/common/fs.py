@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import os
+import sys
 from pathlib import Path
 
 from stopan.errors import StopanStorageOSError
@@ -27,6 +29,90 @@ def ensure_private_dir(path: Path) -> None:
         os.chmod(path, 0o700)
     except OSError:
         pass
+
+
+def atomic_rename_noreplace(
+    source: str | Path,
+    destination: str | Path,
+) -> None:
+    """
+    Renombra ``source`` a ``destination`` sin sustituir un destino existente.
+
+    La comprobación de ausencia y el renombrado forman una única operación del
+    sistema de ficheros. Si el destino existe en ese instante se propaga
+    ``FileExistsError`` y el origen permanece en su ubicación anterior.
+
+    La operación es una capacidad dependiente de la plataforma. El backend
+    actual utiliza ``renameat2(RENAME_NOREPLACE)`` en Linux. Las plataformas
+    sin un backend que preserve esta semántica fallan de forma explícita en vez
+    de degradar a una secuencia vulnerable a TOCTOU.
+    """
+    source_path = os.fspath(source)
+    destination_path = os.fspath(destination)
+
+    if sys.platform.startswith("linux"):
+        _linux_rename_noreplace(source_path, destination_path)
+        return
+
+    raise StopanStorageOSError(
+        "La plataforma actual no dispone de un backend para publicar rutas "
+        "atómicamente sin sustituir un destino existente."
+    )
+
+
+def _linux_rename_noreplace(source: str, destination: str) -> None:
+    import ctypes
+
+    at_fdcwd = -100
+    rename_noreplace = 1
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as exc:
+        raise StopanStorageOSError(
+            "La libc de esta instalación no expone renameat2, necesario para "
+            "publicar rutas sin sustitución."
+        ) from exc
+
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+
+    ctypes.set_errno(0)
+    result = renameat2(
+        at_fdcwd,
+        os.fsencode(source),
+        at_fdcwd,
+        os.fsencode(destination),
+        rename_noreplace,
+    )
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    if error_number == 0:
+        raise StopanStorageOSError(
+            f"renameat2 falló sin proporcionar errno al publicar {destination}"
+        )
+
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination,
+        )
+
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        destination,
+    )
 
 
 def atomic_write_bytes(

@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 
 from stopan.cli.output import format_duration, format_speed
+from stopan.common.fs import atomic_rename_noreplace
 from stopan.metadata.database import MetadataDB
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.models import RestoreRunStats
@@ -264,7 +265,7 @@ class SnapshotRestorer:
                 )
 
             try:
-                os.replace(paths.incomplete_dir, paths.final_dir)
+                atomic_rename_noreplace(paths.incomplete_dir, paths.final_dir)
                 print("-" * 40)
                 print(f"Restauración completa del Snapshot {snapshot_id}.")
                 print(f"Directorio final: {paths.final_dir}")
@@ -277,9 +278,25 @@ class SnapshotRestorer:
                     final_dir=paths.final_dir,
                     stats=stats,
                 )
+            except FileExistsError:
+                message = (
+                    f"El destino final apareció durante la restauración y no se sobrescribirá: "
+                    f"{paths.final_dir}. El resultado permanece en {paths.incomplete_dir}."
+                )
+                print(message)
+                return RestoreResult(
+                    snapshot_id=snapshot_id,
+                    completed=False,
+                    processed_items=stats.processed_items,
+                    successful_items=stats.successful_items,
+                    final_dir=paths.final_dir,
+                    work_dir=paths.incomplete_dir,
+                    error=message,
+                    stats=stats,
+                )
             except OSError as exc:
-                message = f"Error al renombrar carpeta final: {exc}"
-                print(f"{message}")
+                message = f"Error al publicar la carpeta final: {exc}"
+                print(message)
                 return RestoreResult(
                     snapshot_id=snapshot_id,
                     completed=False,

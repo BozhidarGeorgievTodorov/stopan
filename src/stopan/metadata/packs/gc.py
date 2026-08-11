@@ -44,6 +44,6 @@ def collect_recovered_metadata_packs(
         target="recovered-metadata-packs",
         root_dir=root,
         files=root.glob("*.stopanmetapack") if root.exists() else (),
-        max_age_seconds=days * _SECONDS_PER_DAY,
+        max_age_seconds=None if days == 0 else days * _SECONDS_PER_DAY,
         dry_run=bool(dry_run),
     )

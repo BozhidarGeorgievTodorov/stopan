@@ -20,7 +20,7 @@ def collect_files_by_age(
 ) -> LocalFileGarbageCollectionResult:
     root = Path(root_dir).expanduser().resolve()
     max_age = None if max_age_seconds is None else max(int(max_age_seconds), 0)
-    enabled = max_age is not None and max_age > 0
+    enabled = max_age is not None
     cutoff = time.time() - max_age if enabled else None
 
     files_seen = 0

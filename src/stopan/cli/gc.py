@@ -301,10 +301,11 @@ def _cmd_received_chunks(args: argparse.Namespace) -> int:
     from stopan.cas.gc import collect_cas_chunks
 
     cfg = load_runtime_config(args)
+    max_age_days = int(choose(args.max_age_days, cfg.gc.received_chunk_max_age_days))
     result = collect_cas_chunks(
         target=args.command,
         root_dir=args.chunk_store or (Path(cfg.storage.custody_dir) / "chunks"),
-        max_age_seconds=int(choose(args.max_age_days, cfg.gc.received_chunk_max_age_days)) * _SECONDS_PER_DAY,
+        max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
         dry_run=bool(args.dry_run),
     )
     _print_local_file_result(result)
@@ -315,10 +316,11 @@ def _cmd_received_ec(args: argparse.Namespace) -> int:
     from stopan.node.storage.ec_gc import collect_ec_shards
 
     cfg = load_runtime_config(args)
+    max_age_days = int(choose(args.max_age_days, cfg.gc.received_ec_max_age_days))
     result = collect_ec_shards(
         target=args.command,
         root_dir=args.ec_store or (Path(cfg.storage.custody_dir) / "ec_shards"),
-        max_age_seconds=int(choose(args.max_age_days, cfg.gc.received_ec_max_age_days)) * _SECONDS_PER_DAY,
+        max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
         dry_run=bool(args.dry_run),
     )
     _print_local_file_result(result)

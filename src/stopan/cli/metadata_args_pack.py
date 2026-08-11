@@ -237,12 +237,13 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         verify_parser,
         rpc_timeout_help="Timeout del RPC ListMetadataPacks en segundos. Default: metadata.pack_rpc_timeout_s.",
     )
-    verify_parser.add_argument(
+    verify_selector = verify_parser.add_mutually_exclusive_group(required=True)
+    verify_selector.add_argument(
         "--pack-hash",
         default=None,
-        help="Pack hash concreto a verificar. Si se omite, verifica el latest descubierto.",
+        help="Pack hash concreto cuya presencia se verifica.",
     )
-    verify_parser.add_argument(
+    verify_selector.add_argument(
         "--all",
         action="store_true",
         help="Verifica todos los packs descubiertos hasta --max-candidates.",
@@ -251,7 +252,7 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
         "--max-candidates",
         type=int,
         default=None,
-        help="Máximo de pack_hash a verificar cuando no se usa --pack-hash. Default: metadata.pack_discovery_max_candidates.",
+        help="Máximo de pack_hash a verificar con --all. Default: metadata.pack_discovery_max_candidates.",
     )
     verify_parser.add_argument(
         "--show-sources",

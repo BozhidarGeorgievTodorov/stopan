@@ -253,6 +253,10 @@ def verify_metadata_packs_from_network(
     max_candidates: int | None = None,
 ) -> MetadataPackVerificationRunResult:
     owner = validate_owner_id(owner_id)
+    if (pack_hash is None and not verify_all) or (pack_hash is not None and verify_all):
+        raise MetadataPackVerificationError(
+            "la verificación requiere exactamente un selector: pack_hash o verify_all=True"
+        )
     requested_hash = validate_pack_hash(pack_hash) if pack_hash is not None else None
     desired_map = dict(desired_copies_by_hash or {})
 
@@ -294,12 +298,7 @@ def verify_metadata_packs_from_network(
         raise MetadataPackVerificationError(str(exc)) from exc
 
     entries = list(discovery.entries)
-    if verify_all:
-        results = tuple(_verification_result_from_entry(item) for item in entries)
-    elif entries:
-        results = (_verification_result_from_entry(entries[0]),)
-    else:
-        results = ()
+    results = tuple(_verification_result_from_entry(item) for item in entries)
 
     stats = _verification_stats(
         results=results,

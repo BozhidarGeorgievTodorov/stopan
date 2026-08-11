@@ -94,7 +94,4 @@ def validate_metadata_args(parser: argparse.ArgumentParser, args: argparse.Names
             (FloatRange("rpc_timeout_s", "--rpc-timeout-s", 0.0, inclusive=False),),
         )
 
-    if args.command == "pack.verify":
-        reject_together(parser, args, Flag("pack_hash", "--pack-hash"), Flag("all", "--all"))
-
 

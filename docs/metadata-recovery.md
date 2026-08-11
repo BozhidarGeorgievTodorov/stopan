@@ -157,11 +157,7 @@ Mostrar también los nodos donde aparece cada pack:
 stopan metadata pack discover --show-sources
 ```
 
-Verificar el latest descubierto:
-
-```bash
-stopan metadata pack verify
-```
+La verificación requiere seleccionar explícitamente un pack concreto o el conjunto de candidatos. La selección del estado lógico más reciente se reserva a la recuperación, que descarga y valida los candidatos antes de comparar sus generaciones.
 
 Verificar todos los candidatos descubiertos:
 

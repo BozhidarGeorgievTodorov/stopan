@@ -3,7 +3,9 @@ kind: metadata-pack
 
 metadata_pack:
   action: verify
-  verify_all: false
+  verify_all: true
   # owner_id:
+  # Alternativa para un pack concreto:
+  # verify_all: false
   # pack_hash:
   # show_sources: false

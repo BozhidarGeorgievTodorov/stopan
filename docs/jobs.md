@@ -367,6 +367,8 @@ key_length
 default_desired_remote_copies
 ```
 
+Cuando `action: verify`, el perfil debe seleccionar un modo de verificación. Usa `verify_all: true` para comprobar los candidatos descubiertos o `pack_hash` para un paquete concreto. La CLI rechaza una ejecución sin selector y también la combinación de ambos.
+
 ## GC
 
 Ejemplo de GC completo:

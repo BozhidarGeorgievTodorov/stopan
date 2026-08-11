@@ -980,11 +980,13 @@ Opciones:
 --show-sources
 ```
 
-Verifica presencia remota de metadata packs distribuidos. Con `--pack-hash` verifica un pack concreto. Con `--all` verifica todos los packs descubiertos hasta el límite de candidatos. Sin ambas opciones, verifica el latest descubierto.
+Verifica presencia remota de metadata packs distribuidos. `--pack-hash` verifica un pack concreto y `--all` verifica todos los packs descubiertos hasta el límite de candidatos.
+
+El listado remoto permite comprobar identidad firmada y presencia, pero la selección por `vault_generation` requiere descargar y validar el contenido cifrado y pertenece a `metadata pack recover`.
 
 `--target-parallelism`, `--rpc-timeout-s` y `--max-message-bytes` controlan las consultas remotas de verificación.
 
-Validación: `--pack-hash` y `--all` son incompatibles.
+Validación: se requiere `--pack-hash` o `--all`, y ambas opciones son incompatibles.
 
 Devuelve `0` si hay resultados y no hay fallos. Devuelve `1` si no hay resultados o si detecta fallos.
 

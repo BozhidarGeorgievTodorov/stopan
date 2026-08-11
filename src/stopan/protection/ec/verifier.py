@@ -31,7 +31,9 @@ class ErasureVerificationStats:
     verified: int = 0
     degraded: int = 0
     failed: int = 0
-    rpc_failures: int = 0
+    rpc_failed_calls: int = 0
+    rpc_failed_targets: int = 0
+    rpc_unverified_assignments: int = 0
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class _AddressProbeOutcome:
     completed_keys: frozenset[tuple[str, int, str]]
     missing_keys: frozenset[tuple[str, int, str]]
     error: str | None = None
+    rpc_failed_calls: int = 0
 
 
 @dataclass
@@ -79,7 +82,12 @@ class ErasureDataPackVerifier:
 
         print(f"Verify EC: {len(candidates)} data packs candidatos")
 
-        outcomes, rpc_failures = self._verify_candidates(candidates)
+        (
+            outcomes,
+            rpc_failed_calls,
+            rpc_failed_targets,
+            rpc_unverified_assignments,
+        ) = self._verify_candidates(candidates)
         verified = 0
         degraded = 0
         failed = 0
@@ -120,13 +128,15 @@ class ErasureDataPackVerifier:
             verified=verified,
             degraded=degraded,
             failed=failed,
-            rpc_failures=rpc_failures,
+            rpc_failed_calls=rpc_failed_calls,
+            rpc_failed_targets=rpc_failed_targets,
+            rpc_unverified_assignments=rpc_unverified_assignments,
         )
 
     def _verify_candidates(
         self,
         candidates: list[ErasureDataPackRecord],
-    ) -> tuple[list["_PackVerificationOutcome"], int]:
+    ) -> tuple[list["_PackVerificationOutcome"], int, int, int]:
         shard_rows_by_pack = self.db.get_erasure_pack_shards_many(
             pack.pack_hash for pack in candidates
         )
@@ -166,7 +176,11 @@ class ErasureDataPackVerifier:
             for address, refs in target_groups.refs_by_address.items():
                 refs_by_address.setdefault(address, []).extend(refs)
 
-        rpc_failures = self._probe_global_targets(
+        (
+            rpc_failed_calls,
+            rpc_failed_targets,
+            rpc_unverified_assignments,
+        ) = self._probe_global_targets(
             refs_by_address=refs_by_address,
             accumulators=accumulators,
         )
@@ -202,16 +216,21 @@ class ErasureDataPackVerifier:
                 )
             )
 
-        return outcomes, rpc_failures
+        return (
+            outcomes,
+            rpc_failed_calls,
+            rpc_failed_targets,
+            rpc_unverified_assignments,
+        )
 
     def _probe_global_targets(
         self,
         *,
         refs_by_address: dict[str, list[RemoteDataPackShardRef]],
         accumulators: dict[str, _PackVerificationAccumulator],
-    ) -> int:
+    ) -> tuple[int, int, int]:
         if not refs_by_address:
-            return 0
+            return 0, 0, 0
 
         tasks = {
             address: (
@@ -219,7 +238,9 @@ class ErasureDataPackVerifier:
             )
             for address, refs in refs_by_address.items()
         }
-        rpc_failures = 0
+        rpc_failed_calls = 0
+        rpc_failed_targets = 0
+        rpc_unverified_assignments = 0
 
         for completed in iter_completed_keyed_tasks(
             tasks=tasks,
@@ -234,16 +255,17 @@ class ErasureDataPackVerifier:
                     completed_keys=frozenset(),
                     missing_keys=frozenset(),
                     error=str(completed.error),
+                    rpc_failed_calls=1,
                 )
             else:
                 outcome = completed.result
 
             missing_by_pack: dict[str, list[int]] = {}
-            unprobed_packs: list[str] = []
+            unprobed_refs: list[RemoteDataPackShardRef] = []
             for ref in planned_refs:
                 key = ref.identity_key
                 if key not in outcome.completed_keys:
-                    unprobed_packs.append(ref.pack_hash)
+                    unprobed_refs.append(ref)
                 elif key in outcome.missing_keys:
                     missing_by_pack.setdefault(ref.pack_hash, []).append(ref.shard_index)
                 else:
@@ -257,12 +279,19 @@ class ErasureDataPackVerifier:
                 )
 
             if outcome.error is not None:
-                rpc_failures += 1
+                rpc_failed_calls += max(1, int(outcome.rpc_failed_calls))
+                rpc_failed_targets += 1
+                rpc_unverified_assignments += len(unprobed_refs)
+
                 message = f"RPC {address}: {outcome.error}"
-                for pack_hash in dict.fromkeys(unprobed_packs):
+                for pack_hash in dict.fromkeys(ref.pack_hash for ref in unprobed_refs):
                     accumulators[pack_hash].errors.append(message)
 
-        return rpc_failures
+        return (
+            rpc_failed_calls,
+            rpc_failed_targets,
+            rpc_unverified_assignments,
+        )
 
     def _probe_address(
         self,
@@ -283,6 +312,7 @@ class ErasureDataPackVerifier:
                     completed_keys=frozenset(completed_keys),
                     missing_keys=frozenset(missing_keys),
                     error=str(exc),
+                    rpc_failed_calls=1,
                 )
 
             completed_keys.update(ref.identity_key for ref in batch)

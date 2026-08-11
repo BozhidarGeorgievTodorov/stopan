@@ -34,8 +34,10 @@ class ProbeExecutionResult:
     node_id: str
     address: str
     requested_hashes: tuple[str, ...]
+    completed_hashes: frozenset[str]
     present_hashes: frozenset[str]
     transport_error: str | None = None
+    rpc_failed_calls: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,31 +128,74 @@ class RemoteChunkClientPool(P2PStorageProtectionClient):
         address: str,
         chunk_hashes: Sequence[str],
     ) -> ProbeExecutionResult:
+        """Sondea un target conservando la evidencia de los lotes ya completados.
+
+        Si una llamada RPC falla, los lotes anteriores mantienen su resultado y
+        solo quedan sin verificar las asignaciones pertenecientes al lote fallido
+        y a los lotes todavía no intentados.
+        """
+
         ordered_hashes = tuple(ordered_unique(chunk_hashes))
-        requested = frozenset(ordered_hashes)
+        completed_hashes: set[str] = set()
+        missing_hashes: set[str] = set()
+
+        if not ordered_hashes:
+            return ProbeExecutionResult(
+                node_id=node_id,
+                address=address,
+                requested_hashes=(),
+                completed_hashes=frozenset(),
+                present_hashes=frozenset(),
+            )
 
         try:
-            missing = self.probe_missing_hashes(
-                address=address,
-                chunk_hashes=ordered_hashes,
-            )
-            return ProbeExecutionResult(
-                node_id=node_id,
-                address=address,
-                requested_hashes=ordered_hashes,
-                present_hashes=frozenset(requested - missing),
-                transport_error=None,
-            )
+            self._ensure_open()
+            self._ensure_runtime()
+            stub = self._get_stub(address)
+
+            for batch in iter_batches(ordered_hashes, self.probe_batch_hashes):
+                try:
+                    response = stub.ProbeMissingChunks(
+                        self._pb.ProbeMissingChunksRequest(chunk_hashes=batch),
+                        timeout=self.probe_timeout_s,
+                        metadata=self._call_metadata,
+                    )
+                except Exception as exc:
+                    return ProbeExecutionResult(
+                        node_id=node_id,
+                        address=address,
+                        requested_hashes=ordered_hashes,
+                        completed_hashes=frozenset(completed_hashes),
+                        present_hashes=frozenset(completed_hashes - missing_hashes),
+                        transport_error=format_remote_error(exc),
+                        rpc_failed_calls=1,
+                    )
+
+                completed_hashes.update(batch)
+                missing_hashes.update(
+                    chunk_hash
+                    for chunk_hash in response.missing_hashes
+                    if chunk_hash
+                )
 
         except Exception as exc:
-            transport_error = format_remote_error(exc)
             return ProbeExecutionResult(
                 node_id=node_id,
                 address=address,
                 requested_hashes=ordered_hashes,
-                present_hashes=frozenset(),
-                transport_error=transport_error,
+                completed_hashes=frozenset(completed_hashes),
+                present_hashes=frozenset(completed_hashes - missing_hashes),
+                transport_error=format_remote_error(exc),
+                rpc_failed_calls=1,
             )
+
+        return ProbeExecutionResult(
+            node_id=node_id,
+            address=address,
+            requested_hashes=ordered_hashes,
+            completed_hashes=frozenset(completed_hashes),
+            present_hashes=frozenset(completed_hashes - missing_hashes),
+        )
 
     def replicate_missing_hashes(
         self,

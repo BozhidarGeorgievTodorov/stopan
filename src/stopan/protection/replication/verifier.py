@@ -105,10 +105,14 @@ class ChunkProtectionVerifier:
             f"probe_timeout_s={self.probe_timeout_s}"
         )
 
-        outcomes = self._verify_candidates(candidates)
+        (
+            outcomes,
+            rpc_failed_calls,
+            rpc_failed_targets,
+            rpc_unverified_assignments,
+        ) = self._verify_candidates(candidates)
         verified = 0
         degraded = 0
-        rpc_failures = 0
 
         updates: list[ChunkProtectionVerificationUpdate] = []
         for outcome in outcomes:
@@ -135,8 +139,6 @@ class ChunkProtectionVerifier:
                 continue
 
             degraded += 1
-            if outcome.error and "RPC" in outcome.error:
-                rpc_failures += 1
             print(
                 f"   {outcome.chunk_hash[:8]} degradado: "
                 f"verified={outcome.verified_remote_copies}/{outcome.required_remote_copies} "
@@ -148,11 +150,19 @@ class ChunkProtectionVerifier:
             candidates=len(candidates),
             verified=verified,
             degraded=degraded,
-            rpc_failures=rpc_failures,
+            rpc_failed_calls=rpc_failed_calls,
+            rpc_failed_targets=rpc_failed_targets,
+            rpc_unverified_assignments=rpc_unverified_assignments,
         )
 
-    def _verify_candidates(self, candidates: list[VerificationCandidate]) -> list[VerificationOutcome]:
+    def _verify_candidates(
+        self,
+        candidates: list[VerificationCandidate],
+    ) -> tuple[list[VerificationOutcome], int, int, int]:
         accumulators, target_chunks, target_members = self._plan(candidates)
+        rpc_failed_calls = 0
+        rpc_failed_targets = 0
+        rpc_unverified_assignments = 0
 
         if target_chunks:
             tasks = {
@@ -179,21 +189,31 @@ class ChunkProtectionVerifier:
                         node_id=member.node_id,
                         address=member.address,
                         requested_hashes=tuple(planned_hashes),
+                        completed_hashes=frozenset(),
                         present_hashes=frozenset(),
                         transport_error=f"probe del target falló: {completed.error}",
+                        rpc_failed_calls=1,
                     )
                 else:
                     result = completed.result
 
-                if result.transport_error:
-                    message = f"RPC {result.node_id[:8]}@{result.address}: {result.transport_error}"
-                    for chunk_hash in result.requested_hashes:
-                        accumulators[chunk_hash].errors.append(message)
-                    continue
-
-                for chunk_hash in result.requested_hashes:
+                for chunk_hash in result.completed_hashes:
                     if chunk_hash in result.present_hashes:
                         accumulators[chunk_hash].verified_remote_copies += 1
+
+                if result.transport_error:
+                    unverified_hashes = tuple(
+                        chunk_hash
+                        for chunk_hash in result.requested_hashes
+                        if chunk_hash not in result.completed_hashes
+                    )
+                    rpc_failed_calls += max(1, int(result.rpc_failed_calls))
+                    rpc_failed_targets += 1
+                    rpc_unverified_assignments += len(unverified_hashes)
+
+                    message = f"RPC {result.node_id[:8]}@{result.address}: {result.transport_error}"
+                    for chunk_hash in unverified_hashes:
+                        accumulators[chunk_hash].errors.append(message)
 
         outcomes: list[VerificationOutcome] = []
         for candidate in candidates:
@@ -209,7 +229,12 @@ class ChunkProtectionVerifier:
                 )
             )
 
-        return outcomes
+        return (
+            outcomes,
+            rpc_failed_calls,
+            rpc_failed_targets,
+            rpc_unverified_assignments,
+        )
 
     def _plan(self, candidates: list[VerificationCandidate]):
         """

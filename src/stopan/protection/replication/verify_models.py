@@ -28,7 +28,9 @@ class VerificationStats:
     candidates: int = 0
     verified: int = 0
     degraded: int = 0
-    rpc_failures: int = 0
+    rpc_failed_calls: int = 0
+    rpc_failed_targets: int = 0
+    rpc_unverified_assignments: int = 0
 
 
 @dataclass(slots=True)

@@ -112,7 +112,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"Verify EC finalizado. verified={stats.verified}/{stats.candidates} | "
             f"degraded={stats.degraded} | failed={stats.failed} | "
-            f"rpc_failures={stats.rpc_failures}"
+            f"rpc_failed_calls={stats.rpc_failed_calls} | "
+            f"rpc_failed_targets={stats.rpc_failed_targets} | "
+            f"rpc_unverified_assignments={stats.rpc_unverified_assignments}"
         )
         return 0 if stats.degraded == 0 and stats.failed == 0 else 2
 
@@ -138,6 +140,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("-" * 40)
     print(
         f"Verify finalizado. verified={stats.verified}/{stats.candidates} | "
-        f"degraded={stats.degraded} | rpc_failures={stats.rpc_failures}"
+        f"degraded={stats.degraded} | "
+        f"rpc_failed_calls={stats.rpc_failed_calls} | "
+        f"rpc_failed_targets={stats.rpc_failed_targets} | "
+        f"rpc_unverified_assignments={stats.rpc_unverified_assignments}"
     )
     return 0 if stats.degraded == 0 else 2

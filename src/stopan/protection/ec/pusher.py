@@ -102,26 +102,18 @@ def push_erasure_data_packs_to_network(
         cluster = remote_context.cluster
         origin_node_id = remote_context.origin_node_id
         remote_candidate_count = remote_context.remote_candidate_count
-        if remote_candidate_count < spec.total_shards:
-            print("Push EC no iniciado: no hay suficientes nodos remotos elegibles.")
-            print(
-                f"   necesarios={spec.total_shards} disponibles={remote_candidate_count} "
-                f"ec_k={spec.data_shards} ec_m={spec.parity_shards}"
-            )
-            return ErasurePushStats(
-                insufficient_remote_targets=True,
-                remote_candidates=remote_candidate_count,
-                required_remote_targets=spec.total_shards,
-            )
-
-        placement_epoch = remote_context.placement_epoch(remote_targets=spec.total_shards)
+        new_pack_placement_epoch = remote_context.placement_epoch(remote_targets=spec.total_shards)
+        existing_epochs = {
+            remote_targets: remote_context.placement_epoch(remote_targets=remote_targets)
+            for remote_targets in db.erasure_data_pack_remote_targets()
+        }
 
         scope_label = describe_protection_scope(scope, snapshot_id=snapshot_id)
         retry_packs = scoped_erasure_push_retry_packs(
             db,
             scope=scope,
             snapshot_id=snapshot_id,
-            current_epoch=placement_epoch,
+            current_epochs=existing_epochs,
             limit=limit,
         )
         pending_chunks = scoped_erasure_push_new_chunks(
@@ -149,19 +141,39 @@ def push_erasure_data_packs_to_network(
             f"total_shards={spec.total_shards} pack_size={pack_size}"
         )
         print(f"Remote candidates: {remote_candidate_count}")
-        print(f"placement_epoch={placement_epoch[:12]}")
+        print(f"new_pack_placement_epoch={new_pack_placement_epoch[:12]}")
+
+        can_create_new_packs = remote_candidate_count >= spec.total_shards
+        insufficient_for_new_packs = bool(pending_chunks) and not can_create_new_packs
+        if insufficient_for_new_packs:
+            print("No se crearán data packs EC nuevos: no hay suficientes nodos remotos elegibles.")
+            print(
+                f"   necesarios={spec.total_shards} disponibles={remote_candidate_count} "
+                f"ec_k={spec.data_shards} ec_m={spec.parity_shards}"
+            )
+            if not retry_packs:
+                return ErasurePushStats(
+                    insufficient_remote_targets=True,
+                    remote_candidates=remote_candidate_count,
+                    required_remote_targets=spec.total_shards,
+                )
 
         pool = RemoteDataPackShardClientPool(
             cluster_token=cluster_token,
             timeout_s=stream_timeout_s,
             max_message_bytes=max_message_bytes,
         )
-        builder = DataPackBuilder(spec=spec, target_size_bytes=pack_size)
+        builder = (
+            DataPackBuilder(spec=spec, target_size_bytes=pack_size)
+            if can_create_new_packs
+            else None
+        )
 
         stats = _MutableErasurePushStats(
-            attempted_chunks=len(pending_chunks),
+            attempted_chunks=len(pending_chunks) if can_create_new_packs else 0,
             remote_candidates=remote_candidate_count,
             required_remote_targets=spec.total_shards,
+            insufficient_remote_targets=insufficient_for_new_packs,
         )
 
         for record in retry_packs:
@@ -181,47 +193,49 @@ def push_erasure_data_packs_to_network(
             if pack_metadata_changed and stats.attempted_packs % commit_every == 0:
                 db.commit()
 
-        for chunk_hash in pending_chunks:
-            try:
-                data = repo.get(chunk_hash)
-            except FileNotFoundError:
-                stats.missing_local_chunks += 1
-                stats.failed_chunks += 1
-                continue
+        if builder is not None:
+            for chunk_hash in pending_chunks:
+                try:
+                    data = repo.get(chunk_hash)
+                except FileNotFoundError:
+                    stats.missing_local_chunks += 1
+                    stats.failed_chunks += 1
+                    continue
 
-            try:
-                must_flush = builder.add_chunk(chunk_hash=chunk_hash, data=data)
-            except ErasureCodingError as exc:
-                stats.failed_chunks += 1
-                continue
+                try:
+                    must_flush = builder.add_chunk(chunk_hash=chunk_hash, data=data)
+                except ErasureCodingError as exc:
+                    stats.failed_chunks += 1
+                    continue
 
-            stats.packed_chunks += 1
-            stats.processed_bytes += len(data)
-            if must_flush:
-                _flush_and_push_pack(
-                    builder=builder,
-                    db=db,
-                    pool=pool,
-                    cluster=cluster,
-                    origin_node_id=origin_node_id,
-                    cluster_token=cluster_token,
-                    placement_epoch=placement_epoch,
-                    stats=stats,
-                )
-                metadata_changed = True
-                if stats.attempted_packs % commit_every == 0:
-                    db.commit()
+                stats.packed_chunks += 1
+                stats.processed_bytes += len(data)
+                if must_flush:
+                    _flush_and_push_pack(
+                        builder=builder,
+                        db=db,
+                        pool=pool,
+                        cluster=cluster,
+                        origin_node_id=origin_node_id,
+                        cluster_token=cluster_token,
+                        placement_epoch=new_pack_placement_epoch,
+                        stats=stats,
+                    )
+                    metadata_changed = True
+                    if stats.attempted_packs % commit_every == 0:
+                        db.commit()
 
-        _flush_and_push_pack(
-            builder=builder,
-            db=db,
-            pool=pool,
-            cluster=cluster,
-            origin_node_id=origin_node_id,
-            cluster_token=cluster_token,
-            placement_epoch=placement_epoch,
-            stats=stats,
-        )
+        if builder is not None:
+            _flush_and_push_pack(
+                builder=builder,
+                db=db,
+                pool=pool,
+                cluster=cluster,
+                origin_node_id=origin_node_id,
+                cluster_token=cluster_token,
+                placement_epoch=new_pack_placement_epoch,
+                stats=stats,
+            )
         metadata_changed = metadata_changed or stats.attempted_packs > 0
         db.commit()
 
@@ -446,6 +460,7 @@ class _MutableErasurePushStats:
     processed_bytes: int = 0
     remote_candidates: int = 0
     required_remote_targets: int = 0
+    insufficient_remote_targets: bool = False
 
     def freeze(self, *, interrupted: bool = False) -> ErasurePushStats:
         return ErasurePushStats(
@@ -465,5 +480,6 @@ class _MutableErasurePushStats:
             processed_bytes=self.processed_bytes,
             remote_candidates=self.remote_candidates,
             required_remote_targets=self.required_remote_targets,
+            insufficient_remote_targets=self.insufficient_remote_targets,
             interrupted=interrupted,
         )

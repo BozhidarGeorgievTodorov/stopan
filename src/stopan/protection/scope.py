@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from stopan.metadata.database import (
     ErasureDataPackRecord,
     MetadataDB,
@@ -118,7 +120,7 @@ def erasure_push_retry_packs_for_scope(
     *,
     scope: str,
     snapshot_id: int | None,
-    current_epoch: str | None,
+    current_epochs: Mapping[int, str],
     limit: int | None,
 ) -> list[ErasureDataPackRecord]:
     if scope == "all-known-chunks":
@@ -126,9 +128,10 @@ def erasure_push_retry_packs_for_scope(
     else:
         chunk_hashes = chunk_hashes_for_scope(db, scope=scope, snapshot_id=snapshot_id)
         pack_hashes = db.erasure_pack_hashes_for_chunks(chunk_hashes)
-    return db.pending_erasure_data_packs_by_hashes(
-        pack_hashes,
-        current_epoch=current_epoch,
+    return _pending_erasure_packs_by_remote_targets(
+        db,
+        pack_hashes=pack_hashes,
+        current_epochs=current_epochs,
         limit=limit,
     )
 
@@ -225,19 +228,55 @@ def scoped_erasure_push_retry_packs(
     *,
     scope: str | None,
     snapshot_id: int | None,
-    current_epoch: str | None,
+    current_epochs: Mapping[int, str],
     limit: int | None,
 ) -> list[ErasureDataPackRecord]:
     scope_value = normalize_protection_scope(scope, snapshot_id=snapshot_id)
     if scope_value == DEFAULT_PROTECTION_SCOPE:
-        return db.get_pending_erasure_data_packs(current_epoch=current_epoch, limit=limit)
+        return _pending_erasure_packs_by_remote_targets(
+            db,
+            pack_hashes=None,
+            current_epochs=current_epochs,
+            limit=limit,
+        )
     return erasure_push_retry_packs_for_scope(
         db,
         scope=scope_value,
         snapshot_id=snapshot_id,
-        current_epoch=current_epoch,
+        current_epochs=current_epochs,
         limit=limit,
     )
+
+
+def _pending_erasure_packs_by_remote_targets(
+    db: MetadataDB,
+    *,
+    pack_hashes: tuple[str, ...] | None,
+    current_epochs: Mapping[int, str],
+    limit: int | None,
+) -> list[ErasureDataPackRecord]:
+    records: list[ErasureDataPackRecord] = []
+    for remote_targets in sorted(current_epochs):
+        current_epoch = current_epochs[remote_targets]
+        if pack_hashes is None:
+            selected = db.get_pending_erasure_data_packs(
+                current_epoch=current_epoch,
+                remote_targets=remote_targets,
+                limit=None,
+            )
+        else:
+            selected = db.pending_erasure_data_packs_by_hashes(
+                pack_hashes,
+                current_epoch=current_epoch,
+                remote_targets=remote_targets,
+                limit=None,
+            )
+        records.extend(selected)
+
+    records.sort(key=lambda item: item.pack_hash)
+    if limit is not None:
+        return records[: max(int(limit), 0)]
+    return records
 
 
 def scoped_erasure_push_new_chunks(

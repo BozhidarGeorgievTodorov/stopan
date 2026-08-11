@@ -1253,10 +1253,19 @@ class MetadataDB:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [row["hash"] for row in rows]
 
+    def erasure_data_pack_remote_targets(self) -> tuple[int, ...]:
+        rows = self.conn.execute("""
+            SELECT DISTINCT (data_shards + parity_shards) AS remote_targets
+            FROM erasure_data_packs
+            ORDER BY remote_targets ASC
+        """).fetchall()
+        return tuple(int(row["remote_targets"]) for row in rows)
+
     def get_pending_erasure_data_packs(
         self,
         *,
         current_epoch: str | None = None,
+        remote_targets: int | None = None,
         limit: int | None = None,
     ) -> list[ErasureDataPackRecord]:
         params: list[object] = [
@@ -1264,26 +1273,35 @@ class MetadataDB:
             ProtectionState.DEGRADED.value,
             ProtectionState.FAILED.value,
         ]
-        query = """
-            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
-                   padded_size, shard_size, protection_state, placement_epoch,
-                   created_at, last_push_at, last_verify_at, last_error
-            FROM erasure_data_packs
-            WHERE protection_state IN (?, ?, ?)
-        """
+        state_condition = "protection_state IN (?, ?, ?)"
 
         if current_epoch is not None:
-            query += """
-               OR (
-                    protection_state IN (?, ?)
-                    AND (placement_epoch IS NULL OR placement_epoch <> ?)
-               )
+            state_condition = f"""
+                (
+                    {state_condition}
+                    OR (
+                        protection_state IN (?, ?)
+                        AND (placement_epoch IS NULL OR placement_epoch <> ?)
+                    )
+                )
             """
             params.extend([
                 ProtectionState.PLACED.value,
                 ProtectionState.VERIFIED.value,
                 current_epoch,
             ])
+
+        query = f"""
+            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
+                   padded_size, shard_size, protection_state, placement_epoch,
+                   created_at, last_push_at, last_verify_at, last_error
+            FROM erasure_data_packs
+            WHERE {state_condition}
+        """
+
+        if remote_targets is not None:
+            query += " AND (data_shards + parity_shards) = ?"
+            params.append(int(remote_targets))
 
         query += " ORDER BY pack_hash ASC"
 
@@ -2202,6 +2220,7 @@ class MetadataDB:
         pack_hashes: Iterable[str],
         *,
         current_epoch: str | None,
+        remote_targets: int | None = None,
         limit: int | None,
     ) -> list[ErasureDataPackRecord]:
         hashes = _unique_hashes(pack_hashes)
@@ -2214,31 +2233,35 @@ class MetadataDB:
             ProtectionState.DEGRADED.value,
             ProtectionState.FAILED.value,
         ]
-        query = f"""
-            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
-                   padded_size, shard_size, protection_state, placement_epoch,
-                   created_at, last_push_at, last_verify_at, last_error
-            FROM erasure_data_packs
-            WHERE pack_hash IN ({hash_placeholders})
-              AND (
-                    protection_state IN (?, ?, ?)
-        """
+        state_condition = "protection_state IN (?, ?, ?)"
         if current_epoch is not None:
-            query += """
-                 OR (
+            state_condition = f"""
+                (
+                    {state_condition}
+                    OR (
                         protection_state IN (?, ?)
-                    AND (placement_epoch IS NULL OR placement_epoch <> ?)
-                 )
+                        AND (placement_epoch IS NULL OR placement_epoch <> ?)
+                    )
+                )
             """
             params.extend([
                 ProtectionState.PLACED.value,
                 ProtectionState.VERIFIED.value,
                 current_epoch,
             ])
-        query += """
-              )
-            ORDER BY pack_hash ASC
+
+        query = f"""
+            SELECT pack_hash, codec, data_shards, parity_shards, payload_size,
+                   padded_size, shard_size, protection_state, placement_epoch,
+                   created_at, last_push_at, last_verify_at, last_error
+            FROM erasure_data_packs
+            WHERE pack_hash IN ({hash_placeholders})
+              AND {state_condition}
         """
+        if remote_targets is not None:
+            query += " AND (data_shards + parity_shards) = ?"
+            params.append(int(remote_targets))
+        query += " ORDER BY pack_hash ASC"
         if limit is not None:
             query += " LIMIT ?"
             params.append(int(limit))

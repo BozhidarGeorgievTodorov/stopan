@@ -393,7 +393,6 @@ def verify_erasure_data_packs(
 
     finally:
         client_pool.close()
-        db.commit()
         db.close()
 
         export_after_successful_metadata_change(

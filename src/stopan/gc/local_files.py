@@ -17,6 +17,7 @@ def collect_files_by_age(
     files: Iterable[Path],
     max_age_seconds: int | None,
     dry_run: bool,
+    retain_file: PathPredicate | None = None,
 ) -> LocalFileGarbageCollectionResult:
     root = Path(root_dir).expanduser().resolve()
     max_age = None if max_age_seconds is None else max(int(max_age_seconds), 0)
@@ -26,6 +27,7 @@ def collect_files_by_age(
     files_seen = 0
     files_collectable = 0
     files_deleted = 0
+    files_retained_by_policy = 0
     files_skipped_by_age = 0
     bytes_collectable = 0
     bytes_deleted = 0
@@ -58,6 +60,10 @@ def collect_files_by_age(
         files_seen += 1
 
         if not enabled:
+            continue
+
+        if retain_file is not None and retain_file(path):
+            files_retained_by_policy += 1
             continue
 
         try:
@@ -95,6 +101,7 @@ def collect_files_by_age(
         files_seen=files_seen,
         files_collectable=files_collectable,
         files_deleted=files_deleted,
+        files_retained_by_policy=files_retained_by_policy,
         files_skipped_by_age=files_skipped_by_age,
         bytes_collectable=bytes_collectable,
         bytes_deleted=bytes_deleted,

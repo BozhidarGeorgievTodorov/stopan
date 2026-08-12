@@ -3,12 +3,13 @@ Reconstrucción de snapshots en disco.
 
 SnapshotRestorer reconstruye la jerarquía de directorios y archivos a partir de
 metadata y chunks raw obtenidos mediante ChunkFetchService. La escritura se hace
-en un directorio .incomplete y cada archivo pasa primero por un .tmp.
+en un directorio .incomplete y cada archivo pasa primero por un temporal privado.
 """
 
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -139,6 +140,16 @@ class SnapshotRestorer:
 
         directories: list[tuple[str, dict]] = []
         current_tmp_path: str | None = None
+        try:
+            temp_workspace = tempfile.TemporaryDirectory(
+                prefix=f".stopan-restore-{snapshot_uuid[:12]}-",
+                dir=os.path.dirname(paths.incomplete_dir),
+                ignore_cleanup_errors=True,
+            )
+        except OSError as exc:
+            raise StopanStorageError(
+                f"No se pudo preparar el espacio temporal de restore junto a {paths.incomplete_dir}: {exc}"
+            ) from exc
 
         try:
             for item in iter_items():
@@ -172,7 +183,7 @@ class SnapshotRestorer:
                 if stats.processed_items % RESTORE_PROGRESS_EVERY_ITEMS == 0:
                     self._print_progress(stats)
 
-                current_tmp_path = full_path + ".tmp"
+                current_tmp_path = None
                 success_file = True
 
                 try:
@@ -183,6 +194,10 @@ class SnapshotRestorer:
                         window=self.prefetch_window,
                     )
 
+                    current_tmp_path = os.path.join(
+                        temp_workspace.name,
+                        f"{int(item['id'])}.tmp",
+                    )
                     with open(current_tmp_path, "wb") as handle:
                         for chunk_hash, raw_chunk in prefetcher.iter_raw_chunks(chunk_hashes):
                             try:
@@ -245,6 +260,7 @@ class SnapshotRestorer:
             directories.sort(key=lambda item: len(item[0]), reverse=True)
             for directory_path, item in directories:
                 self.apply_item_metadata(directory_path, item, is_dir=True)
+            temp_workspace.cleanup()
 
         if stats.successful_items == stats.processed_items and stats.processed_items > 0:
             if os.path.lexists(paths.final_dir):

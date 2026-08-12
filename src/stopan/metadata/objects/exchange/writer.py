@@ -7,7 +7,6 @@ mapa de tamaños de chunks y creación de filas operacionales.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -408,7 +407,7 @@ class MetadataDBImportWriter:
             if known_size is not None and known_size != chunk_size:
                 raise MetadataObjectImportError(f"tamaño de chunk no coincide para {chunk_hash}")
             if known_size is None:
-                db.object_import_insert_chunk_zero_ref(chunk_hash, chunk_size)
+                db.object_import_insert_chunk(chunk_hash, chunk_size)
                 self.chunk_sizes[chunk_hash] = chunk_size
             chunks.append((order, chunk_hash, chunk_size))
 
@@ -429,7 +428,6 @@ class MetadataDBImportWriter:
             existing = self._recipe_chunks_by_hash[recipe_hash]
             if existing != tuple_chunks:
                 raise MetadataObjectImportError(f"recipe_hash duplicado con chunks distintos: {recipe_hash}")
-            self._increment_chunk_ref_counts(db, tuple_chunks)
             return RecipeImportResult(
                 cached_id,
                 recipe_hash,
@@ -467,20 +465,7 @@ class MetadataDBImportWriter:
 
         self._recipe_id_by_hash[recipe_hash] = recipe_id
         self._recipe_chunks_by_hash[recipe_hash] = tuple_chunks
-        self._increment_chunk_ref_counts(db, tuple_chunks)
         return RecipeImportResult(recipe_id, recipe_hash, chunk_count, total_size, created=created)
-
-    def _increment_chunk_ref_counts(
-        self,
-        db: MetadataDB,
-        chunks: tuple[tuple[int, str, int], ...],
-    ) -> None:
-        increments: dict[str, int] = defaultdict(int)
-        for _order, chunk_hash, _size in chunks:
-            increments[chunk_hash] += 1
-        if not increments:
-            return
-        db.object_import_increment_chunk_ref_counts(increments)
 
     def _insert_snapshot_item(
         self,

@@ -37,7 +37,7 @@ setup(
         "protobuf>=6.31.1,<7",
         "PyYAML>=6.0.0",
         "zstandard>=0.25.0",
-        "cryptography>=42.0.0",
+        "cryptography>=48.0.1",
         "zfec>=1.6.0.0",
     ],
     extras_require={

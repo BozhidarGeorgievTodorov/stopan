@@ -329,7 +329,7 @@ Los campos `generated_*_grace_hours` son periodos de gracia para artefactos gene
 
 Los campos `received_*_max_age_days` y `recovered_metadata_pack_max_age_days` son políticas de edad para artefactos recibidos o recuperados. En los targets de edad máxima, `0` desactiva el borrado por edad.
 
-`generated_chunk_grace_hours` se aplica a chunks propios en `storage.local_chunk_dir`.
+`generated_chunk_grace_hours` se aplica a chunks propios en `storage.local_chunk_dir` que no estén asociados a snapshots `CREATING` o `COMPLETE`. La alcanzabilidad desde esas capturas prevalece sobre el periodo de gracia. Un valor `0` permite considerar inmediatamente solo los chunks no protegidos por esa condición.
 
 `received_chunk_max_age_days` se aplica a chunks recibidos bajo `storage.custody_dir/chunks`.
 

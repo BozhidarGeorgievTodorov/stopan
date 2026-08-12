@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from stopan.cas.repository import CASRepository
 from stopan.metadata.database import (
+    ErasureDataPackPushUpdate,
     ErasureDataPackRecord,
     MetadataDB,
     MetadataDBAccessMode,
@@ -17,8 +18,8 @@ from stopan.protection.ec.models import ErasureCodingError, ErasureSpec
 from stopan.protection.ec.packer import DataPackBuilder, build_data_pack
 from stopan.protection.ec.placement import plan_data_pack_shard_placement
 from stopan.protection.ec.push_execution import (
+    build_data_pack_push_update,
     push_data_pack_shards,
-    refresh_data_pack_push_metadata,
     register_data_pack_metadata,
 )
 from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
@@ -86,6 +87,15 @@ def push_erasure_data_packs_to_network(
     db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     pool: RemoteDataPackShardClientPool | None = None
     metadata_changed = False
+    pending_updates: list[ErasureDataPackPushUpdate] = []
+
+    def flush_push_updates() -> None:
+        nonlocal metadata_changed
+        if not pending_updates:
+            return
+        db.apply_erasure_data_pack_push_updates(pending_updates)
+        pending_updates.clear()
+        metadata_changed = True
 
     try:
         remote_context = resolve_remote_protection_context(
@@ -177,7 +187,7 @@ def push_erasure_data_packs_to_network(
         )
 
         for record in retry_packs:
-            pack_chunk_count, pack_metadata_changed = _retry_existing_pack(
+            pack_chunk_count, push_update = _retry_existing_pack(
                 record=record,
                 db=db,
                 repo=repo,
@@ -189,9 +199,10 @@ def push_erasure_data_packs_to_network(
                 stats=stats,
             )
             stats.attempted_chunks += pack_chunk_count
-            metadata_changed = metadata_changed or pack_metadata_changed
-            if pack_metadata_changed and stats.attempted_packs % commit_every == 0:
-                db.commit()
+            if push_update is not None:
+                pending_updates.append(push_update)
+                if len(pending_updates) >= commit_every:
+                    flush_push_updates()
 
         if builder is not None:
             for chunk_hash in pending_chunks:
@@ -211,7 +222,7 @@ def push_erasure_data_packs_to_network(
                 stats.packed_chunks += 1
                 stats.processed_bytes += len(data)
                 if must_flush:
-                    _flush_and_push_pack(
+                    push_update = _flush_and_push_pack(
                         builder=builder,
                         db=db,
                         pool=pool,
@@ -221,12 +232,14 @@ def push_erasure_data_packs_to_network(
                         placement_epoch=new_pack_placement_epoch,
                         stats=stats,
                     )
-                    metadata_changed = True
-                    if stats.attempted_packs % commit_every == 0:
-                        db.commit()
+                    if push_update is not None:
+                        metadata_changed = True
+                        pending_updates.append(push_update)
+                        if len(pending_updates) >= commit_every:
+                            flush_push_updates()
 
         if builder is not None:
-            _flush_and_push_pack(
+            push_update = _flush_and_push_pack(
                 builder=builder,
                 db=db,
                 pool=pool,
@@ -236,22 +249,33 @@ def push_erasure_data_packs_to_network(
                 placement_epoch=new_pack_placement_epoch,
                 stats=stats,
             )
-        metadata_changed = metadata_changed or stats.attempted_packs > 0
-        db.commit()
+            if push_update is not None:
+                metadata_changed = True
+                pending_updates.append(push_update)
+
+        flush_push_updates()
 
         return stats.freeze()
 
     except KeyboardInterrupt:
         print("\nPush EC interrumpido por el usuario.")
-        db.commit()
+        flush_push_updates()
         if "stats" in locals():
             return stats.freeze(interrupted=True)
         return ErasurePushStats(interrupted=True)
 
+    except BaseException:
+        try:
+            flush_push_updates()
+        except Exception:
+            pass
+        raise
+
     finally:
         if pool is not None:
             pool.close()
-        db.commit()
+        if "stats" in locals() and stats.attempted_packs > 0:
+            metadata_changed = True
         db.close()
 
         export_after_successful_metadata_change(
@@ -272,12 +296,12 @@ def _flush_and_push_pack(
     cluster_token: str,
     placement_epoch: str,
     stats: "_MutableErasurePushStats",
-) -> None:
+) -> ErasureDataPackPushUpdate | None:
     pack = builder.flush()
     if pack is None:
-        return
+        return None
 
-    _push_pack(
+    return _push_pack(
         pack=pack,
         db=db,
         pool=pool,
@@ -301,17 +325,17 @@ def _retry_existing_pack(
     cluster_token: str,
     remote_candidate_count: int,
     stats: "_MutableErasurePushStats",
-) -> tuple[int, bool]:
+) -> tuple[int, ErasureDataPackPushUpdate | None]:
     chunks = db.get_erasure_pack_chunks(record.pack_hash)
     chunk_count = len(chunks)
     if not chunks:
-        return 0, False
+        return 0, None
 
     record_spec = spec_from_erasure_metadata(record)
     if remote_candidate_count < record_spec.total_shards:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        return chunk_count, False
+        return chunk_count, None
 
     record_placement_epoch = cluster.placement_epoch_excluding(
         desired_rf=record_spec.total_shards,
@@ -333,23 +357,23 @@ def _retry_existing_pack(
 
     if missing_local:
         stats.failed_packs += 1
-        return chunk_count, False
+        return chunk_count, None
 
     try:
         pack = build_data_pack(chunks=materialized_chunks, spec=record_spec)
     except ErasureCodingError as exc:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        return chunk_count, False
+        return chunk_count, None
 
     if pack.pack_hash != record.pack_hash:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        return chunk_count, False
+        return chunk_count, None
 
     stats.packed_chunks += len(pack.entries)
     stats.processed_bytes += sum(len(data) for _, data in materialized_chunks)
-    _push_pack(
+    push_update = _push_pack(
         pack=pack,
         db=db,
         pool=pool,
@@ -360,7 +384,7 @@ def _retry_existing_pack(
         stats=stats,
         refresh_existing=True,
     )
-    return chunk_count, True
+    return chunk_count, push_update
 
 
 def _push_pack(
@@ -374,7 +398,7 @@ def _push_pack(
     placement_epoch: str,
     stats: "_MutableErasurePushStats",
     refresh_existing: bool,
-) -> None:
+) -> ErasureDataPackPushUpdate:
     stats.attempted_packs += 1
     placements = plan_data_pack_shard_placement(
         pack_hash=pack.pack_hash,
@@ -383,6 +407,15 @@ def _push_pack(
         origin_node_id=origin_node_id,
         cluster_token=cluster_token,
     )
+
+    if not refresh_existing:
+        register_data_pack_metadata(
+            db=db,
+            pack=pack,
+            placements=placements,
+            protection_state=ProtectionState.PENDING,
+            placement_epoch=placement_epoch,
+        )
 
     push_result = push_data_pack_shards(
         pack=pack,
@@ -398,13 +431,7 @@ def _push_pack(
         data_shards=pack.spec.data_shards,
         total_shards=pack.spec.total_shards,
     )
-    metadata_writer = (
-        refresh_data_pack_push_metadata
-        if refresh_existing
-        else register_data_pack_metadata
-    )
-    metadata_writer(
-        db=db,
+    push_update = build_data_pack_push_update(
         pack=pack,
         placements=placements,
         protection_state=protection_state,
@@ -419,6 +446,7 @@ def _push_pack(
         protection_state=protection_state,
         stats=stats,
     )
+    return push_update
 
 
 def _apply_pack_state_to_stats(

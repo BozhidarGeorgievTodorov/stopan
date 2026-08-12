@@ -1174,7 +1174,7 @@ Opciones de `received-ec`:
 --apply
 ```
 
-`generated-chunks` limpia chunks propios en `storage.local_chunk_dir`. Usa periodo de gracia en horas.
+`generated-chunks` limpia chunks propios en `storage.local_chunk_dir`. Antes de aplicar el periodo de gracia, conserva los chunks asociados en el catálogo a snapshots `CREATING` o `COMPLETE`. Solo los restantes pueden convertirse en candidatos por antigüedad. Un periodo de gracia de `0` elimina la espera temporal, pero no esta condición de conservación.
 
 `received-chunks` limpia chunks recibidos bajo `storage.custody_dir/chunks`. Usa edad máxima en días. Valor `0` desactiva el borrado por edad.
 

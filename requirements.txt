@@ -4,5 +4,5 @@ protobuf==6.33.6
 PyYAML==6.0.2
 typing_extensions==4.15.0
 zstandard==0.25.0
-cryptography==42.0.8
+cryptography==48.0.1
 zfec==1.6.0.0

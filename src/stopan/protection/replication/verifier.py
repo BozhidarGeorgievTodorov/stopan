@@ -384,7 +384,6 @@ def verify_remote_protection(
     finally:
         if verifier is not None:
             verifier.close()
-        db.commit()
         db.close()
 
         export_after_successful_metadata_change(

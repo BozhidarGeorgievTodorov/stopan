@@ -285,13 +285,25 @@ def _command_handlers() -> dict[str, GcCommandHandler]:
 
 def _cmd_generated_chunks(args: argparse.Namespace) -> int:
     from stopan.cas.gc import collect_cas_chunks
+    from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 
     cfg = load_runtime_config(args)
+    db = MetadataDB(
+        cfg.node.catalog_file,
+        init_schema=False,
+        access_mode=MetadataDBAccessMode.READ_ONLY,
+    )
+    try:
+        reachable_hashes = db.gc_protected_chunk_hashes()
+    finally:
+        db.close()
+
     result = collect_cas_chunks(
         target=args.command,
         root_dir=args.chunk_store or cfg.storage.local_chunk_dir,
         max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_chunk_grace_hours)) * _SECONDS_PER_HOUR),
         dry_run=bool(args.dry_run),
+        reachable_hashes=reachable_hashes,
     )
     _print_local_file_result(result)
     return 0
@@ -459,6 +471,7 @@ def _print_local_file_result(result: LocalFileGarbageCollectionResult) -> None:
     print(f"   age_cutoff: {_format_optional_time(result.cutoff_unix)}")
     print("Scan")
     print(f"   files_seen: {result.files_seen}")
+    print(f"   files_retained_by_policy: {result.files_retained_by_policy}")
     print(f"   files_skipped_by_age: {result.files_skipped_by_age}")
     print("Prune")
     print(f"   files_collectable: {result.files_collectable}")

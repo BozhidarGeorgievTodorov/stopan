@@ -292,7 +292,7 @@ Las familias principales son:
 - metadata packs recibidos
 - metadata packs recuperados
 
-Los targets de edad máxima usan `0` como valor que desactiva borrado por edad. Los targets generados usan periodos de gracia para evitar borrar artefactos recién creados.
+Los targets de edad máxima usan `0` como valor que desactiva borrado por edad. Los targets generados usan periodos de gracia para evitar borrar artefactos recién creados. En `generated-chunks`, el periodo de gracia se aplica solo después de excluir los chunks asociados a snapshots `CREATING` o `COMPLETE`, de modo que la limpieza no retire contenido todavía necesario por una captura activa o terminada.
 
 El metadata object graph usa un GC tipo mark-and-sweep desde `latest`. Los objetos alcanzables siguen vivos. Los objetos huérfanos se vuelven candidatos después del periodo de gracia. Los packs locales generados se tratan como artefactos de exportación o cache.
 

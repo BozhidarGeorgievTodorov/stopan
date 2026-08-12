@@ -15,6 +15,7 @@ class LocalFileGarbageCollectionResult:
     files_seen: int = 0
     files_collectable: int = 0
     files_deleted: int = 0
+    files_retained_by_policy: int = 0
     files_skipped_by_age: int = 0
     bytes_collectable: int = 0
     bytes_deleted: int = 0

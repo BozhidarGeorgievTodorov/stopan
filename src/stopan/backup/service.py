@@ -11,6 +11,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import time
+from collections.abc import Iterator
 
 from stopan.cli.output import format_speed
 from .identity import resolve_origin_node_id
@@ -29,6 +30,7 @@ from stopan.config.defaults import DEFAULT_BACKUP_WORKERS
 
 
 _DEFAULT_WORKERS_FALLBACK = DEFAULT_BACKUP_WORKERS
+_SNAPSHOT_ITEM_BATCH_SIZE = 32
 
 
 def backup_directory(
@@ -147,49 +149,75 @@ def backup_directory(
                         failed_files.append((rel_path, str(chunks_or_error)))
                         continue
 
-                    recipe_id = db.get_or_create_recipe(
+                    db.consolidate_item_recipe(
+                        item_id,
                         recipe_hash,
                         chunks_or_error,
                         desired_rf=policy.desired_rf,
                     )
-                    db.set_item_recipe(item_id, recipe_id)
 
                     totals.add_worker_file(file_size=file_size, stats=stats)
 
-            for rel_path, full_path, stat_info, item_type in walker.walk():
-                item_id = db.add_item(snapshot_id, rel_path, stat_info, item_type)
+            for walk_batch in _iter_walk_batches(
+                walker,
+                batch_size=_SNAPSHOT_ITEM_BATCH_SIZE,
+            ):
+                item_ids = db.add_items(
+                    snapshot_id,
+                    (
+                        (rel_path, stat_info, item_type)
+                        for rel_path, _, stat_info, item_type in walk_batch
+                    ),
+                )
+                reused_assignments: list[tuple[int, int]] = []
+                pending_processing: list[tuple[int, str, str]] = []
 
-                if item_type != "file":
-                    continue
+                for item_id, (rel_path, full_path, stat_info, item_type) in zip(
+                    item_ids,
+                    walk_batch,
+                    strict=True,
+                ):
+                    if item_type != "file":
+                        continue
 
-                if previous_snapshot_id is not None and not safe_mode:
-                    previous_item = db.get_item_by_path(previous_snapshot_id, rel_path)
-                    if previous_item is not None:
-                        if _is_unchanged_file(previous_item, stat_info):
-                            db.set_item_recipe(item_id, previous_item["recipe_id"])
-                            db.ensure_recipe_protection(
-                                previous_item["recipe_id"],
-                                desired_rf=policy.desired_rf,
+                    if previous_snapshot_id is not None and not safe_mode:
+                        previous_item = db.get_item_by_path(
+                            previous_snapshot_id, rel_path
+                        )
+                        if (
+                            previous_item is not None
+                            and _is_unchanged_file(previous_item, stat_info)
+                        ):
+                            reused_assignments.append(
+                                (item_id, previous_item["recipe_id"])
                             )
                             totals.add_reused_file(file_size=stat_info.st_size)
                             continue
 
-                future = executor.submit(
-                    process_file_worker,
-                    full_path,
-                    local_chunk_dir=local_chunk_dir,
-                    db_file=db_file,
-                    fast_local_enabled=policy.fast_local_enabled,
-                    fast_remote_enabled=policy.fast_remote_enabled,
-                    safe_mode=safe_mode,
-                    shared_index=shared_index,
-                    desired_rf=policy.desired_rf,
-                    placement_epoch=placement_epoch,
-                )
-                future_map[future] = (item_id, rel_path)
+                    pending_processing.append((item_id, rel_path, full_path))
 
-                if len(future_map) >= max_pending_futures:
-                    collect_completed(wait_for_all=False)
+                db.reuse_item_recipes(
+                    reused_assignments,
+                    desired_rf=policy.desired_rf,
+                )
+
+                for item_id, rel_path, full_path in pending_processing:
+                    future = executor.submit(
+                        process_file_worker,
+                        full_path,
+                        local_chunk_dir=local_chunk_dir,
+                        db_file=db_file,
+                        fast_local_enabled=policy.fast_local_enabled,
+                        fast_remote_enabled=policy.fast_remote_enabled,
+                        safe_mode=safe_mode,
+                        shared_index=shared_index,
+                        desired_rf=policy.desired_rf,
+                        placement_epoch=placement_epoch,
+                    )
+                    future_map[future] = (item_id, rel_path)
+
+                    if len(future_map) >= max_pending_futures:
+                        collect_completed(wait_for_all=False)
 
             if future_map:
                 collect_completed(wait_for_all=True)
@@ -197,25 +225,22 @@ def backup_directory(
         _raise_if_failed_files(failed_files)
 
         db.finish_snapshot(snapshot_id, totals.size, totals.files)
-        db.commit()
         snapshot_completed = True
 
     except KeyboardInterrupt:
         if snapshot_id is not None:
             try:
                 db.fail_snapshot(snapshot_id, "backup interrumpido por el usuario")
-                db.commit()
             except Exception:
-                db.rollback()
+                pass
         raise
 
     except Exception as exc:
         if snapshot_id is not None:
             try:
                 db.fail_snapshot(snapshot_id, str(exc))
-                db.commit()
             except Exception:
-                db.rollback()
+                pass
         raise
 
     finally:
@@ -245,6 +270,32 @@ def backup_directory(
             settings=metadata_object_graph_auto_export,
             context_label="BACKUP",
         )
+
+
+def _iter_walk_batches(
+    walker: TreeWalker,
+    *,
+    batch_size: int,
+) -> Iterator[list[tuple[str, str, os.stat_result, str]]]:
+    """Agrupa emisiones del recorrido sin mantener una transacción durante E/S."""
+    if batch_size < 1:
+        raise ValueError("batch_size debe ser positivo")
+
+    iterator = iter(walker.walk())
+    while True:
+        batch: list[tuple[str, str, os.stat_result, str]] = []
+        try:
+            while len(batch) < batch_size:
+                batch.append(next(iterator))
+        except StopIteration:
+            if batch:
+                yield batch
+            return
+        except Exception:
+            if batch:
+                yield batch
+            raise
+        yield batch
 
 
 def _is_unchanged_file(previous_item: dict, stat_info: os.stat_result) -> bool:

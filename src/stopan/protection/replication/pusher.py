@@ -282,7 +282,6 @@ def push_to_network(
     finally:
         if remote_client is not None:
             remote_client.close()
-        db.commit()
         db.close()
 
         export_after_successful_metadata_change(

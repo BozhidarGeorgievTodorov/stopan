@@ -80,6 +80,22 @@ class ErasureDataPackVerificationUpdate:
 
 
 @dataclass(frozen=True)
+class ErasureDataPackPushUpdate:
+    pack_hash: str
+    codec: str
+    data_shards: int
+    parity_shards: int
+    payload_size: int
+    padded_size: int
+    shard_size: int
+    chunks: tuple[tuple[str, int, int, int], ...]
+    shards: tuple[tuple[int, str, str, int], ...]
+    protection_state: ProtectionState
+    placement_epoch: str | None
+    pushed_at: float
+
+
+@dataclass(frozen=True)
 class ErasureDataPackRecord:
     pack_hash: str
     codec: str
@@ -167,6 +183,7 @@ class MetadataDB:
             connect_target,
             uri=use_uri,
             timeout=self.busy_timeout_ms / 1000.0,
+            isolation_level=None,
         )
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
@@ -202,12 +219,6 @@ class MetadataDB:
 
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
-
-    def commit(self) -> None:
-        self.conn.commit()
-
-    def rollback(self) -> None:
-        self.conn.rollback()
 
     @contextmanager
     def transaction(
@@ -263,7 +274,7 @@ class MetadataDB:
 
     def _init_db(self) -> None:
         """Crea las tablas y los índices requeridos por los recorridos actuales."""
-        with self.conn:
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
             cursor = self.conn.cursor()
 
             # Identidad lógica del catálogo.
@@ -301,8 +312,7 @@ class MetadataDB:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS chunks (
                     hash TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL,
-                    ref_count INTEGER NOT NULL DEFAULT 0
+                    size INTEGER NOT NULL
                 )
             """)
 
@@ -464,18 +474,10 @@ class MetadataDB:
             return _require_vault_id("vault_id", row["value"])
 
         vault_id = uuid.uuid4().hex
-        outer_transaction = self.conn.in_transaction
-        try:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
-                (vault_id,),
-            )
-            if not outer_transaction:
-                self.conn.commit()
-        except BaseException:
-            if not outer_transaction:
-                self.conn.rollback()
-            raise
+        self.conn.execute(
+            "INSERT OR IGNORE INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
+            (vault_id,),
+        )
         row = self.conn.execute(
             "SELECT value FROM metadata_vault WHERE key = 'vault_id' LIMIT 1"
         ).fetchone()
@@ -496,18 +498,10 @@ class MetadataDB:
                 )
             return
 
-        outer_transaction = self.conn.in_transaction
-        try:
-            self.conn.execute(
-                "INSERT INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
-                (value,),
-            )
-            if not outer_transaction:
-                self.conn.commit()
-        except BaseException:
-            if not outer_transaction:
-                self.conn.rollback()
-            raise
+        self.conn.execute(
+            "INSERT INTO metadata_vault (key, value) VALUES ('vault_id', ?)",
+            (value,),
+        )
 
     # ------------------------------------------------------------------
     # Metadata pack publications
@@ -538,35 +532,34 @@ class MetadataDB:
         failed = _require_non_negative_int("failed_targets", failed_targets)
         pushed = time.time() if pushed_at is None else float(pushed_at)
 
-        with self.conn:
-            self.conn.execute("""
-                INSERT INTO metadata_pack_publications (
-                    owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
-                    attempted_targets, successful_targets, stored_targets,
-                    already_present_targets, failed_targets
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(owner_id, pack_hash) DO UPDATE SET
-                    desired_copies = excluded.desired_copies,
-                    pushed_at = excluded.pushed_at,
-                    pack_size_bytes = excluded.pack_size_bytes,
-                    attempted_targets = excluded.attempted_targets,
-                    successful_targets = excluded.successful_targets,
-                    stored_targets = excluded.stored_targets,
-                    already_present_targets = excluded.already_present_targets,
-                    failed_targets = excluded.failed_targets
-            """, (
-                owner,
-                pack,
-                desired,
-                pushed,
-                pack_size,
-                attempted,
-                successful,
-                stored,
-                already_present,
-                failed,
-            ))
+        self.conn.execute("""
+            INSERT INTO metadata_pack_publications (
+                owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
+                attempted_targets, successful_targets, stored_targets,
+                already_present_targets, failed_targets
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id, pack_hash) DO UPDATE SET
+                desired_copies = excluded.desired_copies,
+                pushed_at = excluded.pushed_at,
+                pack_size_bytes = excluded.pack_size_bytes,
+                attempted_targets = excluded.attempted_targets,
+                successful_targets = excluded.successful_targets,
+                stored_targets = excluded.stored_targets,
+                already_present_targets = excluded.already_present_targets,
+                failed_targets = excluded.failed_targets
+        """, (
+            owner,
+            pack,
+            desired,
+            pushed,
+            pack_size,
+            attempted,
+            successful,
+            stored,
+            already_present,
+            failed,
+        ))
 
     def get_metadata_pack_publication(
         self,
@@ -639,19 +632,64 @@ class MetadataDB:
 
     def finish_snapshot(self, snapshot_id: int, total_size: int, total_files: int) -> None:
         """Marca un snapshot como completado."""
-        self.conn.execute("""
-            UPDATE snapshots
-            SET total_size = ?, total_files = ?, status = 'COMPLETE', error = NULL
-            WHERE id = ?
-        """, (total_size, total_files, snapshot_id))
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            row = self.conn.execute(
+                "SELECT status FROM snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if row is None:
+                raise MetadataDatabaseError(f"snapshot no registrado: {snapshot_id}")
+            if row["status"] != "CREATING":
+                raise MetadataDatabaseError(
+                    f"snapshot {snapshot_id} no está en CREATING: {row['status']}"
+                )
+
+            incomplete = self.conn.execute("""
+                SELECT path
+                FROM snapshot_items
+                WHERE snapshot_id = ?
+                  AND item_type = 'file'
+                  AND recipe_id IS NULL
+                ORDER BY path ASC
+                LIMIT 1
+            """, (snapshot_id,)).fetchone()
+            if incomplete is not None:
+                raise MetadataDatabaseError(
+                    "snapshot contiene archivos sin receta: "
+                    f"snapshot_id={snapshot_id} path={incomplete['path']}"
+                )
+
+            cursor = self.conn.execute("""
+                UPDATE snapshots
+                SET total_size = ?, total_files = ?, status = 'COMPLETE', error = NULL
+                WHERE id = ? AND status = 'CREATING'
+            """, (total_size, total_files, snapshot_id))
+            if cursor.rowcount != 1:
+                raise MetadataDatabaseError(
+                    f"no se pudo completar snapshot: {snapshot_id}"
+                )
 
     def fail_snapshot(self, snapshot_id: int, error: str) -> None:
         """Marca un snapshot como fallido y guarda la causa."""
-        self.conn.execute("""
+        cursor = self.conn.execute("""
             UPDATE snapshots
             SET status = 'FAILED', error = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'CREATING'
         """, (str(error), snapshot_id))
+        if cursor.rowcount == 1:
+            return
+
+        row = self.conn.execute(
+            "SELECT status FROM snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise MetadataDatabaseError(f"snapshot no registrado: {snapshot_id}")
+        if row["status"] == "FAILED":
+            return
+        raise MetadataDatabaseError(
+            f"snapshot {snapshot_id} no puede pasar a FAILED desde {row['status']}"
+        )
 
     def get_snapshot_status(self, snapshot_id: int) -> tuple[str | None, str | None]:
         row = self.conn.execute("""
@@ -725,6 +763,22 @@ class MetadataDB:
         ))
         return cursor.lastrowid
 
+    def add_items(
+        self,
+        snapshot_id: int,
+        items: Iterable[tuple[str, object, str]],
+    ) -> list[int]:
+        """Registra un lote acotado de elementos en una única transacción corta."""
+        batch = list(items)
+        if not batch:
+            return []
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            return [
+                self.add_item(snapshot_id, rel_path, stat_info, item_type)
+                for rel_path, stat_info, item_type in batch
+            ]
+
     def get_snapshot_items(self, snapshot_id: int) -> Iterator[dict[str, object]]:
         """Genera los elementos de un snapshot en orden de ruta."""
         cursor = self.conn.execute("""
@@ -750,11 +804,65 @@ class MetadataDB:
 
     def set_item_recipe(self, item_id: int, recipe_id: int) -> None:
         """Asocia un item del snapshot con una receta."""
-        self.conn.execute("""
+        self._set_item_recipe(item_id, recipe_id)
+
+    def _set_item_recipe(self, item_id: int, recipe_id: int) -> None:
+        cursor = self.conn.execute("""
             UPDATE snapshot_items
             SET recipe_id = ?
             WHERE id = ?
         """, (recipe_id, item_id))
+        if cursor.rowcount != 1:
+            raise MetadataDatabaseError(f"snapshot item no registrado: {item_id}")
+
+    def consolidate_item_recipe(
+        self,
+        item_id: int,
+        recipe_hash: str,
+        chunks: Iterable[tuple[int, str, int]],
+        *,
+        desired_rf: int = 3,
+    ) -> int:
+        """Consolida receta, protección inicial y asociación al item como una unidad."""
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            recipe_id = self._get_or_create_recipe(
+                recipe_hash,
+                chunks,
+                desired_rf=desired_rf,
+            )
+            self._set_item_recipe(item_id, recipe_id)
+        return recipe_id
+
+    def reuse_item_recipe(
+        self,
+        item_id: int,
+        recipe_id: int,
+        *,
+        desired_rf: int = 3,
+    ) -> None:
+        """Asocia una receta previa y actualiza su intención de protección atómicamente."""
+        self.reuse_item_recipes(
+            ((item_id, recipe_id),),
+            desired_rf=desired_rf,
+        )
+
+    def reuse_item_recipes(
+        self,
+        assignments: Iterable[tuple[int, int]],
+        *,
+        desired_rf: int = 3,
+    ) -> None:
+        """Consolida un lote de reutilizaciones sin repetir protección por receta."""
+        batch = list(assignments)
+        if not batch:
+            return
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for item_id, recipe_id in batch:
+                self._set_item_recipe(item_id, recipe_id)
+
+            for recipe_id in dict.fromkeys(recipe_id for _, recipe_id in batch):
+                self._ensure_recipe_protection(recipe_id, desired_rf=desired_rf)
 
     def get_item_chunks(self, item_id: int) -> Iterator[str]:
         """Genera la receta de hashes de un archivo."""
@@ -792,6 +900,20 @@ class MetadataDB:
         desired_rf: int = 3,
     ) -> int:
         """Crea o reutiliza una receta deduplicada de chunks."""
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            return self._get_or_create_recipe(
+                recipe_hash,
+                chunks,
+                desired_rf=desired_rf,
+            )
+
+    def _get_or_create_recipe(
+        self,
+        recipe_hash: str,
+        chunks: Iterable[tuple[int, str, int]],
+        *,
+        desired_rf: int,
+    ) -> int:
         recipe_hash = _require_hash64("recipe_hash", recipe_hash)
         chunks = list(chunks)
         desired_rf = int(desired_rf)
@@ -809,63 +931,66 @@ class MetadataDB:
             if chunk_size < 1:
                 raise MetadataDatabaseError(f"invalid chunk size in recipe {recipe_hash}: {chunk_size}")
 
-        with self.conn:
-            self.conn.execute("""
-                INSERT OR IGNORE INTO recipes (recipe_hash, chunk_count, total_size)
-                VALUES (?, ?, ?)
-            """, (recipe_hash, chunk_count, total_size))
+        self.conn.execute("""
+            INSERT OR IGNORE INTO recipes (recipe_hash, chunk_count, total_size)
+            VALUES (?, ?, ?)
+        """, (recipe_hash, chunk_count, total_size))
 
-            row = self.conn.execute("""
-                SELECT id, chunk_count, total_size
-                FROM recipes
-                WHERE recipe_hash = ?
-                LIMIT 1
-            """, (recipe_hash,)).fetchone()
-            if row is None:
-                raise MetadataDatabaseError(f"Could not resolve recipe_id for {recipe_hash}")
+        row = self.conn.execute("""
+            SELECT id, chunk_count, total_size
+            FROM recipes
+            WHERE recipe_hash = ?
+            LIMIT 1
+        """, (recipe_hash,)).fetchone()
+        if row is None:
+            raise MetadataDatabaseError(f"Could not resolve recipe_id for {recipe_hash}")
 
-            if row["chunk_count"] != chunk_count or row["total_size"] != total_size:
-                raise MetadataDatabaseError(
-                    "Inconsistent recipe_hash: "
-                    f"{recipe_hash} already maps to chunk_count={row['chunk_count']} "
-                    f"total_size={row['total_size']}, attempted chunk_count={chunk_count} "
-                    f"total_size={total_size}"
-                )
+        if row["chunk_count"] != chunk_count or row["total_size"] != total_size:
+            raise MetadataDatabaseError(
+                "Inconsistent recipe_hash: "
+                f"{recipe_hash} already maps to chunk_count={row['chunk_count']} "
+                f"total_size={row['total_size']}, attempted chunk_count={chunk_count} "
+                f"total_size={total_size}"
+            )
 
-            recipe_id = row["id"]
+        recipe_id = row["id"]
 
-            existing_rows = self.conn.execute("""
-                SELECT chunk_order, chunk_hash, chunk_size
-                FROM recipe_chunks
-                WHERE recipe_id = ?
-                ORDER BY chunk_order ASC
-            """, (recipe_id,)).fetchall()
+        existing_rows = self.conn.execute("""
+            SELECT chunk_order, chunk_hash, chunk_size
+            FROM recipe_chunks
+            WHERE recipe_id = ?
+            ORDER BY chunk_order ASC
+        """, (recipe_id,)).fetchall()
 
-            existing_chunks = [
-                (row["chunk_order"], row["chunk_hash"], row["chunk_size"])
-                for row in existing_rows
-            ]
-            if existing_chunks:
-                if existing_chunks != chunks:
-                    raise MetadataDatabaseError(f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}")
+        existing_chunks = [
+            (row["chunk_order"], row["chunk_hash"], row["chunk_size"])
+            for row in existing_rows
+        ]
+        if existing_chunks and existing_chunks != chunks:
+            raise MetadataDatabaseError(
+                f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}"
+            )
 
-            self._register_chunks(chunks)
+        self._register_chunks(chunks)
 
-            if not existing_chunks and chunk_count > 0:
-                self.conn.executemany("""
-                    INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    (recipe_id, order, chunk_hash, chunk_size)
-                    for order, chunk_hash, chunk_size in chunks
-                ))
+        if not existing_chunks and chunk_count > 0:
+            self.conn.executemany("""
+                INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
+                VALUES (?, ?, ?, ?)
+            """, (
+                (recipe_id, order, chunk_hash, chunk_size)
+                for order, chunk_hash, chunk_size in chunks
+            ))
 
-            self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
-
+        self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
         return recipe_id
 
     def ensure_recipe_protection(self, recipe_id: int, *, desired_rf: int = 3) -> None:
         """Asegura filas de protección para los chunks de una receta reutilizada."""
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            self._ensure_recipe_protection(recipe_id, desired_rf=desired_rf)
+
+    def _ensure_recipe_protection(self, recipe_id: int, *, desired_rf: int) -> None:
         rows = self.conn.execute("""
             SELECT chunk_order, chunk_hash, chunk_size
             FROM recipe_chunks
@@ -877,28 +1002,41 @@ class MetadataDB:
         self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
 
     def _register_chunks(self, chunks: Iterable[tuple[int, str, int]]) -> None:
-        ref_counts: dict[str, list[int]] = {}
+        chunk_sizes: dict[str, int] = {}
         for _, chunk_hash, chunk_size in chunks:
-            current = ref_counts.get(chunk_hash)
+            current = chunk_sizes.get(chunk_hash)
             if current is None:
-                ref_counts[chunk_hash] = [chunk_size, 1]
+                chunk_sizes[chunk_hash] = chunk_size
                 continue
-            if current[0] != chunk_size:
+            if current != chunk_size:
                 raise MetadataDatabaseError(
                     "un mismo chunk no puede tener tamaños distintos dentro de una receta: "
-                    f"hash={chunk_hash} tamaños={current[0]},{chunk_size}"
+                    f"hash={chunk_hash} tamaños={current},{chunk_size}"
                 )
-            current[1] += 1
 
         self.conn.executemany("""
-            INSERT INTO chunks (hash, size, ref_count)
-            VALUES (?, ?, ?)
-            ON CONFLICT(hash) DO UPDATE SET
-                ref_count = ref_count + excluded.ref_count
+            INSERT OR IGNORE INTO chunks (hash, size)
+            VALUES (?, ?)
         """, (
-            (chunk_hash, chunk_size, ref_count)
-            for chunk_hash, (chunk_size, ref_count) in ref_counts.items()
+            (chunk_hash, chunk_size)
+            for chunk_hash, chunk_size in chunk_sizes.items()
         ))
+
+        for batch in iter_batches(list(chunk_sizes), 500):
+            placeholders = ", ".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT hash, size FROM chunks WHERE hash IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            persisted_sizes = {row["hash"]: int(row["size"]) for row in rows}
+            for chunk_hash in batch:
+                expected_size = chunk_sizes[chunk_hash]
+                current_size = persisted_sizes.get(chunk_hash)
+                if current_size != expected_size:
+                    raise MetadataDatabaseError(
+                        "chunk hash asociado a tamaño inconsistente: "
+                        f"hash={chunk_hash} esperado={expected_size} actual={current_size}"
+                    )
 
     def _ensure_chunk_protection_rows(
         self,
@@ -998,12 +1136,7 @@ class MetadataDB:
         protection_state: ProtectionState = ProtectionState.PENDING,
         placement_epoch: str | None = None,
     ) -> None:
-        """
-        Registra un data pack EC sellado.
-
-        chunks usa tuplas (chunk_hash, offset, length, ordinal).
-        shards usa tuplas (shard_index, shard_hash, node_id, size).
-        """
+        """Registra atómicamente la definición persistente de un data pack EC."""
         pack_hash = _require_hash64("pack_hash", pack_hash)
         codec = _require_non_empty_text("codec", codec)
         data_shards = _require_positive_int("data_shards", data_shards)
@@ -1024,7 +1157,7 @@ class MetadataDB:
         now = time.time()
         last_push_at = now if state_value != ProtectionState.PENDING.value else None
 
-        with self.conn:
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
             self._insert_erasure_data_pack_once(
                 pack_hash=pack_hash,
                 codec=codec,
@@ -1039,8 +1172,12 @@ class MetadataDB:
                 last_push_at=last_push_at,
             )
             self._insert_erasure_pack_chunks_once(pack_hash, chunk_rows)
-            self._insert_erasure_pack_shards_once(pack_hash, shard_rows, state_value, last_push_at)
-
+            self._insert_erasure_pack_shards_once(
+                pack_hash,
+                shard_rows,
+                state_value,
+                last_push_at,
+            )
 
     def refresh_erasure_data_pack_push(
         self,
@@ -1057,20 +1194,58 @@ class MetadataDB:
         protection_state: ProtectionState,
         placement_epoch: str | None,
     ) -> None:
-        """
-        Actualiza el resultado de push de un data pack EC ya registrado.
+        """Actualiza el resultado de push de un data pack EC ya registrado."""
+        self.apply_erasure_data_pack_push_updates((
+            ErasureDataPackPushUpdate(
+                pack_hash=pack_hash,
+                codec=codec,
+                data_shards=data_shards,
+                parity_shards=parity_shards,
+                payload_size=payload_size,
+                padded_size=padded_size,
+                shard_size=shard_size,
+                chunks=tuple(chunks),
+                shards=tuple(shards),
+                protection_state=protection_state,
+                placement_epoch=placement_epoch,
+                pushed_at=time.time(),
+            ),
+        ))
 
-        No reasigna chunks a otro pack ni cambia la identidad del pack. Solo
-        refresca estado, epoch y filas de shards tras un reintento.
-        """
-        pack_hash = _require_hash64("pack_hash", pack_hash)
-        codec = _require_non_empty_text("codec", codec)
-        data_shards = _require_positive_int("data_shards", data_shards)
-        parity_shards = _require_non_negative_int("parity_shards", parity_shards)
-        payload_size = _require_non_negative_int("payload_size", payload_size)
-        padded_size = _require_non_negative_int("padded_size", padded_size)
-        shard_size = _require_positive_int("shard_size", shard_size)
-        state_value = _protection_state_value(protection_state)
+    def apply_erasure_data_pack_push_updates(
+        self,
+        updates: Iterable[ErasureDataPackPushUpdate],
+    ) -> int:
+        """Consolida resultados de push EC en una única transacción SQLite."""
+        normalized = list(updates)
+        if not normalized:
+            return 0
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for update in normalized:
+                self._apply_erasure_data_pack_push_update(update)
+        return len(normalized)
+
+    def _apply_erasure_data_pack_push_update(
+        self,
+        update: ErasureDataPackPushUpdate,
+    ) -> None:
+        pack_hash = _require_hash64("pack_hash", update.pack_hash)
+        codec = _require_non_empty_text("codec", update.codec)
+        data_shards = _require_positive_int("data_shards", update.data_shards)
+        parity_shards = _require_non_negative_int("parity_shards", update.parity_shards)
+        payload_size = _require_non_negative_int("payload_size", update.payload_size)
+        padded_size = _require_non_negative_int("padded_size", update.padded_size)
+        shard_size = _require_positive_int("shard_size", update.shard_size)
+        protection_state = ProtectionState(update.protection_state)
+        if protection_state not in {
+            ProtectionState.PLACED,
+            ProtectionState.DEGRADED,
+            ProtectionState.FAILED,
+        }:
+            raise MetadataDatabaseValueError(
+                f"estado inválido para push EC: {protection_state.value}"
+            )
         total_shards = data_shards + parity_shards
 
         if padded_size != shard_size * data_shards:
@@ -1078,60 +1253,59 @@ class MetadataDB:
         if payload_size > padded_size:
             raise MetadataDatabaseError("payload_size no puede ser mayor que padded_size")
 
-        chunk_rows = _normalize_erasure_chunk_rows(chunks, payload_size)
-        shard_rows = _normalize_erasure_shard_rows(shards, total_shards)
-        now = time.time()
+        chunk_rows = _normalize_erasure_chunk_rows(update.chunks, payload_size)
+        shard_rows = _normalize_erasure_shard_rows(update.shards, total_shards)
+        pushed_at = float(update.pushed_at)
 
-        with self.conn:
-            existing = self.conn.execute("""
-                SELECT codec, data_shards, parity_shards, payload_size, padded_size,
-                       shard_size
-                FROM erasure_data_packs
-                WHERE pack_hash = ?
-            """, (pack_hash,)).fetchone()
-            if existing is None:
-                raise MetadataDatabaseError(f"erasure data pack no registrado: {pack_hash}")
+        existing = self.conn.execute("""
+            SELECT codec, data_shards, parity_shards, payload_size, padded_size,
+                   shard_size
+            FROM erasure_data_packs
+            WHERE pack_hash = ?
+        """, (pack_hash,)).fetchone()
+        if existing is None:
+            raise MetadataDatabaseError(f"erasure data pack no registrado: {pack_hash}")
 
-            current = (
-                existing["codec"],
-                int(existing["data_shards"]),
-                int(existing["parity_shards"]),
-                int(existing["payload_size"]),
-                int(existing["padded_size"]),
-                int(existing["shard_size"]),
-            )
-            expected = (
-                codec,
-                data_shards,
-                parity_shards,
-                payload_size,
-                padded_size,
-                shard_size,
-            )
-            if current != expected:
-                raise MetadataDatabaseError(f"erasure data pack inconsistente: {pack_hash}")
+        current = (
+            existing["codec"],
+            int(existing["data_shards"]),
+            int(existing["parity_shards"]),
+            int(existing["payload_size"]),
+            int(existing["padded_size"]),
+            int(existing["shard_size"]),
+        )
+        expected = (
+            codec,
+            data_shards,
+            parity_shards,
+            payload_size,
+            padded_size,
+            shard_size,
+        )
+        if current != expected:
+            raise MetadataDatabaseError(f"erasure data pack inconsistente: {pack_hash}")
 
-            self._assert_erasure_pack_chunks_match(pack_hash, chunk_rows)
-            self.conn.execute("""
-                UPDATE erasure_data_packs
-                SET protection_state = ?,
-                    placement_epoch = ?,
-                    last_push_at = ?,
-                    last_verify_at = NULL,
-                    last_error = NULL
-                WHERE pack_hash = ?
-            """, (
-                state_value,
-                placement_epoch,
-                now,
-                pack_hash,
-            ))
-            self._upsert_erasure_pack_shards_for_push(
-                pack_hash=pack_hash,
-                rows=shard_rows,
-                protection_state=state_value,
-                last_push_at=now,
-            )
+        self._assert_erasure_pack_chunks_match(pack_hash, chunk_rows)
+        self.conn.execute("""
+            UPDATE erasure_data_packs
+            SET protection_state = ?,
+                placement_epoch = ?,
+                last_push_at = ?,
+                last_verify_at = NULL,
+                last_error = NULL
+            WHERE pack_hash = ?
+        """, (
+            protection_state.value,
+            update.placement_epoch,
+            pushed_at,
+            pack_hash,
+        ))
+        self._upsert_erasure_pack_shards_for_push(
+            pack_hash=pack_hash,
+            rows=shard_rows,
+            protection_state=protection_state.value,
+            last_push_at=pushed_at,
+        )
 
     def get_erasure_data_pack(self, pack_hash: str) -> ErasureDataPackRecord | None:
         pack_hash = _require_hash64("pack_hash", pack_hash)
@@ -1473,7 +1647,7 @@ class MetadataDB:
         ) else None
         last_verify_at = now if protection_state == ProtectionState.VERIFIED else None
 
-        with self.conn:
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
             self.conn.execute("""
                 UPDATE erasure_data_packs
                 SET protection_state = ?,
@@ -1852,8 +2026,8 @@ class MetadataDB:
             return 0
         self.conn.executemany(
             """
-            INSERT INTO chunks (hash, size, ref_count)
-            VALUES (?, ?, 0)
+            INSERT INTO chunks (hash, size)
+            VALUES (?, ?)
             """,
             [(chunk_hash, int(size)) for chunk_hash, size in sorted(chunks.items())],
         )
@@ -1946,9 +2120,9 @@ class MetadataDB:
             count += 1
         return count
 
-    def object_import_insert_chunk_zero_ref(self, chunk_hash: str, chunk_size: int) -> None:
+    def object_import_insert_chunk(self, chunk_hash: str, chunk_size: int) -> None:
         self.conn.execute(
-            "INSERT INTO chunks (hash, size, ref_count) VALUES (?, ?, 0)",
+            "INSERT INTO chunks (hash, size) VALUES (?, ?)",
             (chunk_hash, int(chunk_size)),
         )
 
@@ -2002,18 +2176,6 @@ class MetadataDB:
                 (int(recipe_id), int(order), chunk_hash, int(chunk_size))
                 for order, chunk_hash, chunk_size in chunks
             ],
-        )
-
-    def object_import_increment_chunk_ref_counts(self, increments: dict[str, int]) -> None:
-        if not increments:
-            return
-        self.conn.executemany(
-            """
-            UPDATE chunks
-            SET ref_count = ref_count + ?
-            WHERE hash = ?
-            """,
-            [(int(count), chunk_hash) for chunk_hash, count in sorted(increments.items())],
         )
 
     def object_import_insert_snapshot_item(
@@ -2078,6 +2240,22 @@ class MetadataDB:
             JOIN snapshot_items AS si ON si.snapshot_id = s.id
             JOIN recipe_chunks AS rc ON rc.recipe_id = si.recipe_id
             WHERE s.status = 'COMPLETE'
+              AND si.item_type = 'file'
+              AND si.recipe_id IS NOT NULL
+            ORDER BY rc.chunk_hash ASC
+            """
+        ).fetchall()
+        return tuple(row["chunk_hash"] for row in rows)
+
+    def gc_protected_chunk_hashes(self) -> tuple[str, ...]:
+        """Hashes que el GC local debe conservar por pertenecer a snapshots vivos."""
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT rc.chunk_hash
+            FROM snapshots AS s
+            JOIN snapshot_items AS si ON si.snapshot_id = s.id
+            JOIN recipe_chunks AS rc ON rc.recipe_id = si.recipe_id
+            WHERE s.status IN ('CREATING', 'COMPLETE')
               AND si.item_type = 'file'
               AND si.recipe_id IS NOT NULL
             ORDER BY rc.chunk_hash ASC
@@ -2455,7 +2633,7 @@ class MetadataDB:
     ) -> None:
         desired_rf = int(desired_rf)
 
-        with self.conn:
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
             self.conn.execute("""
                 UPDATE chunk_protection
                 SET protection_state = ?,

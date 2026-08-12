@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from stopan.metadata.database import MetadataDB
+import time
+
+from stopan.metadata.database import ErasureDataPackPushUpdate, MetadataDB
 from stopan.protection.ec.models import EncodedDataPack
 from stopan.protection.ec.placement import DataPackShardPlacement
 from stopan.protection.ec.remote_client import (
@@ -157,6 +159,30 @@ def refresh_data_pack_push_metadata(
         protection_state=protection_state,
         placement_epoch=placement_epoch,
         refresh_existing=True,
+    )
+
+
+def build_data_pack_push_update(
+    *,
+    pack: EncodedDataPack,
+    placements: tuple[DataPackShardPlacement, ...],
+    protection_state: ProtectionState,
+    placement_epoch: str,
+) -> ErasureDataPackPushUpdate:
+    metadata_rows = _data_pack_metadata_rows(pack=pack, placements=placements)
+    return ErasureDataPackPushUpdate(
+        pack_hash=pack.pack_hash,
+        codec=pack.spec.codec,
+        data_shards=pack.spec.data_shards,
+        parity_shards=pack.spec.parity_shards,
+        payload_size=pack.payload_size,
+        padded_size=pack.padded_size,
+        shard_size=pack.shard_size,
+        chunks=tuple(metadata_rows.chunks),
+        shards=tuple(metadata_rows.shards),
+        protection_state=protection_state,
+        placement_epoch=placement_epoch,
+        pushed_at=time.time(),
     )
 
 

@@ -80,9 +80,9 @@ Si un archivo no cambia respecto al snapshot completo anterior de la misma raíz
 
 `FileChunker` divide archivos con Content-Defined Chunking usando una extensión nativa basada en Rabin. El tamaño medio por defecto es 65536 bytes, con mínimo 16384 y máximo 262144.
 
-El chunker usa `mmap` para leer archivos sin cargarlos completos en memoria. Cada chunk se identifica con BLAKE3 sobre bytes raw.
+Los archivos de hasta `min_chunk_size` se emiten directamente como un único chunk. Para archivos mayores, el chunker usa `mmap` y calcula los límites en la extensión nativa, liberando el GIL durante esa búsqueda para que distintos workers puedan ejecutar CDC en paralelo. Cada chunk se identifica con BLAKE3 sobre bytes raw.
 
-`CASRepository` comprime chunks con Zstandard y escribe cada blob bajo una ruta derivada del hash. Las escrituras usan fichero temporal y `rename` atómico. Al leer con `get`, el CAS descomprime y valida que el BLAKE3 calculado coincide con el hash pedido.
+`CASRepository` comprime chunks con Zstandard y escribe cada blob bajo una ruta derivada del hash, repartida en dos niveles de prefijos de un byte para limitar el número de entradas por directorio. Las escrituras usan fichero temporal y `rename` atómico. Al leer con `get`, el CAS descomprime y valida que el BLAKE3 calculado coincide con el hash pedido.
 
 El CAS también puede guardar blobs comprimidos ya validados. Esto se usa cuando restore recupera un chunk remoto, lo valida en memoria y lo cachea en el CAS local.
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import heapq
 
+import blake3
+
 
 # Identifica el contrato de colocación usado por placement_epoch. Debe cambiar si
 # cambia el algoritmo, el hash o la serialización del mensaje de puntuación.
@@ -26,8 +28,6 @@ def _hrw_score(chunk_hash: str, node_id: str, *, salt: str) -> int:
       - cualquier cambio en este formato exige actualizar HRW_PLACEMENT_SCHEME
       - score mayor = mejor candidato.
     """
-    import blake3
-
     message = f"{salt}|{node_id}|{chunk_hash}".encode("utf-8")
     digest = blake3.blake3(message).digest()
     return int.from_bytes(digest, "big")

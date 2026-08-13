@@ -45,12 +45,13 @@ class ZfecErasureCodec:
             data = bytes(raw)
             if len(data) != shard_size:
                 raise ErasureCodingError("zfec devolvió un shard con tamaño inesperado")
+            shard_hash = hash_bytes(data)
             shards.append(
-                DataPackShard(
+                DataPackShard._from_prehashed(
                     pack_hash=pack_hash,
                     shard_index=shard_index,
                     data=data,
-                    shard_hash=hash_bytes(data),
+                    shard_hash=shard_hash,
                 )
             )
 

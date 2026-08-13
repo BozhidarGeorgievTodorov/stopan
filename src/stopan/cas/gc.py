@@ -25,6 +25,7 @@ def collect_cas_chunks(
         max_age_seconds=max_age_seconds,
         dry_run=dry_run,
         retain_file=(lambda path: path.name in reachable) if reachable_hashes is not None else None,
+        sort_files=False,
     )
 
 
@@ -38,5 +39,5 @@ def _iter_cas_chunk_files(root: Path):
             if not second_level.is_dir() or len(second_level.name) != 2:
                 continue
             for path in second_level.iterdir():
-                if path.is_file() and is_valid_blake3_hex(path.name):
+                if is_valid_blake3_hex(path.name):
                     yield path

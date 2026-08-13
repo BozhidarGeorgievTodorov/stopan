@@ -172,6 +172,17 @@ def backup_directory(
                 reused_assignments: list[tuple[int, int]] = []
                 pending_processing: list[tuple[int, str, str]] = []
 
+                previous_items: dict[str, dict] = {}
+                if previous_snapshot_id is not None and not safe_mode:
+                    previous_items = db.get_file_items_by_paths(
+                        previous_snapshot_id,
+                        (
+                            rel_path
+                            for rel_path, _, _, item_type in walk_batch
+                            if item_type == "file"
+                        ),
+                    )
+
                 for item_id, (rel_path, full_path, stat_info, item_type) in zip(
                     item_ids,
                     walk_batch,
@@ -180,10 +191,8 @@ def backup_directory(
                     if item_type != "file":
                         continue
 
-                    if previous_snapshot_id is not None and not safe_mode:
-                        previous_item = db.get_item_by_path(
-                            previous_snapshot_id, rel_path
-                        )
+                    if previous_items:
+                        previous_item = previous_items.get(rel_path)
                         if (
                             previous_item is not None
                             and _is_unchanged_file(previous_item, stat_info)

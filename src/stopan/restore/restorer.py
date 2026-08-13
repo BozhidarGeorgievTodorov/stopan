@@ -9,6 +9,7 @@ en un directorio .incomplete y cada archivo pasa primero por un temporal privado
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -109,9 +110,9 @@ class SnapshotRestorer:
                 stats=stats,
             )
 
-        items_gen = self.db.get_snapshot_items(snapshot_id)
-        first_item = next(items_gen, None)
-        if first_item is None:
+        items_gen = self.db.iter_snapshot_restore_items(snapshot_id)
+        first_entry = next(items_gen, None)
+        if first_entry is None:
             message = f"Snapshot {snapshot_id} está vacío."
             print(f"{message}")
             return RestoreResult(
@@ -124,6 +125,7 @@ class SnapshotRestorer:
 
         try:
             os.makedirs(paths.incomplete_dir, exist_ok=True)
+            self._ensure_work_directory_permissions(paths.incomplete_dir)
         except OSError as exc:
             raise StopanStorageError(f"No se pudo preparar el directorio de restore {paths.incomplete_dir}: {exc}") from exc
 
@@ -135,10 +137,16 @@ class SnapshotRestorer:
         )
 
         def iter_items():
-            yield first_item
+            yield first_entry
             yield from items_gen
 
         directories: list[tuple[str, dict]] = []
+        prepared_dirs: set[str] = {paths.incomplete_dir}
+        prefetcher = OrderedBatchChunkPrefetcher(
+            self.fetch_service,
+            target_parallelism=self.batch_target_parallelism,
+            window=self.prefetch_window,
+        )
         current_tmp_path: str | None = None
         try:
             temp_workspace = tempfile.TemporaryDirectory(
@@ -152,7 +160,7 @@ class SnapshotRestorer:
             ) from exc
 
         try:
-            for item in iter_items():
+            for item, recipe_chunk_hashes in iter_items():
                 stats.processed_items += 1
 
                 try:
@@ -164,6 +172,8 @@ class SnapshotRestorer:
                 item_type = item.get("item_type")
                 if item_type == "dir":
                     os.makedirs(full_path, exist_ok=True)
+                    self._ensure_work_directory_permissions(full_path)
+                    prepared_dirs.add(full_path)
                     directories.append((full_path, item))
                     stats.directories_created += 1
                     stats.successful_items += 1
@@ -173,7 +183,11 @@ class SnapshotRestorer:
                     print(f"   Tipo de item no soportado en {item['path']}: {item_type!r}")
                     continue
 
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                parent_dir = os.path.dirname(full_path)
+                if parent_dir not in prepared_dirs:
+                    os.makedirs(parent_dir, exist_ok=True)
+                    self._ensure_work_directory_permissions(parent_dir)
+                    prepared_dirs.add(parent_dir)
 
                 if os.path.isdir(full_path):
                     print(f"   Se esperaba archivo pero existe directorio en {item['path']}")
@@ -187,13 +201,12 @@ class SnapshotRestorer:
                 success_file = True
 
                 try:
-                    chunk_hashes = list(self.db.get_item_chunks(item["id"]))
-                    prefetcher = OrderedBatchChunkPrefetcher(
-                        self.fetch_service,
-                        target_parallelism=self.batch_target_parallelism,
-                        window=self.prefetch_window,
-                    )
-
+                    recipe_id = item.get("recipe_id")
+                    if recipe_id is None:
+                        raise RestoreDataError(
+                            f"Archivo {item['path']} sin receta asociada"
+                        )
+                    chunk_hashes = recipe_chunk_hashes
                     current_tmp_path = os.path.join(
                         temp_workspace.name,
                         f"{int(item['id'])}.tmp",
@@ -257,9 +270,6 @@ class SnapshotRestorer:
             )
 
         finally:
-            directories.sort(key=lambda item: len(item[0]), reverse=True)
-            for directory_path, item in directories:
-                self.apply_item_metadata(directory_path, item, is_dir=True)
             temp_workspace.cleanup()
 
         if stats.successful_items == stats.processed_items and stats.processed_items > 0:
@@ -280,6 +290,10 @@ class SnapshotRestorer:
                     stats=stats,
                 )
 
+            directories.sort(key=lambda item: len(item[0]), reverse=True)
+            for directory_path, item in directories:
+                self.apply_item_metadata(directory_path, item, is_dir=True)
+
             try:
                 atomic_rename_noreplace(paths.incomplete_dir, paths.final_dir)
                 print("-" * 40)
@@ -295,6 +309,7 @@ class SnapshotRestorer:
                     stats=stats,
                 )
             except FileExistsError:
+                self._restore_work_directory_permissions(paths.incomplete_dir, directories)
                 message = (
                     f"El destino final apareció durante la restauración y no se sobrescribirá: "
                     f"{paths.final_dir}. El resultado permanece en {paths.incomplete_dir}."
@@ -311,6 +326,7 @@ class SnapshotRestorer:
                     stats=stats,
                 )
             except OSError as exc:
+                self._restore_work_directory_permissions(paths.incomplete_dir, directories)
                 message = f"Error al publicar la carpeta final: {exc}"
                 print(message)
                 return RestoreResult(
@@ -336,6 +352,43 @@ class SnapshotRestorer:
             error=f"restore incompleto: {stats.successful_items}/{stats.processed_items} items",
             stats=stats,
         )
+
+    @staticmethod
+    def _ensure_work_directory_permissions(path: str) -> None:
+        """
+        Mantiene un directorio de ``.incomplete`` utilizable durante reintentos.
+
+        Los metadatos definitivos de los directorios se aplican únicamente cuando
+        todo el árbol está listo para publicarse. Una ejecución anterior puede
+        haber dejado permisos restrictivos, por lo que al reanudar se recuperan
+        temporalmente lectura, escritura y búsqueda para el propietario.
+        """
+        current_mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+        work_mode = current_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        if work_mode != current_mode:
+            os.chmod(path, work_mode)
+
+    @classmethod
+    def _restore_work_directory_permissions(
+        cls,
+        incomplete_dir: str,
+        directories: list[tuple[str, dict]],
+    ) -> None:
+        """Devuelve el árbol incompleto a un estado reanudable tras fallar la publicación."""
+        ordered_paths = [incomplete_dir]
+        ordered_paths.extend(
+            path
+            for path, _item in sorted(directories, key=lambda item: len(item[0]))
+            if path != incomplete_dir
+        )
+        for path in ordered_paths:
+            try:
+                cls._ensure_work_directory_permissions(path)
+            except OSError:
+                # El error de publicación es el resultado principal. Si tampoco se
+                # pueden reabrir permisos, el siguiente reintento informará del
+                # problema al preparar el directorio de trabajo.
+                pass
 
     @staticmethod
     def _print_progress(stats: RestoreRunStats) -> None:

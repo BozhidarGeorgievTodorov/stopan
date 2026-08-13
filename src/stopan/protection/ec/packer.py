@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from .codec import ZfecErasureCodec, split_primary_blocks
+from .codec import ZfecErasureCodec
 from .manifest import DataPackManifest
 from .models import (
     DataPackEntry,
@@ -52,6 +52,13 @@ class DataPackBuilder:
 
     def add_chunk(self, *, chunk_hash: str, data: bytes) -> bool:
         chunk_hash, data = _validated_chunk_payload(chunk_hash=chunk_hash, data=data)
+        return self._append_validated_chunk(chunk_hash=chunk_hash, data=data)
+
+    def _add_prevalidated_chunk(self, *, chunk_hash: str, data: bytes) -> bool:
+        """Añade bytes cuya identidad ya fue verificada por la frontera CAS."""
+        return self._append_validated_chunk(chunk_hash=chunk_hash, data=data)
+
+    def _append_validated_chunk(self, *, chunk_hash: str, data: bytes) -> bool:
         self._chunks.append((chunk_hash, data))
         self._current_size += len(data)
         return self._current_size >= self.target_size_bytes
@@ -60,8 +67,8 @@ class DataPackBuilder:
         if not self._chunks:
             return None
 
-        encoded = build_data_pack(
-            chunks=self._chunks,
+        encoded = _build_data_pack_from_validated_chunks(
+            chunks=tuple(self._chunks),
             spec=self.spec,
             codec=self.codec,
         )
@@ -76,16 +83,31 @@ def build_data_pack(
     spec: ErasureSpec,
     codec: ZfecErasureCodec | None = None,
 ) -> EncodedDataPack:
-    materialized = tuple(chunks)
-    if not materialized:
+    materialized = tuple(
+        _validated_chunk_payload(chunk_hash=chunk_hash, data=data)
+        for chunk_hash, data in chunks
+    )
+    return _build_data_pack_from_validated_chunks(
+        chunks=materialized,
+        spec=spec,
+        codec=codec,
+    )
+
+
+def _build_data_pack_from_validated_chunks(
+    *,
+    chunks: tuple[tuple[str, bytes], ...],
+    spec: ErasureSpec,
+    codec: ZfecErasureCodec | None = None,
+) -> EncodedDataPack:
+    if not chunks:
         raise ErasureCodingError("no se puede construir un data pack vacío")
 
     payload_parts: list[bytes] = []
     entries: list[DataPackEntry] = []
     offset = 0
 
-    for ordinal, (chunk_hash, data) in enumerate(materialized):
-        chunk_hash, data = _validated_chunk_payload(chunk_hash=chunk_hash, data=data)
+    for ordinal, (chunk_hash, data) in enumerate(chunks):
         payload_parts.append(data)
         entries.append(
             DataPackEntry(
@@ -99,7 +121,10 @@ def build_data_pack(
 
     payload = b"".join(payload_parts)
     pack_hash = hash_bytes(payload)
-    _primary_blocks, shard_size = split_primary_blocks(payload, spec.data_shards)
+    shard_size = max(
+        (len(payload) + spec.data_shards - 1) // spec.data_shards,
+        1,
+    )
     padded_size = shard_size * spec.data_shards
     codec = codec or ZfecErasureCodec()
     shards = codec.encode(pack_hash=pack_hash, payload=payload, spec=spec)

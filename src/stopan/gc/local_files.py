@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -18,6 +19,7 @@ def collect_files_by_age(
     max_age_seconds: int | None,
     dry_run: bool,
     retain_file: PathPredicate | None = None,
+    sort_files: bool = True,
 ) -> LocalFileGarbageCollectionResult:
     root = Path(root_dir).expanduser().resolve()
     max_age = None if max_age_seconds is None else max(int(max_age_seconds), 0)
@@ -54,8 +56,15 @@ def collect_files_by_age(
             errors=(f"root_dir no es un directorio: {root}",),
         )
 
-    for path in sorted(files):
-        if not path.is_file():
+    file_iterable = sorted(files) if sort_files else files
+    for path in file_iterable:
+        try:
+            stat_result = path.stat()
+        except OSError as exc:
+            errors.append(f"stat falló {path}: {exc}")
+            continue
+
+        if not stat.S_ISREG(stat_result.st_mode):
             continue
         files_seen += 1
 
@@ -64,12 +73,6 @@ def collect_files_by_age(
 
         if retain_file is not None and retain_file(path):
             files_retained_by_policy += 1
-            continue
-
-        try:
-            stat_result = path.stat()
-        except OSError as exc:
-            errors.append(f"stat falló {path}: {exc}")
             continue
 
         if cutoff is not None and stat_result.st_mtime > cutoff:

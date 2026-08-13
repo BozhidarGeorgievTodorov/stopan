@@ -221,7 +221,7 @@ def _sweep_objects(
         return stats
 
     touched_dirs: set[Path] = set()
-    for path in sorted(objects_dir.glob("*/*.stobj")):
+    for path in objects_dir.glob("*/*.stobj"):
         stats.files_seen += 1
         storage_id = path.stem
         if not _STORAGE_FILE_RE.fullmatch(path.name):

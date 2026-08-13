@@ -20,4 +20,5 @@ def collect_ec_shards(
         files=root.rglob("*.stec") if root.exists() else (),
         max_age_seconds=max_age_seconds,
         dry_run=dry_run,
+        sort_files=False,
     )

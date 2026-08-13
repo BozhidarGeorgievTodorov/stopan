@@ -79,8 +79,17 @@ class ChunkFetchService:
         Devuelve bytes para los chunks recuperados y Exception para los que no se
         pudieron resolver. No lanza por fallo individual de chunk.
         """
-        ordered_hashes = list(chunk_hashes)
-        self.stats.chunks_requested += len(ordered_hashes)
+        requested_hashes = list(chunk_hashes)
+        self.stats.chunks_requested += len(requested_hashes)
+
+        multiplicity: dict[str, int] = {}
+        ordered_hashes: list[str] = []
+        for chunk_hash in requested_hashes:
+            if chunk_hash not in multiplicity:
+                multiplicity[chunk_hash] = 0
+                ordered_hashes.append(chunk_hash)
+            multiplicity[chunk_hash] += 1
+
         results: dict[str, bytes | Exception] = {}
         missing_hashes: list[str] = []
         local_errors: dict[str, list[str]] = {}
@@ -88,7 +97,7 @@ class ChunkFetchService:
         for chunk_hash in ordered_hashes:
             try:
                 results[chunk_hash] = self.repo.get(chunk_hash)
-                self.stats.chunks_from_local_cas += 1
+                self.stats.chunks_from_local_cas += multiplicity[chunk_hash]
                 continue
             except FileNotFoundError:
                 pass
@@ -110,7 +119,7 @@ class ChunkFetchService:
                             f"CAS local cache desde P2P: {exc}"
                         )
                     results[chunk_hash] = raw_data
-                    self.stats.chunks_from_local_p2p_cas += 1
+                    self.stats.chunks_from_local_p2p_cas += multiplicity[chunk_hash]
                     continue
                 except FileNotFoundError:
                     pass
@@ -125,6 +134,7 @@ class ChunkFetchService:
                     missing_hashes,
                     target_parallelism=max(int(target_parallelism), 1),
                     initial_errors=local_errors,
+                    multiplicity=multiplicity,
                 )
             else:
                 remote_results = self._remote_chunk_recovery_disabled_results(
@@ -137,10 +147,12 @@ class ChunkFetchService:
                     missing_hashes,
                     remote_results,
                     target_parallelism=max(int(target_parallelism), 1),
+                    multiplicity=multiplicity,
                 )
             results.update(remote_results)
             self.stats.chunks_failed += sum(
-                1 for chunk_hash in missing_hashes
+                multiplicity[chunk_hash]
+                for chunk_hash in missing_hashes
                 if isinstance(remote_results.get(chunk_hash), Exception)
             )
 
@@ -171,6 +183,7 @@ class ChunkFetchService:
         remote_results: dict[str, bytes | Exception],
         *,
         target_parallelism: int,
+        multiplicity: dict[str, int],
     ) -> dict[str, bytes | Exception]:
         unresolved = [
             chunk_hash
@@ -191,7 +204,7 @@ class ChunkFetchService:
                 continue
             if not isinstance(value, Exception):
                 remote_results[chunk_hash] = value
-                self.stats.chunks_from_ec += 1
+                self.stats.chunks_from_ec += multiplicity.get(chunk_hash, 1)
                 continue
 
             previous = remote_results.get(chunk_hash)
@@ -199,7 +212,7 @@ class ChunkFetchService:
                 remote_results[chunk_hash] = ChunkUnavailableError(
                     f"{previous} | EC: {value}"
                 )
-                self.stats.ec_recovery_failures += 1
+                self.stats.ec_recovery_failures += multiplicity.get(chunk_hash, 1)
             else:
                 remote_results[chunk_hash] = value
 
@@ -238,6 +251,7 @@ class ChunkFetchService:
         *,
         target_parallelism: int,
         initial_errors: dict[str, list[str]] | None = None,
+        multiplicity: dict[str, int] | None = None,
     ) -> dict[str, bytes | Exception]:
         """
         Recupera chunks ausentes desde targets HRW remotos.
@@ -372,7 +386,7 @@ class ChunkFetchService:
                             )
 
                         result_map[chunk_hash] = raw_data
-                        self.stats.chunks_from_remote_replication += 1
+                        self.stats.chunks_from_remote_replication += (multiplicity or {}).get(chunk_hash, 1)
                         unresolved.discard(chunk_hash)
 
         for chunk_hash in list(unresolved):

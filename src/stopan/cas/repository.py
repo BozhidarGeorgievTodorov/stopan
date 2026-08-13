@@ -97,9 +97,6 @@ class CASRepository:
     def get_compressed(self, chunk_hash: str) -> bytes:
         """Devuelve el blob comprimido tal como está almacenado."""
         path = self._chunk_path(chunk_hash)
-        if not os.path.exists(path):
-            raise CASMissingChunkError(f"Chunk no encontrado en CAS: {chunk_hash}")
-
         try:
             with open(path, "rb") as handle:
                 return handle.read()
@@ -110,11 +107,13 @@ class CASRepository:
 
     def _write_once(self, path: str, data: bytes) -> bool:
         """
-        Escribe data de forma atómica si path todavía no existe.
+        Publica data de forma atómica cuando path no se había observado previamente.
 
-        Devuelve True si este proceso creó el archivo y False si otro proceso o
-        hilo ya lo había creado. El archivo temporal evita que una excepción durante
-        la escritura deje un chunk parcial visible en la ruta definitiva.
+        Devuelve False si la ruta ya existía al comprobarla y True cuando esta llamada
+        completa la publicación. Dos escritores concurrentes del mismo objeto pueden
+        publicarlo sucesivamente mediante os.replace(); el direccionamiento por
+        contenido hace equivalentes esas sustituciones. El archivo temporal evita que
+        una excepción durante la escritura deje un chunk parcial visible.
         """
         if os.path.exists(path):
             return False

@@ -144,6 +144,31 @@ class DataPackShard:
         object.__setattr__(self, "pack_hash", pack_hash)
         object.__setattr__(self, "shard_index", shard_index)
 
+    @classmethod
+    def _from_prehashed(
+        cls,
+        *,
+        pack_hash: str,
+        shard_index: int,
+        data: bytes,
+        shard_hash: str,
+    ) -> "DataPackShard":
+        """Construye un shard cuyo hash acaba de calcular el codec local."""
+        pack_hash = require_hash64("pack_hash", pack_hash)
+        shard_index = require_non_negative_int("shard_index", shard_index)
+        if not isinstance(data, bytes):
+            raise ErasureCodingError(
+                f"shard.data debe ser bytes; recibido {type(data).__name__}"
+            )
+        shard_hash = require_hash64("shard_hash", shard_hash)
+
+        shard = object.__new__(cls)
+        object.__setattr__(shard, "pack_hash", pack_hash)
+        object.__setattr__(shard, "shard_index", shard_index)
+        object.__setattr__(shard, "data", data)
+        object.__setattr__(shard, "shard_hash", shard_hash)
+        return shard
+
 
 @dataclass(frozen=True, slots=True)
 class EncodedDataPack:

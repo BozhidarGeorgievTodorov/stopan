@@ -57,6 +57,7 @@ typedef struct {
     Py_ssize_t last_split;
     uint64_t fingerprint;
     int buffer_active;
+    int in_next;
 } ChunkIterator;
 
 
@@ -76,21 +77,9 @@ static PyObject *ChunkIterator_iter(PyObject *self) {
 }
 
 
-static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
-    ChunkIterator *self = (ChunkIterator *)self_obj;
+static Py_ssize_t ChunkIterator_next_boundary(ChunkIterator *self) {
     const uint8_t *data = (const uint8_t *)self->view.buf;
     Py_ssize_t data_len = self->view.len;
-
-    if (self->last_split >= data_len) {
-        return NULL;  /* StopIteration */
-    }
-
-    if (data_len - self->last_split <= self->min_size) {
-        Py_ssize_t end = data_len;
-        self->last_split = end;
-        self->current_pos = end;
-        return PyLong_FromSsize_t(end);
-    }
 
     self->fingerprint = 0;
     self->current_pos = self->last_split;
@@ -134,7 +123,7 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
             Py_ssize_t split_point = self->current_pos + 1;
             self->last_split = split_point;
             self->current_pos = split_point;
-            return PyLong_FromSsize_t(split_point);
+            return split_point;
         }
     }
 
@@ -149,7 +138,7 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
             Py_ssize_t split_point = self->current_pos + 1;
             self->last_split = split_point;
             self->current_pos = split_point;
-            return PyLong_FromSsize_t(split_point);
+            return split_point;
         }
     }
 
@@ -159,7 +148,44 @@ static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
 
     self->last_split = max_split;
     self->current_pos = max_split;
-    return PyLong_FromSsize_t(max_split);
+    return max_split;
+}
+
+
+static PyObject *ChunkIterator_iternext(PyObject *self_obj) {
+    ChunkIterator *self = (ChunkIterator *)self_obj;
+    Py_ssize_t data_len = self->view.len;
+
+    if (self->last_split >= data_len) {
+        return NULL;  /* StopIteration */
+    }
+
+    if (data_len - self->last_split <= self->min_size) {
+        Py_ssize_t end = data_len;
+        self->last_split = end;
+        self->current_pos = end;
+        return PyLong_FromSsize_t(end);
+    }
+
+    if (self->in_next) {
+        PyErr_SetString(PyExc_RuntimeError, "ChunkIterator no admite next() concurrente");
+        return NULL;
+    }
+
+    self->in_next = 1;
+    Py_ssize_t split_point;
+    if (self->view.readonly) {
+        Py_BEGIN_ALLOW_THREADS
+        split_point = ChunkIterator_next_boundary(self);
+        Py_END_ALLOW_THREADS
+    } else {
+        /* Un búfer mutable requiere conservar el GIL para evitar una carrera
+         * con mutaciones realizadas desde otros hilos Python. */
+        split_point = ChunkIterator_next_boundary(self);
+    }
+    self->in_next = 0;
+
+    return PyLong_FromSsize_t(split_point);
 }
 
 
@@ -236,6 +262,7 @@ static PyObject *get_chunk_boundaries(PyObject *self, PyObject *args) {
     iterator->last_split = 0;
     iterator->fingerprint = 0;
     iterator->buffer_active = 1;
+    iterator->in_next = 0;
 
     return (PyObject *)iterator;
 }

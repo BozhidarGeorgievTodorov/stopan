@@ -67,7 +67,7 @@ class MetadataObjectGraphExporter:
     def __init__(self, db: MetadataDB):
         self.db = db
         self._objects: dict[str, EncodedMetadataObject] = {}
-        self._recipe_ref_cache: dict[int, ObjectRef] = {}
+        self._recipe_ref_cache: dict[int, tuple[ObjectRef, str]] = {}
 
     def export_current_state(self, *, include_protection: bool = True) -> MetadataObjectGraph:
         self._objects = {}
@@ -264,8 +264,7 @@ class MetadataObjectGraphExporter:
     def _export_recipe(self, recipe_id: int) -> tuple[ObjectRef, str]:
         cached = self._recipe_ref_cache.get(recipe_id)
         if cached is not None:
-            recipe_hash = self._recipe_hash_for_id(recipe_id)
-            return cached, recipe_hash
+            return cached
 
         recipe_row = self.db.object_export_recipe_row(recipe_id)
         if recipe_row is None:
@@ -291,14 +290,9 @@ class MetadataObjectGraphExporter:
                 chunk_list=chunk_list_ref,
             )
         )
-        self._recipe_ref_cache[recipe_id] = recipe_ref
-        return recipe_ref, recipe_hash
-
-    def _recipe_hash_for_id(self, recipe_id: int) -> str:
-        recipe_hash = self.db.object_export_recipe_hash(recipe_id)
-        if recipe_hash is None:
-            raise MetadataObjectError(f"recipe_id cacheado no encontrado: {recipe_id}")
-        return recipe_hash
+        cached = (recipe_ref, recipe_hash)
+        self._recipe_ref_cache[recipe_id] = cached
+        return cached
 
     def _export_known_chunk_index(self) -> tuple[ObjectRef, int]:
         rows = self.db.object_export_known_chunk_rows()

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from stopan.common.sequences import ordered_unique
 from stopan.errors import StopanConfigValueError
 from stopan.cluster.view import ClusterMember, ClusterView
+from stopan.placement.hrw import hrw_top_k_node_ids
 from stopan.protection.policy import normalize_remote_rf
 
 
@@ -58,18 +59,38 @@ def plan_chunk_replication_targets(
     origin_node_id: str,
 ) -> ReplicationTargetPlan:
     ordered_hashes = ordered_unique(chunk_hashes)
+    required_remote_copies = normalize_remote_rf(
+        required_remote_copies,
+        field_name="required_remote_copies",
+    )
+    excluded = _excluded_origin(origin_node_id)
+    candidates = tuple(
+        member
+        for member in cluster.members
+        if member.node_id and member.node_id not in excluded
+    )
+    k = min(required_remote_copies, len(candidates))
+    candidate_node_ids = tuple(member.node_id for member in candidates)
+    member_by_id = {member.node_id: member for member in candidates}
+    salt = str(cluster_token or "")
+
     chunk_targets: dict[str, tuple[ClusterMember, ...]] = {}
     target_chunks: dict[str, list[str]] = defaultdict(list)
     target_members: dict[str, ClusterMember] = {}
 
     for chunk_hash in ordered_hashes:
-        remote_targets = select_remote_chunk_targets(
-            cluster=cluster,
-            chunk_hash=chunk_hash,
-            required_remote_copies=required_remote_copies,
-            cluster_token=cluster_token,
-            origin_node_id=origin_node_id,
-        )
+        if k <= 0:
+            remote_targets = ()
+        else:
+            remote_targets = tuple(
+                member_by_id[node_id]
+                for node_id in hrw_top_k_node_ids(
+                    chunk_hash,
+                    candidate_node_ids,
+                    k=k,
+                    salt=salt,
+                )
+            )
         chunk_targets[chunk_hash] = remote_targets
 
         for member in remote_targets:

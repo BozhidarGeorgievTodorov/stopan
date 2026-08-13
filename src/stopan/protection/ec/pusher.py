@@ -15,7 +15,10 @@ from stopan.metadata.objects.graph.auto_export import (
 )
 from stopan.protection.ec.metadata_adapter import spec_from_erasure_metadata
 from stopan.protection.ec.models import ErasureCodingError, ErasureSpec
-from stopan.protection.ec.packer import DataPackBuilder, build_data_pack
+from stopan.protection.ec.packer import (
+    DataPackBuilder,
+    _build_data_pack_from_validated_chunks,
+)
 from stopan.protection.ec.placement import plan_data_pack_shard_placement
 from stopan.protection.ec.push_execution import (
     build_data_pack_push_update,
@@ -214,7 +217,7 @@ def push_erasure_data_packs_to_network(
                     continue
 
                 try:
-                    must_flush = builder.add_chunk(chunk_hash=chunk_hash, data=data)
+                    must_flush = builder._add_prevalidated_chunk(chunk_hash=chunk_hash, data=data)
                 except ErasureCodingError as exc:
                     stats.failed_chunks += 1
                     continue
@@ -360,7 +363,10 @@ def _retry_existing_pack(
         return chunk_count, None
 
     try:
-        pack = build_data_pack(chunks=materialized_chunks, spec=record_spec)
+        pack = _build_data_pack_from_validated_chunks(
+            chunks=tuple(materialized_chunks),
+            spec=record_spec,
+        )
     except ErasureCodingError as exc:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count

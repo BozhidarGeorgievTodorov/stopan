@@ -106,7 +106,11 @@ def process_file_worker(
                     processed += 1
                     if repo.put(chunk_hash, chunk_data):
                         written += 1
-                        shared_index.local_exists.set(chunk_hash, True)
+                    # Si put() termina sin excepción, el objeto existe al salir aunque
+                    # otro writer haya ganado la carrera de publicación. Evita que un
+                    # falso negativo concurrente quede cacheado y fuerce compresiones
+                    # redundantes en duplicados posteriores.
+                    shared_index.local_exists.set(chunk_hash, True)
 
                 elif decision == "skip_local":
                     skipped += 1

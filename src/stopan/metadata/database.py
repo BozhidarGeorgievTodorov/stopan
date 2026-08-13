@@ -19,6 +19,37 @@ _SQLITE_CACHE_SIZE_KIB = 64 * 1024
 _SQLITE_MMAP_SIZE_BYTES = 2 * 1024**3
 _SQLITE_BUSY_TIMEOUT_MS = 5_000
 
+_CHUNK_PROTECTION_PUSH_UPSERT_SQL = """
+    INSERT INTO chunk_protection (
+        chunk_hash, desired_rf, protection_state, protected_remote_copies,
+        placement_epoch, last_push_at, last_verify_at, last_error
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(chunk_hash) DO UPDATE SET
+        desired_rf = excluded.desired_rf,
+        protection_state = excluded.protection_state,
+        protected_remote_copies = excluded.protected_remote_copies,
+        placement_epoch = excluded.placement_epoch,
+        last_push_at = excluded.last_push_at,
+        last_verify_at = excluded.last_verify_at,
+        last_error = excluded.last_error
+"""
+
+_CHUNK_PROTECTION_VERIFY_UPSERT_SQL = """
+    INSERT INTO chunk_protection (
+        chunk_hash, desired_rf, protection_state, protected_remote_copies,
+        placement_epoch, last_push_at, last_verify_at, last_error
+    )
+    VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+    ON CONFLICT(chunk_hash) DO UPDATE SET
+        desired_rf = excluded.desired_rf,
+        protection_state = excluded.protection_state,
+        protected_remote_copies = excluded.protected_remote_copies,
+        placement_epoch = excluded.placement_epoch,
+        last_verify_at = excluded.last_verify_at,
+        last_error = excluded.last_error
+"""
+
 
 class MetadataDatabaseError(StopanDataError, RuntimeError):
     """Inconsistencia en metadata persistida o filas derivadas de la base SQLite."""
@@ -791,6 +822,49 @@ class MetadataDB:
         for row in cursor:
             yield dict(row)
 
+    def iter_snapshot_restore_items(
+        self,
+        snapshot_id: int,
+    ) -> Iterator[tuple[dict[str, object], tuple[str, ...]]]:
+        """Genera elementos y receta ordenada con un único cursor de lectura."""
+        cursor = self.conn.execute("""
+            SELECT
+                si.*,
+                rc.chunk_order AS _chunk_order,
+                rc.chunk_hash AS _chunk_hash
+            FROM snapshot_items AS si
+            LEFT JOIN recipe_chunks AS rc ON rc.recipe_id = si.recipe_id
+            WHERE si.snapshot_id = ?
+            ORDER BY si.path ASC, rc.chunk_order ASC
+        """, (snapshot_id,))
+
+        current_item_id: int | None = None
+        current_item: dict[str, object] | None = None
+        chunk_hashes: list[str] = []
+
+        for row in cursor:
+            item_id = int(row["id"])
+            if current_item_id is not None and item_id != current_item_id:
+                assert current_item is not None
+                yield current_item, tuple(chunk_hashes)
+                chunk_hashes = []
+
+            if item_id != current_item_id:
+                current_item_id = item_id
+                current_item = {
+                    key: row[key]
+                    for key in row.keys()
+                    if not key.startswith("_chunk_")
+                }
+
+            chunk_hash = row["_chunk_hash"]
+            if chunk_hash is not None:
+                chunk_hashes.append(str(chunk_hash))
+
+        if current_item_id is not None:
+            assert current_item is not None
+            yield current_item, tuple(chunk_hashes)
+
     def get_item_by_path(self, snapshot_id: int, rel_path: str) -> dict | None:
         """Devuelve un archivo de un snapshot anterior por ruta relativa."""
         row = self.conn.execute("""
@@ -801,6 +875,32 @@ class MetadataDB:
         """, (snapshot_id, rel_path)).fetchone()
 
         return dict(row) if row else None
+
+    def get_file_items_by_paths(
+        self,
+        snapshot_id: int,
+        rel_paths: Iterable[str],
+    ) -> dict[str, dict]:
+        """Devuelve por ruta los archivos solicitados de un snapshot."""
+        paths = list(dict.fromkeys(rel_paths))
+        if not paths:
+            return {}
+
+        result: dict[str, dict] = {}
+        for batch in iter_batches(paths, 500):
+            placeholders = ", ".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"""
+                SELECT path, id, size, mode, mtime_ns, ctime_ns, uid, gid, recipe_id
+                FROM snapshot_items
+                WHERE snapshot_id = ?
+                  AND item_type = 'file'
+                  AND path IN ({placeholders})
+                """,
+                (snapshot_id, *batch),
+            ).fetchall()
+            result.update((row["path"], dict(row)) for row in rows)
+        return result
 
     def set_item_recipe(self, item_id: int, recipe_id: int) -> None:
         """Asocia un item del snapshot con una receta."""
@@ -858,11 +958,30 @@ class MetadataDB:
             return
 
         with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
-            for item_id, recipe_id in batch:
-                self._set_item_recipe(item_id, recipe_id)
+            cursor = self.conn.executemany(
+                "UPDATE snapshot_items SET recipe_id = ? WHERE id = ?",
+                ((recipe_id, item_id) for item_id, recipe_id in batch),
+            )
+            if cursor.rowcount != len(batch):
+                raise MetadataDatabaseError(
+                    "no se pudieron asociar todas las recetas reutilizadas: "
+                    f"esperadas={len(batch)} actualizadas={cursor.rowcount}"
+                )
 
             for recipe_id in dict.fromkeys(recipe_id for _, recipe_id in batch):
                 self._ensure_recipe_protection(recipe_id, desired_rf=desired_rf)
+
+    def get_recipe_chunks(self, recipe_id: int) -> Iterator[str]:
+        """Genera los hashes de una receta en su orden canónico."""
+        cursor = self.conn.execute("""
+            SELECT chunk_hash
+            FROM recipe_chunks
+            WHERE recipe_id = ?
+            ORDER BY chunk_order ASC
+        """, (recipe_id,))
+
+        for row in cursor:
+            yield row["chunk_hash"]
 
     def get_item_chunks(self, item_id: int) -> Iterator[str]:
         """Genera la receta de hashes de un archivo."""
@@ -878,15 +997,7 @@ class MetadataDB:
         if row["recipe_id"] is None:
             raise MetadataDatabaseValueError(f"Snapshot item has no associated recipe: {item_id}")
 
-        cursor = self.conn.execute("""
-            SELECT chunk_hash
-            FROM recipe_chunks
-            WHERE recipe_id = ?
-            ORDER BY chunk_order ASC
-        """, (row["recipe_id"],))
-
-        for row in cursor:
-            yield row["chunk_hash"]
+        yield from self.get_recipe_chunks(int(row["recipe_id"]))
 
     # ------------------------------------------------------------------
     # Recipes / chunks
@@ -971,9 +1082,29 @@ class MetadataDB:
                 f"Inconsistent recipe_chunks for recipe_hash: {recipe_hash}"
             )
 
+        if existing_chunks:
+            inconsistent_chunk = self.conn.execute("""
+                SELECT rc.chunk_hash, rc.chunk_size, c.size
+                FROM recipe_chunks AS rc
+                LEFT JOIN chunks AS c ON c.hash = rc.chunk_hash
+                WHERE rc.recipe_id = ?
+                  AND (c.hash IS NULL OR c.size != rc.chunk_size)
+                LIMIT 1
+            """, (recipe_id,)).fetchone()
+            if inconsistent_chunk is not None:
+                raise MetadataDatabaseError(
+                    "chunk registrado con tamaño inconsistente para una receta existente: "
+                    f"hash={inconsistent_chunk['chunk_hash']} "
+                    f"receta={inconsistent_chunk['chunk_size']} "
+                    f"catálogo={inconsistent_chunk['size']}"
+                )
+
+            self._ensure_recipe_protection(recipe_id, desired_rf=desired_rf)
+            return recipe_id
+
         self._register_chunks(chunks)
 
-        if not existing_chunks and chunk_count > 0:
+        if chunk_count > 0:
             self.conn.executemany("""
                 INSERT INTO recipe_chunks (recipe_id, chunk_order, chunk_hash, chunk_size)
                 VALUES (?, ?, ?, ?)
@@ -982,7 +1113,7 @@ class MetadataDB:
                 for order, chunk_hash, chunk_size in chunks
             ))
 
-        self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
+        self._ensure_recipe_protection(recipe_id, desired_rf=desired_rf)
         return recipe_id
 
     def ensure_recipe_protection(self, recipe_id: int, *, desired_rf: int = 3) -> None:
@@ -991,15 +1122,44 @@ class MetadataDB:
             self._ensure_recipe_protection(recipe_id, desired_rf=desired_rf)
 
     def _ensure_recipe_protection(self, recipe_id: int, *, desired_rf: int) -> None:
-        rows = self.conn.execute("""
-            SELECT chunk_order, chunk_hash, chunk_size
-            FROM recipe_chunks
-            WHERE recipe_id = ?
-            ORDER BY chunk_order ASC
-        """, (recipe_id,)).fetchall()
-
-        chunks = [(row["chunk_order"], row["chunk_hash"], row["chunk_size"]) for row in rows]
-        self._ensure_chunk_protection_rows(chunks, desired_rf=desired_rf)
+        desired_rf = int(desired_rf)
+        self.conn.execute("""
+            INSERT INTO chunk_protection (
+                chunk_hash, desired_rf, protection_state, protected_remote_copies,
+                placement_epoch, last_push_at, last_verify_at, last_error
+            )
+            SELECT DISTINCT
+                rc.chunk_hash, ?, ?, 0, NULL, NULL, NULL, NULL
+            FROM recipe_chunks AS rc
+            WHERE rc.recipe_id = ?
+            ON CONFLICT(chunk_hash) DO UPDATE SET
+                desired_rf = MAX(
+                    chunk_protection.desired_rf,
+                    excluded.desired_rf
+                ),
+                protection_state = CASE
+                    WHEN chunk_protection.desired_rf < excluded.desired_rf
+                         AND chunk_protection.protection_state IN (?, ?)
+                    THEN ?
+                    ELSE chunk_protection.protection_state
+                END,
+                last_error = CASE
+                    WHEN chunk_protection.desired_rf < excluded.desired_rf
+                         AND chunk_protection.protection_state IN (?, ?)
+                    THEN 'desired_rf increased'
+                    ELSE chunk_protection.last_error
+                END
+            WHERE chunk_protection.desired_rf < excluded.desired_rf
+        """, (
+            desired_rf,
+            ProtectionState.PENDING.value,
+            recipe_id,
+            ProtectionState.PLACED.value,
+            ProtectionState.VERIFIED.value,
+            ProtectionState.DEGRADED.value,
+            ProtectionState.PLACED.value,
+            ProtectionState.VERIFIED.value,
+        ))
 
     def _register_chunks(self, chunks: Iterable[tuple[int, str, int]]) -> None:
         chunk_sizes: dict[str, int] = {}
@@ -2680,26 +2840,29 @@ class MetadataDB:
             ProtectionState.FAILED,
         }
         now = time.time()
-        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
-            for update in normalized:
-                state = ProtectionState(update.protection_state)
-                if state not in allowed_states:
-                    raise MetadataDatabaseValueError(
-                        f"estado inválido para push de replicación: {state.value}"
-                    )
-                self._upsert_chunk_protection_state(
-                    chunk_hash=_require_hash64("chunk_hash", update.chunk_hash),
-                    desired_rf=_require_non_negative_int("desired_rf", update.desired_rf),
-                    protection_state=state,
-                    protected_remote_copies=_require_non_negative_int(
-                        "protected_remote_copies",
-                        update.protected_remote_copies,
-                    ),
-                    placement_epoch=update.placement_epoch,
-                    last_push_at=now,
-                    last_verify_at=None,
-                    last_error=update.error,
+        rows: list[tuple[object, ...]] = []
+        for update in normalized:
+            state = ProtectionState(update.protection_state)
+            if state not in allowed_states:
+                raise MetadataDatabaseValueError(
+                    f"estado inválido para push de replicación: {state.value}"
                 )
+            rows.append((
+                _require_hash64("chunk_hash", update.chunk_hash),
+                _require_non_negative_int("desired_rf", update.desired_rf),
+                state.value,
+                _require_non_negative_int(
+                    "protected_remote_copies",
+                    update.protected_remote_copies,
+                ),
+                update.placement_epoch,
+                now,
+                None,
+                update.error,
+            ))
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            self.conn.executemany(_CHUNK_PROTECTION_PUSH_UPSERT_SQL, rows)
         return len(normalized)
 
     def apply_chunk_verification_updates(
@@ -2713,25 +2876,28 @@ class MetadataDB:
 
         allowed_states = {ProtectionState.VERIFIED, ProtectionState.DEGRADED}
         now = time.time()
-        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
-            for update in normalized:
-                state = ProtectionState(update.protection_state)
-                if state not in allowed_states:
-                    raise MetadataDatabaseValueError(
-                        f"estado inválido para verificación de replicación: {state.value}"
-                    )
-                self._upsert_chunk_verification_state(
-                    chunk_hash=_require_hash64("chunk_hash", update.chunk_hash),
-                    desired_rf=_require_non_negative_int("desired_rf", update.desired_rf),
-                    protection_state=state,
-                    protected_remote_copies=_require_non_negative_int(
-                        "protected_remote_copies",
-                        update.protected_remote_copies,
-                    ),
-                    placement_epoch=update.placement_epoch,
-                    last_verify_at=now,
-                    last_error=update.error,
+        rows: list[tuple[object, ...]] = []
+        for update in normalized:
+            state = ProtectionState(update.protection_state)
+            if state not in allowed_states:
+                raise MetadataDatabaseValueError(
+                    f"estado inválido para verificación de replicación: {state.value}"
                 )
+            rows.append((
+                _require_hash64("chunk_hash", update.chunk_hash),
+                _require_non_negative_int("desired_rf", update.desired_rf),
+                state.value,
+                _require_non_negative_int(
+                    "protected_remote_copies",
+                    update.protected_remote_copies,
+                ),
+                update.placement_epoch,
+                now,
+                update.error,
+            ))
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            self.conn.executemany(_CHUNK_PROTECTION_VERIFY_UPSERT_SQL, rows)
         return len(normalized)
 
     def mark_chunk_placed(
@@ -2843,21 +3009,7 @@ class MetadataDB:
         last_verify_at: float | None,
         last_error: str | None,
     ) -> None:
-        self.conn.execute("""
-            INSERT INTO chunk_protection (
-                chunk_hash, desired_rf, protection_state, protected_remote_copies,
-                placement_epoch, last_push_at, last_verify_at, last_error
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chunk_hash) DO UPDATE SET
-                desired_rf = excluded.desired_rf,
-                protection_state = excluded.protection_state,
-                protected_remote_copies = excluded.protected_remote_copies,
-                placement_epoch = excluded.placement_epoch,
-                last_push_at = excluded.last_push_at,
-                last_verify_at = excluded.last_verify_at,
-                last_error = excluded.last_error
-        """, (
+        self.conn.execute(_CHUNK_PROTECTION_PUSH_UPSERT_SQL, (
             chunk_hash,
             int(desired_rf),
             protection_state.value,
@@ -2879,20 +3031,7 @@ class MetadataDB:
         last_verify_at: float,
         last_error: str | None,
     ) -> None:
-        self.conn.execute("""
-            INSERT INTO chunk_protection (
-                chunk_hash, desired_rf, protection_state, protected_remote_copies,
-                placement_epoch, last_push_at, last_verify_at, last_error
-            )
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
-            ON CONFLICT(chunk_hash) DO UPDATE SET
-                desired_rf = excluded.desired_rf,
-                protection_state = excluded.protection_state,
-                protected_remote_copies = excluded.protected_remote_copies,
-                placement_epoch = excluded.placement_epoch,
-                last_verify_at = excluded.last_verify_at,
-                last_error = excluded.last_error
-        """, (
+        self.conn.execute(_CHUNK_PROTECTION_VERIFY_UPSERT_SQL, (
             chunk_hash,
             int(desired_rf),
             protection_state.value,

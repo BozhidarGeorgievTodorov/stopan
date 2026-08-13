@@ -82,6 +82,20 @@ class FileChunker:
         if file_size == 0:
             return
 
+        # Ningún archivo de tamaño <= min_chunk_size puede contener un corte CDC
+        # anterior a EOF. Evitamos mmap y el iterador nativo en esta ruta frecuente.
+        if file_size <= self.min_chunk_size:
+            file_stream.seek(0)
+            chunk_data = file_stream.read(self.min_chunk_size + 1)
+            if len(chunk_data) <= self.min_chunk_size:
+                if chunk_data:
+                    yield blake3.blake3(chunk_data).hexdigest(), chunk_data
+                return
+
+            # El archivo creció entre fstat() y read(). Se procesa por la ruta CDC
+            # normal con su tamaño actual en lugar de tratarlo como un único chunk.
+            file_size = os.fstat(file_descriptor).st_size
+
         with mmap.mmap(file_descriptor, length=0, access=mmap.ACCESS_READ) as mapped_file:
             boundaries = fast_rabin.get_chunk_boundaries(
                 mapped_file,

@@ -245,13 +245,7 @@ class MetadataPackStore:
 
         return pruned_count, pruned_bytes, cutoff
 
-    def _enforce_pre_store_quotas_unlocked(
-        self,
-        *,
-        owner_id: str,
-        pack_hash: str,
-        incoming_size: int,
-    ) -> tuple[int, int]:
+    def _validate_incoming_quota_limits_unlocked(self, *, incoming_size: int) -> None:
         if incoming_size > self.max_pack_bytes:
             raise MetadataPackStoreError(
                 f"metadata pack demasiado grande: {incoming_size} bytes > {self.max_pack_bytes}"
@@ -265,6 +259,15 @@ class MetadataPackStore:
             raise MetadataPackQuotaError(
                 f"metadata pack excede la cuota total del store: {incoming_size} bytes > {self.max_total_store_bytes}"
             )
+
+    def _enforce_post_store_quotas_unlocked(
+        self,
+        *,
+        owner_id: str,
+        pack_hash: str,
+        incoming_size: int,
+    ) -> tuple[int, int]:
+        self._validate_incoming_quota_limits_unlocked(incoming_size=incoming_size)
 
         pruned_count = 0
         pruned_bytes = 0
@@ -457,26 +460,27 @@ class MetadataPackStore:
                     os.utime(path, None)
                 except OSError:
                     pass
-                prune_result = self.prune_to_limits(dry_run=False)
+                existing_size = int(path.stat().st_size)
+                pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
+                    owner_id=owner,
+                    pack_hash=pack,
+                    incoming_size=existing_size,
+                )
                 existing_public, existing_signature = self._read_signature_record(owner_id=owner, pack_hash=pack)
                 return StoreMetadataPackResult(
                     owner_id=owner,
                     pack_hash=pack,
                     path=path,
-                    size_bytes=path.stat().st_size,
+                    size_bytes=existing_size,
                     stored=False,
                     already_present=True,
                     public_key_b64=existing_public,
                     signature_b64=existing_signature,
-                    pruned_packs=prune_result.pruned_packs,
-                    pruned_bytes=prune_result.pruned_bytes,
+                    pruned_packs=pruned_count,
+                    pruned_bytes=pruned_bytes,
                 )
 
-            pruned_count, pruned_bytes = self._enforce_pre_store_quotas_unlocked(
-                owner_id=owner,
-                pack_hash=pack,
-                incoming_size=len(data),
-            )
+            self._validate_incoming_quota_limits_unlocked(incoming_size=len(data))
 
             ensure_private_dir(path.parent)
             pack_written = False
@@ -496,6 +500,12 @@ class MetadataPackStore:
                     except OSError:
                         pass
                 raise
+
+            pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
+                owner_id=owner,
+                pack_hash=pack,
+                incoming_size=len(data),
+            )
 
             return StoreMetadataPackResult(
                 owner_id=owner,
@@ -596,7 +606,12 @@ class MetadataPackStore:
                     os.utime(destination, None)
                 except OSError:
                     pass
-                prune_result = self.prune_to_limits(dry_run=False)
+                existing_size = int(destination.stat().st_size)
+                pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                    incoming_size=existing_size,
+                )
                 existing_public, existing_signature = self._read_signature_record(
                     owner_id=owner,
                     pack_hash=pack_hash,
@@ -605,20 +620,16 @@ class MetadataPackStore:
                     owner_id=owner,
                     pack_hash=pack_hash,
                     path=destination,
-                    size_bytes=int(destination.stat().st_size),
+                    size_bytes=existing_size,
                     stored=False,
                     already_present=True,
                     public_key_b64=existing_public,
                     signature_b64=existing_signature,
-                    pruned_packs=prune_result.pruned_packs,
-                    pruned_bytes=prune_result.pruned_bytes,
+                    pruned_packs=pruned_count,
+                    pruned_bytes=pruned_bytes,
                 )
 
-            pruned_count, pruned_bytes = self._enforce_pre_store_quotas_unlocked(
-                owner_id=owner,
-                pack_hash=pack_hash,
-                incoming_size=size_bytes,
-            )
+            self._validate_incoming_quota_limits_unlocked(incoming_size=size_bytes)
 
             ensure_private_dir(destination.parent)
             pack_written = False
@@ -638,6 +649,12 @@ class MetadataPackStore:
                     except OSError:
                         pass
                 raise
+
+            pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
+                owner_id=owner,
+                pack_hash=pack_hash,
+                incoming_size=size_bytes,
+            )
 
             return StoreMetadataPackResult(
                 owner_id=owner,

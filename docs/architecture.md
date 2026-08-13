@@ -253,7 +253,7 @@ Un `.stopanmetapack` empaqueta el latest del metadata object graph. El pack est�
 
 El cliente que crea, descifra o recupera packs necesita `metadata_identity.json` y la passphrase. Los nodos remotos no necesitan esos secretos. Solo guardan el payload cifrado y sidecars de validación.
 
-El servicio remoto valida owner, hash, tamaño, clave pública, firma y cuotas antes de almacenar un pack.
+El servicio remoto valida owner, hash, tamaño, clave pública y firma antes de publicar un pack. Los límites absolutos se comprueban antes de la escritura y, una vez publicados el paquete y su sidecar firmado, el almacén aplica retención y cuotas sobre el conjunto resultante, conservando el paquete recién aceptado.
 
 La distribución de packs usa una política separada de la protección de chunks. `pack_copies` no es `remote_copies`.
 

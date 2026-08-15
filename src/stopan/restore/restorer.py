@@ -19,10 +19,10 @@ from stopan.common.fs import atomic_rename_noreplace
 from stopan.metadata.database import MetadataDB
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.models import RestoreRunStats
-from stopan.restore.paths import RestorePaths, safe_restore_path
+from stopan.restore.paths import RestorePaths, safe_restore_path, validate_restore_root
 from stopan.restore.prefetcher import OrderedBatchChunkPrefetcher
 from stopan.errors import StopanStorageError
-from stopan.restore.errors import RestoreDataError
+from stopan.restore.errors import RestoreDataError, RestorePathError
 
 
 RESTORE_PROGRESS_EVERY_ITEMS = 100
@@ -125,9 +125,12 @@ class SnapshotRestorer:
 
         try:
             os.makedirs(paths.incomplete_dir, exist_ok=True)
+            validate_restore_root(paths.incomplete_dir)
             self._ensure_work_directory_permissions(paths.incomplete_dir)
-        except OSError as exc:
-            raise StopanStorageError(f"No se pudo preparar el directorio de restore {paths.incomplete_dir}: {exc}") from exc
+        except (OSError, RestorePathError) as exc:
+            raise StopanStorageError(
+                f"No se pudo preparar el directorio de restore {paths.incomplete_dir}: {exc}"
+            ) from exc
 
         print(f"Restaurando Snapshot {snapshot_id} en '{paths.incomplete_dir}/'...")
         print(
@@ -165,7 +168,7 @@ class SnapshotRestorer:
 
                 try:
                     full_path = safe_restore_path(paths.incomplete_dir, item["path"])
-                except ValueError as exc:
+                except RestorePathError as exc:
                     print(f"   {exc}")
                     continue
 
@@ -230,6 +233,10 @@ class SnapshotRestorer:
 
                 if success_file:
                     try:
+                        # La obtención de chunks puede ser larga. Revalida la ruta
+                        # inmediatamente antes de publicar para detectar cambios
+                        # simbólicos introducidos desde la resolución inicial.
+                        full_path = safe_restore_path(paths.incomplete_dir, item["path"])
                         os.replace(current_tmp_path, full_path)
                         current_tmp_path = None
                         self.apply_item_metadata(full_path, item, is_dir=False)

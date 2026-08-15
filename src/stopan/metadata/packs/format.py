@@ -80,9 +80,10 @@ class MetadataObjectPackHeader:
 def parse_pack_outer(path: Path, raw: dict[str, Any]) -> tuple[dict[str, Any], bytes, str]:
     if raw.get("format") != OBJECT_PACK_FORMAT:
         raise MetadataObjectPackError(f"formato de metadata pack inválido: {path}")
-    if raw.get("version") != OBJECT_PACK_VERSION:
+    version = raw.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != OBJECT_PACK_VERSION:
         raise MetadataObjectPackError(
-            f"versión de metadata pack no soportada in {path}: {raw.get('version')!r}; "
+            f"versión de metadata pack no soportada in {path}: {version!r}; "
             "crea un pack nuevo con la versión actual de Stopan."
         )
     if raw.get("encryption") != OBJECT_PACK_ENCRYPTION_X25519_CHACHA20POLY1305:
@@ -127,7 +128,7 @@ def pack_header_from_outer(
         path=path,
         pack_hash=validate_pack_hash(pack_hash),
         format=str(raw.get("format")),
-        version=int(raw.get("version")),
+        version=raw["version"],
         encryption=str(raw.get("encryption")),
         aead_name=str(payload_aead.get("name")),
         compression=str(raw.get("compression")),

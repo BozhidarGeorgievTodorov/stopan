@@ -7,9 +7,10 @@ se identifica por BLAKE3 de esos bytes canónicos.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 from enum import Enum
-from typing import Any
+import types
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import blake3
 
@@ -17,10 +18,156 @@ from stopan.common.json import canonical_json_bytes
 from stopan.metadata.objects.models import (
     METADATA_OBJECT_FORMAT,
     METADATA_OBJECT_VERSION,
+    CatalogObject,
+    ChunkListObject,
+    ErasureDataPackIndexObject,
+    ErasureDataPackShardObject,
+    FileObject,
+    KnownChunkIndexObject,
+    KnownChunkShardObject,
     MetadataObjectError,
     MetadataObjectType,
     MetadataPlainObject,
+    ProtectionIndexObject,
+    ProtectionShardObject,
+    RecipeObject,
+    SnapshotIndexObject,
+    SnapshotRootObject,
+    TreeObject,
 )
+
+
+_OBJECT_CLASS_BY_TYPE = {
+    MetadataObjectType.CATALOG: CatalogObject,
+    MetadataObjectType.SNAPSHOT_INDEX: SnapshotIndexObject,
+    MetadataObjectType.SNAPSHOT_ROOT: SnapshotRootObject,
+    MetadataObjectType.TREE: TreeObject,
+    MetadataObjectType.FILE: FileObject,
+    MetadataObjectType.RECIPE: RecipeObject,
+    MetadataObjectType.CHUNK_LIST: ChunkListObject,
+    MetadataObjectType.KNOWN_CHUNK_INDEX: KnownChunkIndexObject,
+    MetadataObjectType.KNOWN_CHUNK_SHARD: KnownChunkShardObject,
+    MetadataObjectType.PROTECTION_INDEX: ProtectionIndexObject,
+    MetadataObjectType.PROTECTION_SHARD: ProtectionShardObject,
+    MetadataObjectType.ERASURE_DATA_PACK_INDEX: ErasureDataPackIndexObject,
+    MetadataObjectType.ERASURE_DATA_PACK_SHARD: ErasureDataPackShardObject,
+}
+
+
+def _decode_model_value(value: Any, expected_type: Any, *, path: str) -> Any:
+    if expected_type is Any:
+        return value
+
+    origin = get_origin(expected_type)
+    args = get_args(expected_type)
+
+    if origin in (types.UnionType, Union):
+        if value is None and type(None) in args:
+            return None
+        errors: list[str] = []
+        for candidate in args:
+            if candidate is type(None):
+                continue
+            try:
+                return _decode_model_value(value, candidate, path=path)
+            except MetadataObjectError as exc:
+                errors.append(str(exc))
+        raise MetadataObjectError(
+            f"{path} no coincide con ninguno de los tipos permitidos"
+            + (": " + " | ".join(errors) if errors else "")
+        )
+
+    if origin is tuple:
+        if not isinstance(value, list):
+            raise MetadataObjectError(
+                f"{path} debe ser lista JSON; recibido {type(value).__name__}"
+            )
+        if len(args) == 2 and args[1] is Ellipsis:
+            item_type = args[0]
+            return tuple(
+                _decode_model_value(item, item_type, path=f"{path}[{index}]")
+                for index, item in enumerate(value)
+            )
+        if len(value) != len(args):
+            raise MetadataObjectError(
+                f"{path} debe contener {len(args)} elementos; recibido {len(value)}"
+            )
+        return tuple(
+            _decode_model_value(item, item_type, path=f"{path}[{index}]")
+            for index, (item, item_type) in enumerate(zip(value, args, strict=True))
+        )
+
+    if isinstance(expected_type, type) and issubclass(expected_type, Enum):
+        try:
+            return expected_type(value)
+        except (TypeError, ValueError) as exc:
+            raise MetadataObjectError(
+                f"{path} no es un valor válido de {expected_type.__name__}: {value!r}"
+            ) from exc
+
+    if isinstance(expected_type, type) and is_dataclass(expected_type):
+        return _decode_model_dataclass(expected_type, value, path=path)
+
+    return value
+
+
+def _decode_model_dataclass(cls: type[Any], payload: Any, *, path: str) -> Any:
+    if not isinstance(payload, dict):
+        raise MetadataObjectError(
+            f"{path} debe ser objeto JSON; recibido {type(payload).__name__}"
+        )
+
+    model_fields = tuple(field for field in fields(cls) if field.init)
+    allowed = {field.name for field in model_fields}
+    extras = sorted(set(payload) - allowed)
+    if extras:
+        raise MetadataObjectError(
+            f"{path} contiene campos no soportados: {', '.join(extras)}"
+        )
+
+    hints = get_type_hints(cls)
+    kwargs: dict[str, Any] = {}
+    for field in model_fields:
+        if field.name not in payload:
+            if field.default is MISSING and field.default_factory is MISSING:
+                raise MetadataObjectError(f"{path}.{field.name} es obligatorio")
+            continue
+        kwargs[field.name] = _decode_model_value(
+            payload[field.name],
+            hints[field.name],
+            path=f"{path}.{field.name}",
+        )
+
+    try:
+        return cls(**kwargs)
+    except MetadataObjectError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise MetadataObjectError(f"{path} inválido: {exc}") from exc
+
+
+def decode_metadata_object_payload(
+    object_type: MetadataObjectType,
+    payload: dict[str, Any],
+) -> MetadataPlainObject:
+    """Decodifica un payload JSON contra el modelo canónico de su tipo.
+
+    La reconstrucción fuerza los invariantes de las dataclasses y exige que la
+    representación normalizada vuelva a producir exactamente el mismo payload.
+    Así se rechazan campos extra, omisiones de campos canónicos y coerciones de
+    tipos que no formarían parte de un objeto emitido por el propio sistema.
+    """
+
+    cls = _OBJECT_CLASS_BY_TYPE.get(object_type)
+    if cls is None:
+        raise MetadataObjectError(f"tipo de metadata object no soportado: {object_type.value}")
+    obj = _decode_model_dataclass(cls, payload, path=object_type.value)
+    normalized = object_payload(obj)
+    if normalized != payload:
+        raise MetadataObjectError(
+            f"payload de {object_type.value} no coincide con su representación canónica de modelo"
+        )
+    return obj
 
 
 @dataclass(frozen=True, slots=True)

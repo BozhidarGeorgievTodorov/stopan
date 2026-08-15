@@ -8,11 +8,17 @@ comprueba que tamaños, tipos y hashes coinciden antes de importar.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 from stopan.common.encoding import b64decode, b64encode
 from stopan.common.json import canonical_json_bytes
+from stopan.common.validators import require_strict_non_negative_int, require_strict_positive_int
 from stopan.metadata.objects.codec import EncodedMetadataObject, canonical_state_digest
+from stopan.metadata.objects.graph.validation import (
+    GraphObjectPayload,
+    validate_metadata_object_graph_semantics,
+)
 from stopan.metadata.objects.graph.walk import decode_object_envelope, iter_object_refs
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.metadata.objects.store import LatestMetadataPointer
@@ -45,47 +51,45 @@ class _ValidatedPackObject:
 def require_metadata_hash(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise MetadataObjectPackError(f"{name} debe ser string")
-    text = value.strip()
-    if len(text) != 64 or any(char not in _HEX64_ALPHABET for char in text):
+    if len(value) != 64 or any(char not in _HEX64_ALPHABET for char in value):
         raise MetadataObjectPackError(f"{name} debe tener 64 caracteres hexadecimales lowercase")
-    return text
+    return value
 
 
 def require_vault_id(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise MetadataObjectPackError(f"{name} debe ser string")
-    text = value.strip()
-    if len(text) != 32 or any(char not in _HEX64_ALPHABET for char in text):
+    if len(value) != 32 or any(char not in _HEX64_ALPHABET for char in value):
         raise MetadataObjectPackError(f"{name} debe tener 32 caracteres hexadecimales lowercase")
-    return text
+    return value
 
 
 def require_non_negative_int(name: str, value: object) -> int:
-    if isinstance(value, bool):
-        raise MetadataObjectPackError(f"{name} debe ser un entero >= 0")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise MetadataObjectPackError(f"{name} debe ser un entero >= 0") from exc
-    if parsed < 0:
-        raise MetadataObjectPackError(f"{name} debe ser >= 0. Recibido {parsed}")
-    return parsed
+    return require_strict_non_negative_int(
+        name,
+        value,
+        error_factory=MetadataObjectPackError,
+        type_label="entero",
+    )
 
 
 def require_positive_int(name: str, value: object) -> int:
-    parsed = require_non_negative_int(name, value)
-    if parsed <= 0:
-        raise MetadataObjectPackError(f"{name} debe ser > 0.. Recibido {parsed}")
-    return parsed
+    return require_strict_positive_int(
+        name,
+        value,
+        error_factory=MetadataObjectPackError,
+        type_label="entero",
+    )
 
 
 def require_positive_float(name: str, value: object) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise MetadataObjectPackError(f"{name} debe ser un número > 0") from exc
-    if parsed <= 0.0:
-        raise MetadataObjectPackError(f"{name} debe ser > 0. Recibido {parsed!r}")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MetadataObjectPackError(
+            f"{name} debe ser un número > 0; recibido {type(value).__name__}"
+        )
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise MetadataObjectPackError(f"{name} debe ser finito y > 0. Recibido {parsed!r}")
     return parsed
 
 
@@ -158,8 +162,9 @@ def pack_payload(
 def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
     if payload.get("format") != OBJECT_PACK_PAYLOAD_FORMAT:
         raise MetadataObjectPackError("formato de payload de metadata pack inválido")
-    if payload.get("version") != OBJECT_PACK_PAYLOAD_VERSION:
-        raise MetadataObjectPackError(f"versión de payload de metadata pack no soportada: {payload.get('version')!r}")
+    version = payload.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != OBJECT_PACK_PAYLOAD_VERSION:
+        raise MetadataObjectPackError(f"versión de payload de metadata pack no soportada: {version!r}")
 
     vault_raw = payload.get("vault")
     if not isinstance(vault_raw, dict):
@@ -293,6 +298,25 @@ def _validate_pack_payload_graph(
             "pack latest.total_canonical_bytes no coincide con el grafo alcanzable: "
             f"latest={parsed.latest.total_canonical_bytes} alcanzables={reachable_bytes}"
         )
+
+    try:
+        validate_metadata_object_graph_semantics(
+            catalog_hash=parsed.latest.catalog_hash,
+            objects_by_hash={
+                object_hash: GraphObjectPayload(
+                    object_type=validated.object_type,
+                    payload=validated.payload,
+                )
+                for object_hash, validated in objects_by_hash.items()
+            },
+            expected_snapshot_count=parsed.latest.snapshot_count,
+            expected_known_chunk_count=parsed.latest.known_chunk_count,
+            expected_protection_record_count=parsed.latest.protection_record_count,
+        )
+    except Exception as exc:
+        raise MetadataObjectPackError(
+            f"grafo de metadata no es semánticamente recuperable: {exc}"
+        ) from exc
 
 
 def _validate_pack_payload_entries(

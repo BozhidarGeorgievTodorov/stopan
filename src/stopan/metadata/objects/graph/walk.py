@@ -15,6 +15,7 @@ import blake3
 
 from stopan.errors import StopanDataError
 from stopan.common.json import canonical_json_bytes
+from stopan.metadata.objects.codec import decode_metadata_object_payload
 from stopan.metadata.objects.models import (
     METADATA_OBJECT_FORMAT,
     METADATA_OBJECT_VERSION,
@@ -73,7 +74,8 @@ def decode_object_envelope(
         )
     if envelope.get("format") != METADATA_OBJECT_FORMAT:
         raise MetadataObjectGraphWalkError(f"formato de metadata object inválido: {calculated}")
-    if envelope.get("version") != METADATA_OBJECT_VERSION:
+    version = envelope.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != METADATA_OBJECT_VERSION:
         raise MetadataObjectGraphWalkError(f"versión de metadata object no soportada: {calculated}")
 
     try:
@@ -86,6 +88,13 @@ def decode_object_envelope(
     payload = envelope.get("payload")
     if not isinstance(payload, dict):
         raise MetadataObjectGraphWalkError(f"payload de metadata object inválido: {calculated}")
+
+    try:
+        decode_metadata_object_payload(object_type, payload)
+    except Exception as exc:
+        raise MetadataObjectGraphWalkError(
+            f"payload semántico inválido para {calculated} ({object_type.value}): {exc}"
+        ) from exc
 
     return object_type, payload
 

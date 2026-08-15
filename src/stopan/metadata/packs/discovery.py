@@ -170,7 +170,7 @@ def collect_metadata_pack_sources(
         )
     ]
     if not targets:
-        raise error_cls("Membership no devolvió miembros remotos elegibles del cluster.")
+        return [], [], ()
 
     parallelism = max(1, int(target_parallelism))
     sources: list[MetadataPackSource] = []

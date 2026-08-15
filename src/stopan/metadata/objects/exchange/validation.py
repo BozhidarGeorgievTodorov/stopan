@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from .errors import MetadataObjectImportError
 from stopan.common.validators import require_strict_int
 from stopan.metadata.objects.models import MetadataObjectType
@@ -32,6 +34,8 @@ def require_number(name: str, value: object, *, min_value: float | None = None) 
             f"{name} debe ser numérico; recibido {type(value).__name__}"
         )
     number = float(value)
+    if not math.isfinite(number):
+        raise MetadataObjectImportError(f"{name} debe ser finito; recibido {value}")
     if min_value is not None and number < min_value:
         raise MetadataObjectImportError(f"{name} debe ser >= {min_value}; recibido {value}")
     return number

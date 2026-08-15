@@ -246,13 +246,13 @@ def add_pack_group(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     verify_selector.add_argument(
         "--all",
         action="store_true",
-        help="Verifica todos los packs descubiertos hasta --max-candidates.",
+        help="Verifica todas las publicaciones locales conocidas y añade hasta --max-candidates candidatos observados solo en remoto.",
     )
     verify_parser.add_argument(
         "--max-candidates",
         type=int,
         default=None,
-        help="Máximo de pack_hash a verificar con --all. Default: metadata.pack_discovery_max_candidates.",
+        help="Máximo de candidatos observados solo en remoto que se añaden a --all. Las publicaciones locales conocidas siempre se verifican. Default: metadata.pack_discovery_max_candidates.",
     )
     verify_parser.add_argument(
         "--show-sources",

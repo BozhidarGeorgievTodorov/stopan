@@ -486,6 +486,20 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
                     pack_hash=pack_hash,
                 )
 
+            calculated = calculate_pack_hash_file(path)
+            if calculated != pack_hash:
+                context.set_code(grpc.StatusCode.DATA_LOSS)
+                context.set_details("metadata pack almacenado no coincide con su identidad")
+                return p2p_storage_pb2.ProbeMetadataPackResponse(
+                    status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_ERROR,
+                    detail=(
+                        "hash de metadata pack no coincide: "
+                        f"esperado={pack_hash} calculado={calculated}"
+                    ),
+                    owner_id=owner_id,
+                    pack_hash=pack_hash,
+                )
+
             public_key_b64, signature_b64 = self.store.get_signature_record(
                 owner_id=owner_id,
                 pack_hash=pack_hash,

@@ -33,6 +33,7 @@ from stopan.metadata.packs.payload import (
     pack_payload,
     parse_pack_payload,
     parse_pack_payload_summary,
+    require_positive_int,
     require_vault_id,
     validate_pack_payload,
 )
@@ -227,6 +228,78 @@ class MetadataObjectPackService:
                 protection_record_count=latest.protection_record_count,
             ),
         )
+
+    def find_reusable_latest_pack(
+        self,
+        *,
+        object_store_dir: str | Path,
+        pack_dir: str | Path,
+        identity_file: str | Path,
+        passphrase: str | bytes,
+    ) -> tuple[Path, MetadataObjectPackSummary] | None:
+        """Selecciona y registra una representación reutilizable del latest vigente.
+
+        La lectura de latest, la selección y el avance del marcador de generación
+        comparten el lock del object store para que una exportación concurrente no
+        pueda reservar una generación inferior entre esas operaciones.
+        """
+
+        resolved_pack_dir = Path(pack_dir).expanduser().resolve()
+        if not resolved_pack_dir.exists():
+            return None
+        if not resolved_pack_dir.is_dir():
+            raise StopanUsageError(f"No es un directorio de metadata packs: {resolved_pack_dir}")
+
+        with object_store_lock(object_store_dir):
+            store = MetadataObjectStore.open_existing(
+                object_store_dir,
+                passphrase=passphrase,
+            )
+            latest = store.read_latest_pointer()
+            candidates: list[tuple[int, str, Path, MetadataObjectPackSummary]] = []
+
+            for path in sorted(resolved_pack_dir.glob(f"*{OBJECT_PACK_FILE_SUFFIX}")):
+                try:
+                    inspection = self.validate_pack(
+                        path,
+                        identity_file=identity_file,
+                        passphrase=passphrase,
+                    )
+                    summary = inspection.decrypted
+                    if summary is None:
+                        continue
+                    if summary.vault_id != latest.vault_id:
+                        continue
+                    if summary.catalog_hash != latest.catalog_hash:
+                        continue
+                    if summary.state_digest != latest.state_digest:
+                        continue
+                    candidates.append(
+                        (
+                            int(summary.vault_generation),
+                            str(inspection.header.pack_hash),
+                            path,
+                            summary,
+                        )
+                    )
+                except Exception:
+                    # Un pack ilegible, de otra identidad, corrupto o antiguo no
+                    # impide reutilizar otra representación válida del mismo estado.
+                    continue
+
+            if not candidates:
+                return None
+
+            generation, _pack_hash, path, summary = max(
+                candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            _remember_pack_generation(
+                object_store_dir,
+                latest.vault_id,
+                generation,
+            )
+            return path, summary
 
     def inspect_pack_header(self, path: str | Path) -> MetadataObjectPackInspection:
         pack_path = Path(path).expanduser().resolve()

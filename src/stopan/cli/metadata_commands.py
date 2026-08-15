@@ -561,61 +561,12 @@ def find_reusable_latest_object_pack(
     resolved_pack_dir = Path(
         pack_dir or cfg.metadata.generated_pack_dir
     ).expanduser().resolve()
-
-    if not resolved_pack_dir.exists():
-        return None
-
-    if not resolved_pack_dir.is_dir():
-        raise StopanUsageError(f"No es un directorio de metadata packs: {resolved_pack_dir}")
-
-    graph_service = object_graph_service_from_config_defaults(cfg)
-    store_inspection = graph_service.inspect_store(
+    return pack_service.find_reusable_latest_pack(
         object_store_dir=object_store_dir,
+        pack_dir=resolved_pack_dir,
+        identity_file=identity_file,
         passphrase=passphrase,
-        decrypt_latest=True,
     )
-    latest = store_inspection.latest
-    if latest is None:
-        raise StopanDataError(f"El metadata object store no tiene latest: {object_store_dir}")
-
-    candidates = []
-
-    for path in sorted(resolved_pack_dir.glob("*.stopanmetapack")):
-        try:
-            inspection = pack_service.validate_pack(
-                path,
-                identity_file=identity_file,
-                passphrase=passphrase,
-            )
-            if inspection.decrypted is None:
-                continue
-
-            summary = inspection.decrypted
-            if summary.catalog_hash != latest.catalog_hash:
-                continue
-            if summary.state_digest != latest.state_digest:
-                continue
-
-            candidates.append(
-                (
-                    int(summary.vault_generation),
-                    str(inspection.header.pack_hash),
-                    path,
-                    summary,
-                )
-            )
-        except Exception:
-            # Pack ilegible, de otra identity, corrupto o antiguo: no bloquea push.
-            continue
-
-    if not candidates:
-        return None
-
-    _generation, _pack_hash, path, summary = max(
-        candidates,
-        key=lambda item: (item[0], item[1]),
-    )
-    return path, summary
 
 
 def metadata_pack_publication_maps(cfg, *, owner_id: str) -> tuple[dict[str, int], dict[str, float]]:

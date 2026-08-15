@@ -298,9 +298,15 @@ def verify_metadata_packs_from_network(
         raise MetadataPackVerificationError(str(exc)) from exc
 
     entries_by_hash = {entry.pack_hash: entry for entry in discovery.entries}
-    candidate_hashes = sorted(set(entries_by_hash) | set(desired_map))
+
+    # Las publicaciones persistidas expresan intención local y no pueden quedar
+    # fuera de verify --all por un límite pensado para acotar candidatos
+    # descubiertos únicamente en remoto.
+    local_hashes = sorted(desired_map)
+    remote_only_hashes = sorted(set(entries_by_hash) - set(desired_map))
     if max_candidates is not None and int(max_candidates) > 0:
-        candidate_hashes = candidate_hashes[: int(max_candidates)]
+        remote_only_hashes = remote_only_hashes[: int(max_candidates)]
+    candidate_hashes = local_hashes + remote_only_hashes
 
     results_list: list[MetadataPackVerificationResult] = []
     for candidate_hash in candidate_hashes:

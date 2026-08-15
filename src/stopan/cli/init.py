@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import grp
 import os
 import pwd
@@ -181,8 +182,117 @@ def _stopan_service_ids() -> tuple[int, int] | None:
     return user.pw_uid, (user.pw_gid if gid is None else gid)
 
 
-def _directory_is_writable_by(path: Path, *, uid: int, gid: int) -> bool:
-    st = path.stat()
+def _absolute_path_without_resolving(path: str | Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _open_directory_chain_no_symlinks(
+    path: str | Path,
+    *,
+    create: bool,
+) -> tuple[Path, int, bool]:
+    absolute = _absolute_path_without_resolving(path)
+    parts = absolute.parts
+    if not parts or parts[0] != os.sep:
+        raise StopanStorageError(f"La ruta debe ser absoluta: {absolute}")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise StopanStorageError(
+            "La plataforma no permite preparar directorios sin seguir enlaces simbólicos."
+        )
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current_fd = os.open(os.sep, flags)
+    current_path = Path(os.sep)
+    final_created = False
+    try:
+        for index, component in enumerate(parts[1:]):
+            current_path /= component
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise StopanStorageError(
+                        f"El directorio configurado no existe: {current_path}"
+                    )
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                except OSError as exc:
+                    raise StopanStorageError(
+                        f"No se pudo crear el directorio {current_path}: {exc}"
+                    ) from exc
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+                is_final = index == len(parts[1:]) - 1
+                if is_final:
+                    final_created = True
+                else:
+                    # El componente nace 0700 para cerrar la ventana entre mkdir
+                    # y la apertura no-follow. Una vez fijado el descriptor,
+                    # permite únicamente la travesía necesaria para alcanzar el
+                    # destino final que recibirá después su política de servicio.
+                    try:
+                        os.fchmod(next_fd, 0o711)
+                    except OSError as exc:
+                        os.close(next_fd)
+                        raise StopanStorageError(
+                            f"No se pudieron ajustar permisos del directorio intermedio {current_path}: {exc}"
+                        ) from exc
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise StopanStorageError(
+                        "La ruta configurada contiene un enlace simbólico o un "
+                        f"componente no directorio: {current_path}"
+                    ) from exc
+                raise StopanStorageError(
+                    f"No se pudo abrir el directorio {current_path}: {exc}"
+                ) from exc
+            os.close(current_fd)
+            current_fd = next_fd
+        return absolute, current_fd, final_created
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_regular_file_no_symlinks(path: str | Path) -> tuple[Path, int]:
+    absolute = _absolute_path_without_resolving(path)
+    parent, parent_fd, _created = _open_directory_chain_no_symlinks(
+        absolute.parent,
+        create=False,
+    )
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            fd = os.open(absolute.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise StopanUsageError(
+                    f"La ruta configurada no puede ser un enlace simbólico: {absolute}"
+                ) from exc
+            raise StopanStorageError(f"No se pudo abrir {absolute}: {exc}") from exc
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise StopanUsageError(f"La ruta configurada no es un archivo regular: {absolute}")
+        return absolute, fd
+    finally:
+        os.close(parent_fd)
+
+
+def _paths_alias_same_file(first: Path, second: Path) -> bool:
+    if first == second:
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StopanStorageError(
+            f"No se pudo comprobar si {first} y {second} identifican el mismo archivo: {exc}"
+        ) from exc
+
+
+def _directory_fd_is_writable_by(fd: int, *, uid: int, gid: int) -> bool:
+    st = os.fstat(fd)
     mode = st.st_mode
     if st.st_uid == uid:
         access_bits = (mode >> 6) & 0o7
@@ -193,26 +303,31 @@ def _directory_is_writable_by(path: Path, *, uid: int, gid: int) -> bool:
     return (access_bits & 0o3) == 0o3
 
 
-def _apply_service_directory_permissions(path: Path, *, created: bool, mode: int = 0o750) -> None:
+def _apply_service_directory_permissions(
+    path: Path,
+    *,
+    fd: int,
+    created: bool,
+    mode: int = 0o750,
+) -> None:
     service_ids = _stopan_service_ids() if os.geteuid() == 0 else None
 
     try:
         if service_ids is None:
             if created:
-                os.chmod(path, mode)
+                os.fchmod(fd, mode)
             return
 
         uid, gid = service_ids
         managed_root = Path("/var/lib/stopan")
-        resolved = path.resolve()
-        managed_by_stopan = resolved == managed_root or managed_root in resolved.parents
+        managed_by_stopan = path == managed_root or managed_root in path.parents
 
         if created or managed_by_stopan:
-            os.chown(path, uid, gid)
-            os.chmod(path, mode)
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, mode)
             return
 
-        if not _directory_is_writable_by(path, uid=uid, gid=gid):
+        if not _directory_fd_is_writable_by(fd, uid=uid, gid=gid):
             raise StopanStorageError(
                 f"El directorio configurado {path} ya existe fuera de /var/lib/stopan "
                 "y no es escribible por el usuario de servicio stopan. "
@@ -224,20 +339,34 @@ def _apply_service_directory_permissions(path: Path, *, created: bool, mode: int
         raise StopanStorageError(f"No se pudieron ajustar permisos de {path}: {exc}") from exc
 
 
-def _apply_service_file_permissions(path: Path, *, mode: int = 0o640) -> None:
+def _verify_directory_identity(path: Path, expected_stat: os.stat_result) -> None:
+    _absolute, verify_fd, _created = _open_directory_chain_no_symlinks(path, create=False)
     try:
-        os.chmod(path, mode)
-    except OSError as exc:
-        raise StopanStorageError(f"No se pudieron ajustar permisos de {path}: {exc}") from exc
+        observed = os.fstat(verify_fd)
+        if (expected_stat.st_dev, expected_stat.st_ino) != (observed.st_dev, observed.st_ino):
+            raise StopanStorageError(
+                f"El directorio configurado cambió durante la inicialización: {path}"
+            )
+    finally:
+        os.close(verify_fd)
 
-    gid = _stopan_group_gid()
-    if gid is not None:
-        try:
-            os.chown(path, -1, gid)
-        except PermissionError:
-            pass
-        except OSError as exc:
-            raise StopanStorageError(f"No se pudo asignar el grupo stopan a {path}: {exc}") from exc
+
+def _apply_service_file_permissions(path: Path, *, mode: int = 0o640) -> None:
+    absolute, fd = _open_regular_file_no_symlinks(path)
+    try:
+        os.fchmod(fd, mode)
+        gid = _stopan_group_gid()
+        if gid is not None:
+            try:
+                os.fchown(fd, -1, gid)
+            except PermissionError:
+                pass
+    except OSError as exc:
+        raise StopanStorageError(
+            f"No se pudieron ajustar permisos de {absolute}: {exc}"
+        ) from exc
+    finally:
+        os.close(fd)
 
 
 def _write_yaml_atomic(path: Path, data: dict[str, Any]) -> None:
@@ -305,20 +434,30 @@ def _ensure_mapping(root: dict[str, Any], section: str) -> dict[str, Any]:
 
 def _prepare_node_directories(cfg: StopanConfig) -> list[Path]:
     directories = list(dict.fromkeys([
-        Path(cfg.node.identity_file).parent,
-        Path(cfg.node.catalog_file).parent,
-        Path(cfg.storage.local_chunk_dir),
-        Path(cfg.storage.custody_dir) / "chunks",
-        Path(cfg.storage.custody_dir) / "ec_shards",
+        _absolute_path_without_resolving(Path(cfg.node.identity_file).parent),
+        _absolute_path_without_resolving(Path(cfg.node.catalog_file).parent),
+        _absolute_path_without_resolving(cfg.storage.local_chunk_dir),
+        _absolute_path_without_resolving(Path(cfg.storage.custody_dir) / "chunks"),
+        _absolute_path_without_resolving(Path(cfg.storage.custody_dir) / "ec_shards"),
     ]))
+    prepared: list[Path] = []
     for directory in directories:
-        created = not directory.exists()
+        absolute, fd, created = _open_directory_chain_no_symlinks(
+            directory,
+            create=True,
+        )
         try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise StopanStorageError(f"No se pudo preparar el directorio {directory}: {exc}") from exc
-        _apply_service_directory_permissions(directory, created=created)
-    return directories
+            _apply_service_directory_permissions(
+                absolute,
+                fd=fd,
+                created=created,
+            )
+            expected = os.fstat(fd)
+        finally:
+            os.close(fd)
+        _verify_directory_identity(absolute, expected)
+        prepared.append(absolute)
+    return prepared
 
 
 def _init_node(args: argparse.Namespace) -> int:
@@ -433,8 +572,13 @@ def _init_metadata(args: argparse.Namespace) -> int:
     if not cfg.metadata.identity_file:
         raise StopanUsageError("metadata.identity_file debe estar configurado para inicializar metadata.")
 
-    passphrase_path = Path(cfg.metadata.passphrase_file).expanduser().resolve()
-    identity_path = Path(cfg.metadata.identity_file).expanduser().resolve()
+    passphrase_path = _absolute_path_without_resolving(cfg.metadata.passphrase_file)
+    identity_path = _absolute_path_without_resolving(cfg.metadata.identity_file)
+
+    if _paths_alias_same_file(passphrase_path, identity_path):
+        raise StopanUsageError(
+            "metadata.passphrase_file y metadata.identity_file deben identificar archivos distintos."
+        )
 
     identity_exists = identity_path.exists()
     if cfg.metadata.owner_id and not identity_exists:
@@ -451,6 +595,7 @@ def _init_metadata(args: argparse.Namespace) -> int:
 
     identity_created = False
     if identity_exists:
+        _apply_service_file_permissions(identity_path, mode=0o640)
         identity = load_metadata_private_identity_file(identity_path, passphrase=passphrase).identity
     else:
         identity = create_metadata_identity_file(
@@ -465,8 +610,7 @@ def _init_metadata(args: argparse.Namespace) -> int:
             force=False,
         )
         identity_created = True
-
-    _apply_service_file_permissions(identity_path, mode=0o640)
+        _apply_service_file_permissions(identity_path, mode=0o640)
 
     if cfg.metadata.owner_id and cfg.metadata.owner_id != identity.owner_id:
         raise StopanUsageError(

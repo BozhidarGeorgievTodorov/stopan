@@ -7,6 +7,7 @@ referencia, orden estable, estados permitidos y contadores agregados.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -70,6 +71,8 @@ def _require_number(name: str, value: object, *, min_value: float | None = None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MetadataObjectError(f"{name} debe ser numérico. Recibido {type(value).__name__}")
     number = float(value)
+    if not math.isfinite(number):
+        raise MetadataObjectError(f"{name} debe ser finito. Recibido {value}")
     if min_value is not None and number < min_value:
         raise MetadataObjectError(f"{name} debe ser >= {min_value}. Recibido {value}")
     return number

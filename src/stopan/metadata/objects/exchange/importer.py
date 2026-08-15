@@ -17,6 +17,14 @@ from stopan.metadata.database import (
     MetadataDBTransactionMode,
 )
 from stopan.metadata.objects.codec import canonical_state_digest
+from stopan.metadata.objects.graph.validation import (
+    GraphObjectPayload,
+    validate_metadata_object_graph_semantics,
+)
+from stopan.metadata.objects.graph.walk import (
+    collect_reachable_object_bytes,
+    decode_object_envelope,
+)
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.metadata.objects.store import MetadataObjectStore
 
@@ -90,6 +98,7 @@ class MetadataObjectGraphImporter:
 
     def import_latest(self, *, include_protection: bool = True) -> MetadataObjectGraphImportResult:
         latest = self.store.read_latest_pointer()
+        self._validate_latest_graph_semantics(latest)
         catalog = self.reader.payload(latest.catalog_hash, MetadataObjectType.CATALOG)
         catalog_vault_id = _require_vault_id("catalog.vault_id", catalog.get("vault_id"))
         if catalog_vault_id != latest.vault_id:
@@ -173,6 +182,60 @@ class MetadataObjectGraphImporter:
                 erasure_pack_shards_imported=erasure_shards_inserted,
             ),
         )
+
+    def _validate_latest_graph_semantics(self, latest) -> None:
+        """Valida el grafo completo antes de abrir la transacción de reconstrucción."""
+
+        try:
+            objects = collect_reachable_object_bytes(
+                catalog_hash=latest.catalog_hash,
+                read_object_bytes=lambda object_hash: self.store.get_object_bytes(
+                    object_hash=object_hash,
+                ),
+            )
+            object_hashes = tuple(objects)
+            digest = canonical_state_digest(latest.catalog_hash, object_hashes)
+            if digest != latest.state_digest:
+                raise MetadataObjectImportError(
+                    "state_digest no coincide antes de reconstruir SQLite: "
+                    f"esperado={latest.state_digest} calculado={digest}"
+                )
+            if len(objects) != latest.object_count:
+                raise MetadataObjectImportError(
+                    "object_count no coincide antes de reconstruir SQLite: "
+                    f"latest={latest.object_count} alcanzables={len(objects)}"
+                )
+            total_bytes = sum(len(canonical) for canonical in objects.values())
+            if total_bytes != latest.total_canonical_bytes:
+                raise MetadataObjectImportError(
+                    "canonical_bytes no coincide antes de reconstruir SQLite: "
+                    f"latest={latest.total_canonical_bytes} alcanzables={total_bytes}"
+                )
+
+            payloads: dict[str, GraphObjectPayload] = {}
+            for object_hash, canonical in objects.items():
+                object_type, payload = decode_object_envelope(
+                    canonical,
+                    expected_hash=object_hash,
+                )
+                payloads[object_hash] = GraphObjectPayload(
+                    object_type=object_type,
+                    payload=payload,
+                )
+
+            validate_metadata_object_graph_semantics(
+                catalog_hash=latest.catalog_hash,
+                objects_by_hash=payloads,
+                expected_snapshot_count=latest.snapshot_count,
+                expected_known_chunk_count=latest.known_chunk_count,
+                expected_protection_record_count=latest.protection_record_count,
+            )
+        except MetadataObjectImportError:
+            raise
+        except Exception as exc:
+            raise MetadataObjectImportError(
+                f"grafo de metadata no es semánticamente recuperable: {exc}"
+            ) from exc
 
     def _verify_latest_digest(
         self,

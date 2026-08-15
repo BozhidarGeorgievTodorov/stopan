@@ -111,6 +111,12 @@ class ErasureDataPackVerificationUpdate:
 
 
 @dataclass(frozen=True)
+class ErasureDataPackPushErrorUpdate:
+    pack_hash: str
+    error: str
+
+
+@dataclass(frozen=True)
 class ErasureDataPackPushUpdate:
     pack_hash: str
     codec: str
@@ -1385,6 +1391,57 @@ class MetadataDB:
             for update in normalized:
                 self._apply_erasure_data_pack_push_update(update)
         return len(normalized)
+
+    def apply_erasure_data_pack_push_errors(
+        self,
+        updates: Iterable[ErasureDataPackPushErrorUpdate],
+    ) -> int:
+        """Registra fallos locales de reintentos EC sin alterar la evidencia remota."""
+        normalized = list(updates)
+        if not normalized:
+            return 0
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for update in normalized:
+                self._apply_erasure_data_pack_push_error(update)
+        return len(normalized)
+
+    def apply_erasure_data_pack_push_result_batch(
+        self,
+        push_updates: Iterable[ErasureDataPackPushUpdate],
+        error_updates: Iterable[ErasureDataPackPushErrorUpdate],
+    ) -> int:
+        """Consolida resultados y fallos locales EC en una única transacción."""
+        normalized_push = list(push_updates)
+        normalized_errors = list(error_updates)
+        if not normalized_push and not normalized_errors:
+            return 0
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for update in normalized_push:
+                self._apply_erasure_data_pack_push_update(update)
+            for update in normalized_errors:
+                self._apply_erasure_data_pack_push_error(update)
+        return len(normalized_push) + len(normalized_errors)
+
+    def _apply_erasure_data_pack_push_error(
+        self,
+        update: ErasureDataPackPushErrorUpdate,
+    ) -> None:
+        pack_hash = _require_hash64("pack_hash", update.pack_hash)
+        error = _require_non_empty_text("error", update.error)
+        cursor = self.conn.execute(
+            """
+            UPDATE erasure_data_packs
+            SET last_error = ?
+            WHERE pack_hash = ?
+            """,
+            (error[:1800], pack_hash),
+        )
+        if cursor.rowcount != 1:
+            raise MetadataDatabaseError(
+                f"erasure data pack no registrado: {pack_hash}"
+            )
 
     def _apply_erasure_data_pack_push_update(
         self,

@@ -146,7 +146,11 @@ class ErasureDataPackVerifier:
         for pack in candidates:
             shard_rows = shard_rows_by_pack.get(pack.pack_hash, [])
             total_shards = pack.data_shards + pack.parity_shards
-            metadata_complete = len(shard_rows) >= total_shards
+            metadata_error = _erasure_shard_metadata_error(
+                shard_rows=shard_rows,
+                total_shards=total_shards,
+            )
+            metadata_complete = metadata_error is None
             accumulator = _PackVerificationAccumulator(
                 pack=pack,
                 total_shards=total_shards,
@@ -156,15 +160,8 @@ class ErasureDataPackVerifier:
             )
             accumulators[pack.pack_hash] = accumulator
 
-            if not metadata_complete:
-                accumulator.verified_shard_indexes.update(
-                    row.shard_index for row in shard_rows
-                )
-                accumulator.errors.append(
-                    "metadata EC incompleta: "
-                    f"registered_shards={len(shard_rows)} "
-                    f"total_shards={total_shards}"
-                )
+            if metadata_error is not None:
+                accumulator.errors.append(metadata_error)
                 continue
 
             target_groups = group_erasure_shard_refs_by_address(
@@ -322,6 +319,22 @@ class ErasureDataPackVerifier:
             completed_keys=frozenset(completed_keys),
             missing_keys=frozenset(missing_keys),
         )
+
+
+def _erasure_shard_metadata_error(*, shard_rows, total_shards: int) -> str | None:
+    indexes = sorted(int(row.shard_index) for row in shard_rows)
+    expected_indexes = list(range(total_shards))
+    if indexes != expected_indexes:
+        return (
+            "metadata EC incoherente: "
+            f"shard_indexes={indexes} expected={expected_indexes}"
+        )
+
+    node_ids = [str(row.node_id) for row in shard_rows]
+    if len(node_ids) != len(set(node_ids)):
+        return "metadata EC incoherente: los shards deben estar asignados a nodos distintos"
+
+    return None
 
 
 @dataclass(frozen=True)

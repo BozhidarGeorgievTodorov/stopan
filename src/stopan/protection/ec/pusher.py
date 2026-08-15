@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stopan.cas.repository import CASRepository
+from stopan.cas.repository import CASRepository, CASRepositoryError
 from stopan.metadata.database import (
+    ErasureDataPackPushErrorUpdate,
     ErasureDataPackPushUpdate,
     ErasureDataPackRecord,
     MetadataDB,
@@ -91,13 +92,18 @@ def push_erasure_data_packs_to_network(
     pool: RemoteDataPackShardClientPool | None = None
     metadata_changed = False
     pending_updates: list[ErasureDataPackPushUpdate] = []
+    pending_error_updates: list[ErasureDataPackPushErrorUpdate] = []
 
     def flush_push_updates() -> None:
         nonlocal metadata_changed
-        if not pending_updates:
+        if not pending_updates and not pending_error_updates:
             return
-        db.apply_erasure_data_pack_push_updates(pending_updates)
+        db.apply_erasure_data_pack_push_result_batch(
+            pending_updates,
+            pending_error_updates,
+        )
         pending_updates.clear()
+        pending_error_updates.clear()
         metadata_changed = True
 
     try:
@@ -156,20 +162,24 @@ def push_erasure_data_packs_to_network(
         print(f"Remote candidates: {remote_candidate_count}")
         print(f"new_pack_placement_epoch={new_pack_placement_epoch[:12]}")
 
-        can_create_new_packs = remote_candidate_count >= spec.total_shards
-        insufficient_for_new_packs = bool(pending_chunks) and not can_create_new_packs
-        if insufficient_for_new_packs:
-            print("No se crearán data packs EC nuevos: no hay suficientes nodos remotos elegibles.")
+        required_remote_targets = max(
+            [
+                *(pack.data_shards + pack.parity_shards for pack in retry_packs),
+                *([spec.total_shards] if pending_chunks else []),
+            ],
+            default=0,
+        )
+        if remote_candidate_count < required_remote_targets:
+            print("Push EC no iniciado: no hay suficientes nodos remotos elegibles.")
             print(
-                f"   necesarios={spec.total_shards} disponibles={remote_candidate_count} "
-                f"ec_k={spec.data_shards} ec_m={spec.parity_shards}"
+                f"   necesarios={required_remote_targets} "
+                f"disponibles={remote_candidate_count}"
             )
-            if not retry_packs:
-                return ErasurePushStats(
-                    insufficient_remote_targets=True,
-                    remote_candidates=remote_candidate_count,
-                    required_remote_targets=spec.total_shards,
-                )
+            return ErasurePushStats(
+                insufficient_remote_targets=True,
+                remote_candidates=remote_candidate_count,
+                required_remote_targets=required_remote_targets,
+            )
 
         pool = RemoteDataPackShardClientPool(
             cluster_token=cluster_token,
@@ -178,19 +188,18 @@ def push_erasure_data_packs_to_network(
         )
         builder = (
             DataPackBuilder(spec=spec, target_size_bytes=pack_size)
-            if can_create_new_packs
+            if pending_chunks
             else None
         )
 
         stats = _MutableErasurePushStats(
-            attempted_chunks=len(pending_chunks) if can_create_new_packs else 0,
+            attempted_chunks=len(pending_chunks),
             remote_candidates=remote_candidate_count,
-            required_remote_targets=spec.total_shards,
-            insufficient_remote_targets=insufficient_for_new_packs,
+            required_remote_targets=required_remote_targets,
         )
 
         for record in retry_packs:
-            pack_chunk_count, push_update = _retry_existing_pack(
+            pack_chunk_count, retry_update = _retry_existing_pack(
                 record=record,
                 db=db,
                 repo=repo,
@@ -198,14 +207,15 @@ def push_erasure_data_packs_to_network(
                 cluster=cluster,
                 origin_node_id=origin_node_id,
                 cluster_token=cluster_token,
-                remote_candidate_count=remote_candidate_count,
                 stats=stats,
             )
             stats.attempted_chunks += pack_chunk_count
-            if push_update is not None:
-                pending_updates.append(push_update)
-                if len(pending_updates) >= commit_every:
-                    flush_push_updates()
+            if isinstance(retry_update, ErasureDataPackPushErrorUpdate):
+                pending_error_updates.append(retry_update)
+            elif retry_update is not None:
+                pending_updates.append(retry_update)
+            if len(pending_updates) + len(pending_error_updates) >= commit_every:
+                flush_push_updates()
 
         if builder is not None:
             for chunk_hash in pending_chunks:
@@ -213,6 +223,9 @@ def push_erasure_data_packs_to_network(
                     data = repo.get(chunk_hash)
                 except FileNotFoundError:
                     stats.missing_local_chunks += 1
+                    stats.failed_chunks += 1
+                    continue
+                except CASRepositoryError:
                     stats.failed_chunks += 1
                     continue
 
@@ -326,20 +339,21 @@ def _retry_existing_pack(
     cluster,
     origin_node_id: str,
     cluster_token: str,
-    remote_candidate_count: int,
     stats: "_MutableErasurePushStats",
-) -> tuple[int, ErasureDataPackPushUpdate | None]:
+) -> tuple[int, ErasureDataPackPushUpdate | ErasureDataPackPushErrorUpdate | None]:
     chunks = db.get_erasure_pack_chunks(record.pack_hash)
     chunk_count = len(chunks)
     if not chunks:
-        return 0, None
+        stats.failed_packs += 1
+        return (
+            0,
+            _pack_push_error(
+                record.pack_hash,
+                "reintento EC imposible: el paquete no tiene chunks registrados",
+            ),
+        )
 
     record_spec = spec_from_erasure_metadata(record)
-    if remote_candidate_count < record_spec.total_shards:
-        stats.failed_packs += 1
-        stats.failed_chunks += chunk_count
-        return chunk_count, None
-
     record_placement_epoch = cluster.placement_epoch_excluding(
         desired_rf=record_spec.total_shards,
         cluster_token=cluster_token,
@@ -347,20 +361,27 @@ def _retry_existing_pack(
     )
 
     materialized_chunks: list[tuple[str, bytes]] = []
-    missing_local = False
+    local_errors: list[str] = []
     for chunk in chunks:
         try:
             data = repo.get(chunk.chunk_hash)
         except FileNotFoundError:
             stats.missing_local_chunks += 1
             stats.failed_chunks += 1
-            missing_local = True
+            local_errors.append(f"chunk local ausente: {chunk.chunk_hash}")
+            continue
+        except CASRepositoryError as exc:
+            stats.failed_chunks += 1
+            local_errors.append(f"chunk local ilegible {chunk.chunk_hash}: {exc}")
             continue
         materialized_chunks.append((chunk.chunk_hash, data))
 
-    if missing_local:
+    if local_errors:
         stats.failed_packs += 1
-        return chunk_count, None
+        return (
+            chunk_count,
+            _pack_push_error(record.pack_hash, "; ".join(local_errors)),
+        )
 
     try:
         pack = _build_data_pack_from_validated_chunks(
@@ -370,12 +391,24 @@ def _retry_existing_pack(
     except ErasureCodingError as exc:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        return chunk_count, None
+        return (
+            chunk_count,
+            _pack_push_error(
+                record.pack_hash,
+                f"reintento EC: no se pudo reconstruir el paquete: {exc}",
+            ),
+        )
 
     if pack.pack_hash != record.pack_hash:
         stats.failed_packs += 1
         stats.failed_chunks += chunk_count
-        return chunk_count, None
+        return (
+            chunk_count,
+            _pack_push_error(
+                record.pack_hash,
+                "reintento EC: la reconstrucción no coincide con el pack_hash registrado",
+            ),
+        )
 
     stats.packed_chunks += len(pack.entries)
     stats.processed_bytes += sum(len(data) for _, data in materialized_chunks)
@@ -391,6 +424,13 @@ def _retry_existing_pack(
         refresh_existing=True,
     )
     return chunk_count, push_update
+
+
+def _pack_push_error(pack_hash: str, error: str) -> ErasureDataPackPushErrorUpdate:
+    return ErasureDataPackPushErrorUpdate(
+        pack_hash=pack_hash,
+        error=str(error)[:1800],
+    )
 
 
 def _push_pack(

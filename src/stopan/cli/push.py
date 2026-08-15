@@ -204,8 +204,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if getattr(stats, "insufficient_remote_targets", False):
             print(
-                "Push EC incompleto: no se pudieron crear data packs nuevos con la "
-                "configuración EC actual. "
+                "Push EC no iniciado: no hay suficientes nodos remotos elegibles para "
+                "todos los paquetes seleccionados. "
                 f"required_remote_targets={stats.required_remote_targets} "
                 f"remote_candidates={stats.remote_candidates}"
             )

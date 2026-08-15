@@ -5,6 +5,7 @@ import errno
 import grp
 import os
 import pwd
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path

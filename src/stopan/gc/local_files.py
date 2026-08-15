@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-import stat
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from stopan.common.fs import fsync_dir
 from stopan.gc.models import LocalFileGarbageCollectionResult
+from stopan.gc.path_safety import (
+    GarbageCollectionPathError,
+    same_file_identity,
+    validate_gc_regular_file,
+)
 
 PathPredicate = Callable[[Path], bool]
+PathReporter = Callable[[Path], None]
 
 
 def collect_files_by_age(
@@ -20,6 +25,7 @@ def collect_files_by_age(
     dry_run: bool,
     retain_file: PathPredicate | None = None,
     sort_files: bool = True,
+    candidate_reporter: PathReporter | None = None,
 ) -> LocalFileGarbageCollectionResult:
     root = Path(root_dir).expanduser().resolve()
     max_age = None if max_age_seconds is None else max(int(max_age_seconds), 0)
@@ -59,13 +65,11 @@ def collect_files_by_age(
     file_iterable = sorted(files) if sort_files else files
     for path in file_iterable:
         try:
-            stat_result = path.stat()
-        except OSError as exc:
-            errors.append(f"stat falló {path}: {exc}")
+            stat_result = validate_gc_regular_file(root_dir=root, path=path)
+        except GarbageCollectionPathError as exc:
+            errors.append(str(exc))
             continue
 
-        if not stat.S_ISREG(stat_result.st_mode):
-            continue
         files_seen += 1
 
         if not enabled:
@@ -81,16 +85,22 @@ def collect_files_by_age(
 
         files_collectable += 1
         bytes_collectable += stat_result.st_size
+        if candidate_reporter is not None:
+            candidate_reporter(Path(path))
         if dry_run:
             continue
 
         try:
-            size = stat_result.st_size
+            current_stat = validate_gc_regular_file(root_dir=root, path=path)
+            if not same_file_identity(stat_result, current_stat):
+                errors.append(f"candidato cambió antes del borrado, omitido {path}")
+                continue
+            size = current_stat.st_size
             path.unlink()
             files_deleted += 1
             bytes_deleted += size
             touched_dirs.add(path.parent)
-        except OSError as exc:
+        except (OSError, GarbageCollectionPathError) as exc:
             errors.append(f"borrado falló {path}: {exc}")
 
     _fsync_touched_dirs(touched_dirs, errors)
@@ -115,6 +125,6 @@ def collect_files_by_age(
 def _fsync_touched_dirs(touched_dirs: set[Path], errors: list[str]) -> None:
     for directory in sorted(touched_dirs):
         try:
-            fsync_dir(directory)
+            fsync_dir(directory, strict=True)
         except OSError as exc:
             errors.append(f"fsync de directorio falló {directory}: {exc}")

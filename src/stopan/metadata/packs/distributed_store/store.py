@@ -8,12 +8,21 @@ cuotas locales por owner, tamaño total y antigüedad.
 from __future__ import annotations
 
 import os
+import logging
+import stat
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from stopan.common.fs import atomic_copy_file, atomic_write_bytes, ensure_private_dir, fsync_dir
+from stopan.common.hashes import is_valid_blake3_hex
 from stopan.errors import StopanConfigValueError
+from stopan.gc.path_safety import (
+    GarbageCollectionPathError,
+    is_filesystem_redirection,
+    validate_gc_regular_file,
+)
 from stopan.metadata.identity import validate_owner_id, verify_metadata_pack_signature
 from stopan.metadata.packs.format import OBJECT_PACK_FILE_SUFFIX
 from stopan.metadata.packs.hashes import calculate_pack_hash, calculate_pack_hash_file, validate_pack_hash
@@ -37,6 +46,8 @@ from .signatures import (
 
 
 _SECONDS_PER_DAY = 86_400
+_LOGGER = logging.getLogger(__name__)
+PathReporter = Callable[[Path], None]
 
 
 class MetadataPackStore:
@@ -112,35 +123,122 @@ class MetadataPackStore:
             pack_hash=pack_hash,
         )
 
-    def _pack_records_for_owner_unlocked(self, *, owner_id: str) -> list[StoredMetadataPackRecord]:
+    def _pack_records_for_owner_unlocked(
+        self,
+        *,
+        owner_id: str,
+        errors: list[str] | None = None,
+    ) -> list[StoredMetadataPackRecord]:
         owner = validate_owner_id(owner_id)
-        owner_dir = self.root_dir / owner[:2] / owner
-        if not owner_dir.exists():
-            return []
-
         records: list[StoredMetadataPackRecord] = []
-        for path in sorted(owner_dir.glob(f"*/*{OBJECT_PACK_FILE_SUFFIX}")):
-            record = self._record_from_path_unlocked(path)
+        for path in self._iter_pack_paths_unlocked(owner_id=owner):
+            record = self._record_from_path_unlocked(path, errors=errors)
             if record is not None and record.owner_id == owner:
                 records.append(record)
         return records
 
-    def _all_pack_records_unlocked(self) -> list[StoredMetadataPackRecord]:
-        if not self.root_dir.exists():
-            return []
-
+    def _all_pack_records_unlocked(
+        self,
+        *,
+        errors: list[str] | None = None,
+    ) -> list[StoredMetadataPackRecord]:
         records: list[StoredMetadataPackRecord] = []
-        for path in sorted(self.root_dir.glob(f"*/*/*/*{OBJECT_PACK_FILE_SUFFIX}")):
-            record = self._record_from_path_unlocked(path)
+        for path in self._iter_pack_paths_unlocked():
+            record = self._record_from_path_unlocked(path, errors=errors)
             if record is not None:
                 records.append(record)
         return records
 
-    def _record_from_path_unlocked(self, path: Path) -> StoredMetadataPackRecord | None:
+    def _iter_pack_paths_unlocked(self, *, owner_id: str | None = None):
+        if not self.root_dir.exists() or not self.root_dir.is_dir():
+            return
+
+        if owner_id is not None:
+            owner = validate_owner_id(owner_id)
+            owner_prefix_dir = self.root_dir / owner[:2]
+            owner_dir = owner_prefix_dir / owner
+            try:
+                owner_prefix_stat = owner_prefix_dir.lstat()
+                owner_stat = owner_dir.lstat()
+            except FileNotFoundError:
+                return
+            except OSError:
+                return
+            if (
+                is_filesystem_redirection(owner_prefix_stat)
+                or not stat.S_ISDIR(owner_prefix_stat.st_mode)
+                or is_filesystem_redirection(owner_stat)
+                or not stat.S_ISDIR(owner_stat.st_mode)
+            ):
+                return
+            yield from self._iter_owner_pack_paths_unlocked(owner_dir=owner_dir, owner=owner)
+            return
+
+        for owner_prefix_dir in sorted(self.root_dir.iterdir()):
+            try:
+                owner_prefix_stat = owner_prefix_dir.lstat()
+            except OSError:
+                continue
+            if (
+                is_filesystem_redirection(owner_prefix_stat)
+                or not stat.S_ISDIR(owner_prefix_stat.st_mode)
+                or len(owner_prefix_dir.name) != 2
+            ):
+                continue
+
+            for owner_dir in sorted(owner_prefix_dir.iterdir()):
+                try:
+                    owner_stat = owner_dir.lstat()
+                except OSError:
+                    continue
+                if is_filesystem_redirection(owner_stat) or not stat.S_ISDIR(owner_stat.st_mode):
+                    continue
+                if not is_valid_blake3_hex(owner_dir.name):
+                    continue
+                owner = owner_dir.name
+                if owner_prefix_dir.name != owner[:2]:
+                    continue
+                yield from self._iter_owner_pack_paths_unlocked(owner_dir=owner_dir, owner=owner)
+
+    def _iter_owner_pack_paths_unlocked(self, *, owner_dir: Path, owner: str):
+        for pack_prefix_dir in sorted(owner_dir.iterdir()):
+            try:
+                pack_prefix_stat = pack_prefix_dir.lstat()
+            except OSError:
+                continue
+            if (
+                is_filesystem_redirection(pack_prefix_stat)
+                or not stat.S_ISDIR(pack_prefix_stat.st_mode)
+                or len(pack_prefix_dir.name) != 2
+            ):
+                continue
+
+            for path in sorted(pack_prefix_dir.iterdir()):
+                if not path.name.endswith(OBJECT_PACK_FILE_SUFFIX):
+                    continue
+                pack_hash = path.name.removesuffix(OBJECT_PACK_FILE_SUFFIX)
+                if not is_valid_blake3_hex(pack_hash):
+                    continue
+                if pack_prefix_dir.name != pack_hash[:2]:
+                    continue
+                # ``owner`` forma parte del contrato de este nivel del layout.
+                if owner_dir.name != owner:
+                    continue
+                yield path
+
+    def _record_from_path_unlocked(
+        self,
+        path: Path,
+        *,
+        errors: list[str] | None = None,
+    ) -> StoredMetadataPackRecord | None:
         try:
             pack_hash = validate_pack_hash(path.name.removesuffix(OBJECT_PACK_FILE_SUFFIX))
             owner_id = validate_owner_id(path.parent.parent.name)
-            st = path.stat()
+            expected_path = self.pack_path(owner_id=owner_id, pack_hash=pack_hash)
+            if path != expected_path:
+                return None
+            st = validate_gc_regular_file(root_dir=self.root_dir, path=path)
             calculated = calculate_pack_hash_file(path)
             if calculated != pack_hash:
                 return None
@@ -154,30 +252,61 @@ class MetadataPackStore:
                 public_key_b64=public_key_b64,
                 signature_b64=signature_b64,
             )
-        except (OSError, TypeError, ValueError):
+        except (OSError, GarbageCollectionPathError, TypeError, ValueError) as exc:
+            if errors is not None:
+                errors.append(f"metadata pack omitido {path}: {exc}")
             return None
 
-    def _delete_record_unlocked(self, record: StoredMetadataPackRecord) -> int:
+    def _delete_record_unlocked(
+        self,
+        record: StoredMetadataPackRecord,
+        *,
+        errors: list[str] | None = None,
+    ) -> int:
         try:
-            deleted_bytes = int(record.path.stat().st_size)
-        except OSError:
-            deleted_bytes = int(record.size_bytes)
+            stat_result = validate_gc_regular_file(root_dir=self.root_dir, path=record.path)
+            deleted_bytes = int(stat_result.st_size)
+            record.path.unlink()
+        except FileNotFoundError:
+            return 0
+        except (OSError, GarbageCollectionPathError) as exc:
+            raise MetadataPackStoreError(
+                f"no se pudo borrar metadata pack {record.path}: {exc}"
+            ) from exc
 
-        for path in (
-            self.signature_path(owner_id=record.owner_id, pack_hash=record.pack_hash),
-            record.path,
-        ):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-
+        signature_path = self.signature_path(
+            owner_id=record.owner_id,
+            pack_hash=record.pack_hash,
+        )
         try:
-            fsync_dir(record.path.parent)
-        except OSError:
+            signature_path.lstat()
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            message = f"no se pudo comprobar la firma de metadata pack {signature_path}: {exc}"
+            if errors is not None:
+                errors.append(message)
+            else:
+                _LOGGER.warning(message)
+        else:
+            try:
+                validate_gc_regular_file(root_dir=self.root_dir, path=signature_path)
+                signature_path.unlink()
+            except (OSError, GarbageCollectionPathError) as exc:
+                message = f"no se pudo borrar la firma de metadata pack {signature_path}: {exc}"
+                if errors is not None:
+                    errors.append(message)
+                else:
+                    _LOGGER.warning(message)
+
+        try:
+            fsync_dir(record.path.parent, strict=True)
+        except OSError as exc:
+            message = f"fsync de directorio falló {record.path.parent}: {exc}"
+            if errors is not None:
+                errors.append(message)
+            else:
+                _LOGGER.warning(message)
         return deleted_bytes
 
     def _prune_records_unlocked(
@@ -188,6 +317,8 @@ class MetadataPackStore:
         count_needed: int = 0,
         protected_pack_hash: str,
         dry_run: bool = False,
+        errors: list[str] | None = None,
+        candidate_reporter: PathReporter | None = None,
     ) -> tuple[int, int]:
         pruned_count = 0
         pruned_bytes = 0
@@ -201,7 +332,20 @@ class MetadataPackStore:
         for record in ordered:
             if remaining_bytes <= 0 and remaining_count <= 0:
                 break
-            deleted = int(record.size_bytes) if dry_run else self._delete_record_unlocked(record)
+            if candidate_reporter is not None:
+                candidate_reporter(record.path)
+            if dry_run:
+                deleted = int(record.size_bytes)
+            else:
+                try:
+                    deleted = self._delete_record_unlocked(record, errors=errors)
+                except MetadataPackStoreError as exc:
+                    if errors is None:
+                        raise
+                    errors.append(str(exc))
+                    continue
+                if deleted <= 0:
+                    continue
             pruned_count += 1
             pruned_bytes += deleted
             remaining_bytes = max(0, remaining_bytes - deleted)
@@ -221,6 +365,8 @@ class MetadataPackStore:
         protected_pack_hash: str = "",
         dry_run: bool = False,
         now_unix: float | None = None,
+        errors: list[str] | None = None,
+        candidate_reporter: PathReporter | None = None,
     ) -> tuple[int, int, float | None]:
         if self.max_age_days <= 0:
             return 0, 0, None
@@ -239,7 +385,20 @@ class MetadataPackStore:
         pruned_count = 0
         pruned_bytes = 0
         for record in expired:
-            deleted = int(record.size_bytes) if dry_run else self._delete_record_unlocked(record)
+            if candidate_reporter is not None:
+                candidate_reporter(record.path)
+            if dry_run:
+                deleted = int(record.size_bytes)
+            else:
+                try:
+                    deleted = self._delete_record_unlocked(record, errors=errors)
+                except MetadataPackStoreError as exc:
+                    if errors is None:
+                        raise
+                    errors.append(str(exc))
+                    continue
+                if deleted <= 0:
+                    continue
             pruned_count += 1
             pruned_bytes += deleted
 
@@ -319,9 +478,15 @@ class MetadataPackStore:
 
         return pruned_count, pruned_bytes
 
-    def prune_to_limits(self, *, dry_run: bool = False) -> PruneMetadataPackStoreResult:
+    def prune_to_limits(
+        self,
+        *,
+        dry_run: bool = False,
+        candidate_reporter: PathReporter | None = None,
+    ) -> PruneMetadataPackStoreResult:
         with self._lock:
-            initial_records = self._all_pack_records_unlocked()
+            errors: list[str] = []
+            initial_records = self._all_pack_records_unlocked(errors=errors)
             owners_seen = len({record.owner_id for record in initial_records})
             pruned_count = 0
             pruned_bytes = 0
@@ -329,13 +494,19 @@ class MetadataPackStore:
             expired_count, expired_bytes, cutoff = self._prune_expired_records_unlocked(
                 records=initial_records,
                 dry_run=bool(dry_run),
+                errors=errors,
+                candidate_reporter=candidate_reporter,
             )
             pruned_count += expired_count
             pruned_bytes += expired_bytes
 
             quota_pruned_count = 0
             quota_pruned_bytes = 0
-            records_after_expiry = initial_records if dry_run else self._all_pack_records_unlocked()
+            records_after_expiry = (
+                initial_records
+                if dry_run
+                else self._all_pack_records_unlocked(errors=errors)
+            )
             if dry_run and self.max_age_days > 0 and cutoff is not None:
                 records_after_expiry = [record for record in initial_records if record.stored_at_unix >= cutoff]
 
@@ -352,6 +523,8 @@ class MetadataPackStore:
                         count_needed=owner_count_excess,
                         protected_pack_hash="",
                         dry_run=bool(dry_run),
+                        errors=errors,
+                        candidate_reporter=candidate_reporter,
                     )
                     quota_pruned_count += count
                     quota_pruned_bytes += bytes_deleted
@@ -372,7 +545,11 @@ class MetadataPackStore:
                             if (record.owner_id, record.pack_hash) not in deleted_keys
                         ]
 
-            global_records = records_after_expiry if dry_run else self._all_pack_records_unlocked()
+            global_records = (
+                records_after_expiry
+                if dry_run
+                else self._all_pack_records_unlocked(errors=errors)
+            )
             global_bytes_excess = max(0, sum(record.size_bytes for record in global_records) - self.max_total_store_bytes)
             if global_bytes_excess:
                 count, bytes_deleted = self._prune_records_unlocked(
@@ -380,6 +557,8 @@ class MetadataPackStore:
                     bytes_needed=global_bytes_excess,
                     protected_pack_hash="",
                     dry_run=bool(dry_run),
+                    errors=errors,
+                    candidate_reporter=candidate_reporter,
                 )
                 quota_pruned_count += count
                 quota_pruned_bytes += bytes_deleted
@@ -397,6 +576,7 @@ class MetadataPackStore:
                 quota_packs=quota_pruned_count,
                 pruned_packs=pruned_count,
                 pruned_bytes=pruned_bytes,
+                errors=tuple(errors),
             )
 
     def put_pack_bytes(

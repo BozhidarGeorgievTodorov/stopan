@@ -4,7 +4,7 @@ Modelos del almacén local de metadata packs distribuidos.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from stopan.errors import StopanDataError, StopanStorageError
@@ -67,3 +67,4 @@ class PruneMetadataPackStoreResult:
     quota_packs: int
     pruned_packs: int
     pruned_bytes: int
+    errors: tuple[str, ...] = field(default_factory=tuple)

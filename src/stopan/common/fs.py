@@ -8,10 +8,12 @@ from pathlib import Path
 from stopan.errors import StopanStorageOSError
 
 
-def fsync_dir(path: Path) -> None:
+def fsync_dir(path: Path, *, strict: bool = False) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(fd)

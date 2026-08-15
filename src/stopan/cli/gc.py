@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,14 +299,16 @@ def _cmd_generated_chunks(args: argparse.Namespace) -> int:
     finally:
         db.close()
 
-    result = collect_cas_chunks(
-        target=args.command,
-        root_dir=args.chunk_store or cfg.storage.local_chunk_dir,
-        max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_chunk_grace_hours)) * _SECONDS_PER_HOUR),
-        dry_run=bool(args.dry_run),
-        reachable_hashes=reachable_hashes,
-    )
-    _print_local_file_result(result)
+    with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
+        result = collect_cas_chunks(
+            target=args.command,
+            root_dir=args.chunk_store or cfg.storage.local_chunk_dir,
+            max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_chunk_grace_hours)) * _SECONDS_PER_HOUR),
+            dry_run=bool(args.dry_run),
+            reachable_hashes=reachable_hashes,
+            candidate_reporter=candidates.report,
+        )
+        _print_local_file_result(result, candidates=candidates)
     return 0
 
 
@@ -314,13 +317,15 @@ def _cmd_received_chunks(args: argparse.Namespace) -> int:
 
     cfg = load_runtime_config(args)
     max_age_days = int(choose(args.max_age_days, cfg.gc.received_chunk_max_age_days))
-    result = collect_cas_chunks(
-        target=args.command,
-        root_dir=args.chunk_store or (Path(cfg.storage.custody_dir) / "chunks"),
-        max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
-        dry_run=bool(args.dry_run),
-    )
-    _print_local_file_result(result)
+    with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
+        result = collect_cas_chunks(
+            target=args.command,
+            root_dir=args.chunk_store or (Path(cfg.storage.custody_dir) / "chunks"),
+            max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
+            dry_run=bool(args.dry_run),
+            candidate_reporter=candidates.report,
+        )
+        _print_local_file_result(result, candidates=candidates)
     return 0
 
 
@@ -329,13 +334,15 @@ def _cmd_received_ec(args: argparse.Namespace) -> int:
 
     cfg = load_runtime_config(args)
     max_age_days = int(choose(args.max_age_days, cfg.gc.received_ec_max_age_days))
-    result = collect_ec_shards(
-        target=args.command,
-        root_dir=args.ec_store or (Path(cfg.storage.custody_dir) / "ec_shards"),
-        max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
-        dry_run=bool(args.dry_run),
-    )
-    _print_local_file_result(result)
+    with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
+        result = collect_ec_shards(
+            target=args.command,
+            root_dir=args.ec_store or (Path(cfg.storage.custody_dir) / "ec_shards"),
+            max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
+            dry_run=bool(args.dry_run),
+            candidate_reporter=candidates.report,
+        )
+        _print_local_file_result(result, candidates=candidates)
     return 0
 
 
@@ -372,18 +379,20 @@ def _cmd_metadata_object_store(args: argparse.Namespace) -> int:
     )
 
     collector = MetadataObjectGarbageCollector(scrypt_cost=scrypt_cost_from_config(cfg))
-    result = collector.collect(
-        object_store_dir=object_store_root,
-        identity_file=identity_file,
-        passphrase=passphrase_for_decrypt(args, cfg),
-        object_grace_seconds=int(max(object_grace_hours, 0.0) * _SECONDS_PER_HOUR),
-        pack_grace_seconds=int(max(pack_grace_hours, 0.0) * _SECONDS_PER_HOUR),
-        dry_run=bool(args.dry_run),
-        include_objects=include_objects,
-        include_packs=include_packs,
-        pack_dir=pack_dir,
-    )
-    _print_metadata_object_gc_result(args.command, result)
+    with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
+        result = collector.collect(
+            object_store_dir=object_store_root,
+            identity_file=identity_file,
+            passphrase=passphrase_for_decrypt(args, cfg),
+            object_grace_seconds=int(max(object_grace_hours, 0.0) * _SECONDS_PER_HOUR),
+            pack_grace_seconds=int(max(pack_grace_hours, 0.0) * _SECONDS_PER_HOUR),
+            dry_run=bool(args.dry_run),
+            include_objects=include_objects,
+            include_packs=include_packs,
+            pack_dir=pack_dir,
+            candidate_reporter=candidates.report,
+        )
+        _print_metadata_object_gc_result(args.command, result, candidates=candidates)
     return 0
 
 
@@ -391,13 +400,15 @@ def _cmd_received_metadata_packs(args: argparse.Namespace) -> int:
     from stopan.metadata.packs.gc import collect_received_metadata_packs
 
     cfg = load_runtime_config(args)
-    result = collect_received_metadata_packs(
-        cfg=cfg,
-        pack_store=args.pack_store,
-        max_age_days=args.max_age_days,
-        dry_run=bool(args.dry_run),
-    )
-    _print_received_metadata_pack_result(result, cfg=cfg)
+    with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
+        result = collect_received_metadata_packs(
+            cfg=cfg,
+            pack_store=args.pack_store,
+            max_age_days=args.max_age_days,
+            dry_run=bool(args.dry_run),
+            candidate_reporter=candidates.report,
+        )
+        _print_received_metadata_pack_result(result, cfg=cfg, candidates=candidates)
     return 0
 
 
@@ -405,14 +416,16 @@ def _cmd_recovered_metadata_packs(args: argparse.Namespace) -> int:
     from stopan.metadata.packs.gc import collect_recovered_metadata_packs
 
     cfg = load_runtime_config(args)
-    result = collect_recovered_metadata_packs(
-        cfg=cfg,
-        object_store=args.object_store,
-        pack_dir=args.pack_dir,
-        max_age_days=args.max_age_days,
-        dry_run=bool(args.dry_run),
-    )
-    _print_local_file_result(result)
+    with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
+        result = collect_recovered_metadata_packs(
+            cfg=cfg,
+            object_store=args.object_store,
+            pack_dir=args.pack_dir,
+            max_age_days=args.max_age_days,
+            dry_run=bool(args.dry_run),
+            candidate_reporter=candidates.report,
+        )
+        _print_local_file_result(result, candidates=candidates)
     return 0
 
 
@@ -462,7 +475,11 @@ def _all_target_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     return targets
 
 
-def _print_local_file_result(result: LocalFileGarbageCollectionResult) -> None:
+def _print_local_file_result(
+    result: LocalFileGarbageCollectionResult,
+    *,
+    candidates: "_CandidateSpool | None" = None,
+) -> None:
     print(f"GC {result.target}")
     print(f"   root_dir: {result.root_dir}")
     print(f"   dry_run: {result.dry_run}")
@@ -478,6 +495,8 @@ def _print_local_file_result(result: LocalFileGarbageCollectionResult) -> None:
     print(f"   bytes_collectable: {format_bytes(result.bytes_collectable)}")
     print(f"   files_deleted: {result.files_deleted}")
     print(f"   bytes_deleted: {format_bytes(result.bytes_deleted)}")
+    if candidates is not None:
+        candidates.print_items()
     _print_items("Errors / skipped items", result.errors)
     _print_dry_run_hint(result.dry_run)
 
@@ -489,7 +508,12 @@ def _print_metadata_object_gc_skipped(target: str, object_store_dir: Path, *, re
     print(f"   reason: {reason}")
 
 
-def _print_metadata_object_gc_result(target: str, result) -> None:
+def _print_metadata_object_gc_result(
+    target: str,
+    result,
+    *,
+    candidates: "_CandidateSpool | None" = None,
+) -> None:
     print(f"GC {target}")
     print(f"   object_store: {result.root_dir}")
     print(f"   catalog_hash: {result.catalog_hash}")
@@ -504,6 +528,7 @@ def _print_metadata_object_gc_result(target: str, result) -> None:
     print(f"   object_files_deleted: {result.object_files_deleted}")
     print(f"   object_files_skipped_by_grace: {result.object_files_skipped_by_grace}")
     print(f"   object_files_malformed: {result.object_files_malformed}")
+    print(f"   object_bytes_collectable: {format_bytes(result.object_bytes_collectable)}")
     print(f"   object_bytes_deleted: {format_bytes(result.object_bytes_deleted)}")
     print("Packs")
     print(f"   pack_dir: {result.pack_dir if result.pack_dir is not None else '(not used)'}")
@@ -513,12 +538,20 @@ def _print_metadata_object_gc_result(target: str, result) -> None:
     print(f"   pack_files_deleted: {result.pack_files_deleted}")
     print(f"   pack_files_skipped_by_grace: {result.pack_files_skipped_by_grace}")
     print(f"   pack_files_unreadable: {result.pack_files_unreadable}")
+    print(f"   pack_bytes_collectable: {format_bytes(result.pack_bytes_collectable)}")
     print(f"   pack_bytes_deleted: {format_bytes(result.pack_bytes_deleted)}")
+    if candidates is not None:
+        candidates.print_items()
     _print_items("Errors / skipped items", result.errors)
     _print_dry_run_hint(result.dry_run)
 
 
-def _print_received_metadata_pack_result(result, *, cfg) -> None:
+def _print_received_metadata_pack_result(
+    result,
+    *,
+    cfg,
+    candidates: "_CandidateSpool | None" = None,
+) -> None:
     print("GC received-metadata-packs")
     print(f"   pack_store: {result.root_dir}")
     print(f"   dry_run: {result.dry_run}")
@@ -537,6 +570,9 @@ def _print_received_metadata_pack_result(result, *, cfg) -> None:
     print(f"   quota_packs: {result.quota_packs}")
     print(f"   pruned_packs: {result.pruned_packs}")
     print(f"   pruned_bytes: {format_bytes(result.pruned_bytes)}")
+    if candidates is not None:
+        candidates.print_items()
+    _print_items("Errors / skipped items", result.errors)
     _print_dry_run_hint(result.dry_run)
 
 
@@ -564,6 +600,40 @@ def _print_items(title: str, items: Sequence[str] | tuple[str, ...], *, limit: i
 def _print_dry_run_hint(dry_run: bool) -> None:
     if dry_run:
         print("\nDry-run activo: no se borró nada. Usa --apply para ejecutar el borrado real.")
+
+
+class _CandidateSpool:
+    """Acumula el listado de dry-run sin retenerlo completo en memoria."""
+
+    def __init__(self, *, enabled: bool, max_memory_bytes: int = 1024 * 1024):
+        self.enabled = bool(enabled)
+        self._count = 0
+        self._spool = tempfile.SpooledTemporaryFile(
+            mode="w+t",
+            max_size=max_memory_bytes,
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    def __enter__(self) -> "_CandidateSpool":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._spool.close()
+
+    def report(self, path: Path) -> None:
+        if not self.enabled:
+            return
+        self._spool.write(f"{path}\n")
+        self._count += 1
+
+    def print_items(self) -> None:
+        if not self.enabled or self._count == 0:
+            return
+        print("Candidates")
+        self._spool.seek(0)
+        for line in self._spool:
+            print(f"- {line.rstrip()}")
 
 
 if __name__ == "__main__":

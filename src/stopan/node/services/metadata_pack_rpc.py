@@ -95,6 +95,8 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
                 f"pruned_packs={prune_result.pruned_packs} "
                 f"pruned_bytes={prune_result.pruned_bytes}"
             )
+        for error in prune_result.errors:
+            print(f"Metadata pack store: {error}")
 
         if stale_incoming:
             print(f"Temporales de metadata packs eliminados al arrancar: {stale_incoming}")

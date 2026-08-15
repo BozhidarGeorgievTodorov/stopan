@@ -397,7 +397,7 @@ def _prompt_metadata_passphrase(*, identity_exists: bool, target_path: Path) -> 
         ) from exc
 
 
-def _ensure_passphrase_file(path: Path, *, identity_exists: bool) -> tuple[str, bool]:
+def _load_or_prompt_metadata_passphrase(path: Path, *, identity_exists: bool) -> tuple[str, bool]:
     from stopan.metadata.identity.passphrase import read_passphrase_file
 
     if path.exists():
@@ -407,9 +407,12 @@ def _ensure_passphrase_file(path: Path, *, identity_exists: bool) -> tuple[str, 
         return read_passphrase_file(path), False
 
     passphrase = _prompt_metadata_passphrase(identity_exists=identity_exists, target_path=path)
+    return passphrase, True
+
+
+def _persist_metadata_passphrase(path: Path, passphrase: str) -> None:
     atomic_write_bytes(path, (passphrase + "\n").encode("utf-8"), mode=0o640)
     _apply_service_file_permissions(path, mode=0o640)
-    return passphrase, True
 
 
 def _init_metadata(args: argparse.Namespace) -> int:
@@ -434,7 +437,17 @@ def _init_metadata(args: argparse.Namespace) -> int:
     identity_path = Path(cfg.metadata.identity_file).expanduser().resolve()
 
     identity_exists = identity_path.exists()
-    passphrase, passphrase_created = _ensure_passphrase_file(passphrase_path, identity_exists=identity_exists)
+    if cfg.metadata.owner_id and not identity_exists:
+        raise StopanUsageError(
+            "metadata.owner_id ya está configurado, pero falta el archivo de identidad de metadata: "
+            f"{identity_path}. Restaura la identidad privada correspondiente a "
+            f"metadata.owner_id={cfg.metadata.owner_id} antes de volver a inicializar metadata."
+        )
+
+    passphrase, passphrase_created = _load_or_prompt_metadata_passphrase(
+        passphrase_path,
+        identity_exists=identity_exists,
+    )
 
     identity_created = False
     if identity_exists:
@@ -461,6 +474,9 @@ def _init_metadata(args: argparse.Namespace) -> int:
             f"metadata.owner_id={cfg.metadata.owner_id} identity_owner_id={identity.owner_id}. "
             "No se sobrescribe la configuración automáticamente."
         )
+
+    if passphrase_created:
+        _persist_metadata_passphrase(passphrase_path, passphrase)
 
     data = _load_config_document(config_path)
     metadata = _ensure_mapping(data, "metadata")

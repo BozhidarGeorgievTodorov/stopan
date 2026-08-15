@@ -16,23 +16,94 @@ if ! getent passwd stopan >/dev/null; then
         stopan >/dev/null
 fi
 
-install -d -o root -g stopan -m 0750 /etc/stopan
-install -d -o root -g stopan -m 0750 /etc/stopan/jobs
-install -d -o root -g stopan -m 0750 /etc/stopan/profiles
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/state
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/data
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/data/chunks
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/object_store
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/packs
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/packs/generated
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/metadata/packs/recovered
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody/chunks
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody/ec_shards
-install -d -o stopan -g stopan -m 0750 /var/lib/stopan/custody/metadata_packs
-install -d -o stopan -g stopan -m 0750 /var/log/stopan
+prepare_managed_directories() {
+    /usr/bin/python3 - <<'PYDIRS'
+import errno
+import grp
+import os
+import pwd
+from pathlib import Path
+
+DIRECTORIES = (
+    ("/etc/stopan", "root", "stopan", 0o750),
+    ("/etc/stopan/jobs", "root", "stopan", 0o750),
+    ("/etc/stopan/profiles", "root", "stopan", 0o750),
+    ("/var/lib/stopan", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/state", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/data", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/data/chunks", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/metadata", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/metadata/object_store", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/metadata/packs", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/metadata/packs/generated", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/metadata/packs/recovered", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/custody", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/custody/chunks", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/custody/ec_shards", "stopan", "stopan", 0o750),
+    ("/var/lib/stopan/custody/metadata_packs", "stopan", "stopan", 0o750),
+    ("/var/log/stopan", "stopan", "stopan", 0o750),
+)
+
+OPEN_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def open_directory_chain(path: str, *, create: bool) -> int:
+    parts = Path(path).parts
+    if not parts or parts[0] != "/":
+        raise RuntimeError(f"Ruta gestionada no absoluta: {path}")
+
+    current_fd = os.open("/", OPEN_DIRECTORY_FLAGS)
+    current_path = Path("/")
+    try:
+        for component in parts[1:]:
+            current_path /= component
+            try:
+                next_fd = os.open(component, OPEN_DIRECTORY_FLAGS, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise RuntimeError(f"El directorio gestionado desapareció durante postinst: {current_path}")
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                next_fd = os.open(component, OPEN_DIRECTORY_FLAGS, dir_fd=current_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise RuntimeError(
+                        f"La ruta gestionada contiene un enlace simbólico o un componente no directorio: {current_path}"
+                    ) from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def prepare_directory(path: str, owner: str, group: str, mode: int) -> None:
+    fd = open_directory_chain(path, create=True)
+    try:
+        uid = pwd.getpwnam(owner).pw_uid
+        gid = grp.getgrnam(group).gr_gid
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        expected = os.fstat(fd)
+
+        verify_fd = open_directory_chain(path, create=False)
+        try:
+            observed = os.fstat(verify_fd)
+            if (expected.st_dev, expected.st_ino) != (observed.st_dev, observed.st_ino):
+                raise RuntimeError(f"El directorio gestionado cambió durante postinst: {path}")
+        finally:
+            os.close(verify_fd)
+    finally:
+        os.close(fd)
+
+
+for directory in DIRECTORIES:
+    prepare_directory(*directory)
+PYDIRS
+}
+
+prepare_managed_directories
 
 install_if_missing() {
     src="$1"

@@ -7,13 +7,14 @@ sin descifrar el payload.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from stopan.errors import StopanDataError
 from stopan.common.encoding import b64decode
-from stopan.common.json import canonical_json_bytes, load_json_file
+from stopan.common.json import canonical_json_bytes
 from stopan.metadata.packs.hashes import calculate_pack_hash, validate_pack_hash
 
 
@@ -33,6 +34,34 @@ class MetadataObjectPackError(StopanDataError, RuntimeError):
 
 class MetadataObjectPackAuthenticationError(MetadataObjectPackError):
     pass
+
+
+def load_canonical_pack_outer(path: str | Path) -> dict[str, Any]:
+    pack_path = Path(path).expanduser().resolve()
+    try:
+        raw_bytes = pack_path.read_bytes()
+    except OSError as exc:
+        raise MetadataObjectPackError(
+            f"No se pudo leer metadata pack {pack_path}: {exc}"
+        ) from exc
+
+    try:
+        value = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise MetadataObjectPackError(
+            f"JSON externo de metadata pack inválido: {pack_path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise MetadataObjectPackError(
+            f"metadata pack no contiene un objeto JSON externo: {pack_path}"
+        )
+
+    canonical = canonical_json_bytes(value)
+    if raw_bytes != canonical:
+        raise MetadataObjectPackError(
+            f"metadata pack no usa la representación JSON canónica: {pack_path}"
+        )
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +138,7 @@ def pack_header_from_outer(
 
 def read_pack_header(path: str | Path) -> MetadataObjectPackHeader:
     pack_path = Path(path).expanduser().resolve()
-    raw = load_json_file(pack_path)
+    raw = load_canonical_pack_outer(pack_path)
     _raw, _payload_nonce, pack_hash = parse_pack_outer(pack_path, raw)
     ciphertext = b64decode("pack.ciphertext", raw.get("ciphertext"))
     return pack_header_from_outer(

@@ -15,7 +15,7 @@ from typing import Any
 import zstandard as zstd
 
 from stopan.common.encoding import b64decode, b64encode
-from stopan.common.json import canonical_json_bytes, load_json_file
+from stopan.common.json import canonical_json_bytes
 from stopan.metadata.identity.files import (
     load_metadata_identity_file,
     load_metadata_private_identity_file,
@@ -31,6 +31,7 @@ from stopan.metadata.packs.format import (
     OBJECT_PACK_ENCRYPTION_X25519_CHACHA20POLY1305,
     OBJECT_PACK_FORMAT,
     OBJECT_PACK_VERSION,
+    load_canonical_pack_outer,
     pack_header_from_outer,
     parse_pack_outer,
 )
@@ -186,7 +187,7 @@ def decrypt_pack_payload(
     passphrase: str | bytes,
 ) -> tuple[dict[str, Any], MetadataObjectPackHeader, int, int]:
     pack_path = Path(path).expanduser().resolve()
-    raw = load_json_file(pack_path)
+    raw = load_canonical_pack_outer(pack_path)
     raw, payload_nonce, pack_hash = parse_pack_outer(pack_path, raw)
     data_key = unwrap_data_key(raw=raw, identity_file=identity_file, passphrase=passphrase)
     ciphertext = b64decode("pack.ciphertext", raw.get("ciphertext"))
@@ -217,6 +218,10 @@ def decrypt_pack_payload(
         raise MetadataObjectPackError(f"JSON de payload de metadata pack inválido: {pack_path}: {exc}") from exc
     if not isinstance(decoded, dict):
         raise MetadataObjectPackError(f"payload de metadata pack no es un objeto JSON: {pack_path}")
+    if plaintext != canonical_json_bytes(decoded):
+        raise MetadataObjectPackError(
+            f"payload de metadata pack no usa la representación JSON canónica: {pack_path}"
+        )
 
     header = pack_header_from_outer(pack_path, raw, pack_hash=pack_hash, ciphertext_bytes=len(ciphertext))
     return decoded, header, len(compressed), len(plaintext)

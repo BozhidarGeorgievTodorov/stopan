@@ -12,8 +12,8 @@ from typing import Any
 
 from stopan.common.encoding import b64decode, b64encode
 from stopan.common.json import canonical_json_bytes
-from stopan.metadata.objects.codec import EncodedMetadataObject
-from stopan.metadata.objects.graph.walk import decode_object_envelope
+from stopan.metadata.objects.codec import EncodedMetadataObject, canonical_state_digest
+from stopan.metadata.objects.graph.walk import decode_object_envelope, iter_object_refs
 from stopan.metadata.objects.models import MetadataObjectType
 from stopan.metadata.objects.store import LatestMetadataPointer
 from stopan.metadata.packs.format import (
@@ -33,6 +33,13 @@ class ParsedPackPayloadBase:
     entries: list[dict[str, Any]]
     vault_generation: int
     pack_created_at_unix: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedPackObject:
+    object_type: MetadataObjectType
+    payload: dict[str, Any]
+    canonical_bytes: int
 
 
 def require_metadata_hash(name: str, value: object) -> str:
@@ -201,6 +208,93 @@ def parse_pack_payload_base(payload: dict[str, Any]) -> ParsedPackPayloadBase:
     )
 
 
+def _validate_pack_payload_graph(
+    parsed: ParsedPackPayloadBase,
+    objects_by_hash: dict[str, _ValidatedPackObject],
+) -> None:
+    pending: list[tuple[str, MetadataObjectType]] = [
+        (parsed.latest.catalog_hash, MetadataObjectType.CATALOG)
+    ]
+    expected_types: dict[str, MetadataObjectType] = {
+        parsed.latest.catalog_hash: MetadataObjectType.CATALOG
+    }
+    reachable: set[str] = set()
+
+    while pending:
+        object_hash, expected_type = pending.pop()
+        if object_hash in reachable:
+            continue
+
+        validated = objects_by_hash.get(object_hash)
+        if validated is None:
+            raise MetadataObjectPackError(
+                f"metadata pack no contiene objeto referenciado: {object_hash}"
+            )
+        if validated.object_type != expected_type:
+            raise MetadataObjectPackError(
+                "tipo de metadata object no coincide para "
+                f"{object_hash}: esperado={expected_type.value} "
+                f"recibido={validated.object_type.value}"
+            )
+
+        reachable.add(object_hash)
+        try:
+            refs = tuple(iter_object_refs(validated.payload))
+        except Exception as exc:
+            raise MetadataObjectPackError(
+                f"ObjectRef inválido en metadata object {object_hash}: {exc}"
+            ) from exc
+
+        for ref_type, ref_hash in refs:
+            previous_type = expected_types.get(ref_hash)
+            if previous_type is not None and previous_type != ref_type:
+                raise MetadataObjectPackError(
+                    "metadata object referenciado con tipos incompatibles: "
+                    f"{ref_hash}: {previous_type.value} y {ref_type.value}"
+                )
+            expected_types.setdefault(ref_hash, ref_type)
+            if ref_hash not in reachable:
+                pending.append((ref_hash, ref_type))
+
+    packaged = set(objects_by_hash)
+    if reachable != packaged:
+        extras = sorted(packaged - reachable)
+        missing = sorted(reachable - packaged)
+        detail: list[str] = []
+        if missing:
+            detail.append("faltan=" + ",".join(missing[:5]))
+        if extras:
+            detail.append("no_alcanzables=" + ",".join(extras[:5]))
+        raise MetadataObjectPackError(
+            "el conjunto de objetos del metadata pack no coincide con el grafo "
+            "alcanzable desde latest.catalog_hash"
+            + (": " + "; ".join(detail) if detail else "")
+        )
+
+    digest = canonical_state_digest(
+        parsed.latest.catalog_hash,
+        tuple(reachable),
+    )
+    if digest != parsed.latest.state_digest:
+        raise MetadataObjectPackError(
+            "pack latest.state_digest no coincide con el grafo alcanzable: "
+            f"esperado={parsed.latest.state_digest} calculado={digest}"
+        )
+
+    if len(reachable) != int(parsed.latest.object_count):
+        raise MetadataObjectPackError(
+            "pack latest.object_count no coincide con el grafo alcanzable: "
+            f"latest={parsed.latest.object_count} alcanzables={len(reachable)}"
+        )
+
+    reachable_bytes = sum(objects_by_hash[item].canonical_bytes for item in reachable)
+    if reachable_bytes != int(parsed.latest.total_canonical_bytes):
+        raise MetadataObjectPackError(
+            "pack latest.total_canonical_bytes no coincide con el grafo alcanzable: "
+            f"latest={parsed.latest.total_canonical_bytes} alcanzables={reachable_bytes}"
+        )
+
+
 def _validate_pack_payload_entries(
     parsed: ParsedPackPayloadBase,
     *,
@@ -210,6 +304,7 @@ def _validate_pack_payload_entries(
     seen: set[str] = set()
     total_bytes = 0
     catalog_vault_id: str | None = None
+    validated_by_hash: dict[str, _ValidatedPackObject] = {}
 
     for index, entry in enumerate(parsed.entries):
         if not isinstance(entry, dict):
@@ -249,6 +344,11 @@ def _validate_pack_payload_entries(
             )
 
         total_bytes += len(canonical)
+        validated_by_hash[object_hash] = _ValidatedPackObject(
+            object_type=actual_type,
+            payload=object_payload,
+            canonical_bytes=len(canonical),
+        )
         if objects is not None:
             objects.append(
                 EncodedMetadataObject(
@@ -270,13 +370,14 @@ def _validate_pack_payload_entries(
             f"catalog.vault_id={catalog_vault_id} no coincide con vault.id={parsed.vault_id}"
         )
 
+    _validate_pack_payload_graph(parsed, validated_by_hash)
     return objects
 
 
 def validate_pack_payload(
     payload: dict[str, Any],
 ) -> tuple[LatestMetadataPointer, str, int, float]:
-    """Valida íntegramente todos los objetos sin conservar sus bytes decodificados."""
+    """Valida objetos y grafo completo sin materializar EncodedMetadataObject."""
 
     parsed = parse_pack_payload_base(payload)
     _validate_pack_payload_entries(parsed, collect_objects=False)

@@ -14,9 +14,12 @@ from pathlib import Path
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.identity.signatures import sign_metadata_pack_hash
-from stopan.metadata.packs.hashes import calculate_pack_hash_file, validate_pack_hash
+from stopan.metadata.packs.crypto import decrypt_pack_payload
+from stopan.metadata.packs.hashes import validate_pack_hash
+from stopan.metadata.packs.payload import validate_pack_payload
 from stopan.metadata.packs.remote import (
     MetadataPackTargetResult,
+    is_remote_metadata_pack_member,
     select_metadata_pack_targets,
     store_metadata_pack_on_target,
 )
@@ -99,9 +102,18 @@ def push_metadata_pack_to_network(
         )
 
     try:
-        pack_hash = validate_pack_hash(calculate_pack_hash_file(path))
-    except OSError as exc:
-        raise MetadataPackPushError(f"No se pudo leer el metadata pack {path}: {exc}") from exc
+        payload, header, _compressed_bytes, _plaintext_bytes = decrypt_pack_payload(
+            path,
+            identity_file=identity_file,
+            passphrase=identity_passphrase,
+        )
+        validate_pack_payload(payload)
+        pack_hash = validate_pack_hash(header.pack_hash)
+    except Exception as exc:
+        raise MetadataPackPushError(
+            f"metadata pack local inválido o no recuperable {path}: {exc}"
+        ) from exc
+
     owner, public_key_b64, signature_b64 = sign_metadata_pack_hash(
         identity_file=identity_file,
         passphrase=identity_passphrase,
@@ -144,12 +156,10 @@ def push_metadata_pack_to_network(
     remote_candidates = [
         member
         for member in cluster.members
-        if str(getattr(member, "address", "") or "").strip()
-        and str(getattr(member, "address", "") or "").strip() != str(self_addr or "").strip()
-        and (
-            not str(getattr(cluster, "self_node_id", "") or "").strip()
-            or str(getattr(member, "node_id", "") or "").strip()
-            != str(getattr(cluster, "self_node_id", "") or "").strip()
+        if is_remote_metadata_pack_member(
+            member,
+            self_addr=self_addr,
+            self_node_id=cluster.self_node_id,
         )
     ]
     remote_candidate_count = len(remote_candidates)

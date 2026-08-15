@@ -71,20 +71,20 @@ class MetadataObjectGraphStoreService:
         finally:
             initializer.close()
 
-        db = MetadataDB(
-            self.db_file,
-            init_schema=False,
-            access_mode=MetadataDBAccessMode.READ_ONLY,
-        )
-        try:
-            with db.read_snapshot():
-                graph = MetadataObjectGraphExporter(db).export_current_state(
-                    include_protection=bool(include_protection),
-                )
-        finally:
-            db.close()
-
         with object_store_lock(object_store_dir):
+            db = MetadataDB(
+                self.db_file,
+                init_schema=False,
+                access_mode=MetadataDBAccessMode.READ_ONLY,
+            )
+            try:
+                with db.read_snapshot():
+                    graph = MetadataObjectGraphExporter(db).export_current_state(
+                        include_protection=bool(include_protection),
+                    )
+            finally:
+                db.close()
+
             store = MetadataObjectStore.open_or_create(
                 object_store_dir,
                 passphrase=passphrase,

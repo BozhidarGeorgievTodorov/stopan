@@ -14,6 +14,7 @@ from typing import Any
 import blake3
 
 from stopan.errors import StopanDataError
+from stopan.common.json import canonical_json_bytes
 from stopan.metadata.objects.models import (
     METADATA_OBJECT_FORMAT,
     METADATA_OBJECT_VERSION,
@@ -66,6 +67,10 @@ def decode_object_envelope(
 
     if not isinstance(envelope, dict):
         raise MetadataObjectGraphWalkError(f"envelope de metadata object inválido: {calculated}")
+    if canonical_json_bytes(envelope) != canonical_bytes:
+        raise MetadataObjectGraphWalkError(
+            f"metadata object no usa la representación JSON canónica: {calculated}"
+        )
     if envelope.get("format") != METADATA_OBJECT_FORMAT:
         raise MetadataObjectGraphWalkError(f"formato de metadata object inválido: {calculated}")
     if envelope.get("version") != METADATA_OBJECT_VERSION:
@@ -122,34 +127,67 @@ def iter_object_refs(value: Any) -> Iterator[tuple[MetadataObjectType, str]]:
             yield from iter_object_refs(item)
 
 
+def _collect_reachable_objects(
+    *,
+    catalog_hash: str,
+    read_object_bytes: Callable[[str], bytes],
+    collect_bytes: bool,
+) -> tuple[set[str], dict[str, bytes]]:
+    root_hash = _require_hash64("catalog_hash", catalog_hash)
+    pending: list[tuple[str, MetadataObjectType]] = [
+        (root_hash, MetadataObjectType.CATALOG)
+    ]
+    expected_types: dict[str, MetadataObjectType] = {
+        root_hash: MetadataObjectType.CATALOG
+    }
+    seen: set[str] = set()
+    objects: dict[str, bytes] = {}
+
+    while pending:
+        object_hash, expected_type = pending.pop()
+        if object_hash in seen:
+            continue
+
+        canonical_bytes = read_object_bytes(object_hash)
+        actual_type, payload = decode_object_envelope(
+            canonical_bytes,
+            expected_hash=object_hash,
+        )
+        if actual_type != expected_type:
+            raise MetadataObjectGraphWalkError(
+                "tipo de metadata object no coincide para "
+                f"{object_hash}: esperado={expected_type.value} "
+                f"recibido={actual_type.value}"
+            )
+
+        seen.add(object_hash)
+        if collect_bytes:
+            objects[object_hash] = canonical_bytes
+
+        for ref_type, ref_hash in iter_object_refs(payload):
+            previous_type = expected_types.get(ref_hash)
+            if previous_type is not None and previous_type != ref_type:
+                raise MetadataObjectGraphWalkError(
+                    "metadata object referenciado con tipos incompatibles: "
+                    f"{ref_hash}: {previous_type.value} y {ref_type.value}"
+                )
+            expected_types.setdefault(ref_hash, ref_type)
+            if ref_hash not in seen:
+                pending.append((ref_hash, ref_type))
+
+    return seen, objects
+
+
 def collect_reachable_object_hashes(
     *,
     catalog_hash: str,
     read_object_bytes: Callable[[str], bytes],
 ) -> set[str]:
-    pending = [_require_hash64("catalog_hash", catalog_hash)]
-    pending_set = set(pending)
-    seen: set[str] = set()
-
-    while pending:
-        object_hash = pending.pop()
-        pending_set.discard(object_hash)
-        if object_hash in seen:
-            continue
-
-        canonical_bytes = read_object_bytes(object_hash)
-        _object_type, payload = decode_object_envelope(
-            canonical_bytes,
-            expected_hash=object_hash,
-        )
-
-        seen.add(object_hash)
-
-        for _ref_type, ref_hash in iter_object_refs(payload):
-            if ref_hash not in seen and ref_hash not in pending_set:
-                pending.append(ref_hash)
-                pending_set.add(ref_hash)
-
+    seen, _objects = _collect_reachable_objects(
+        catalog_hash=catalog_hash,
+        read_object_bytes=read_object_bytes,
+        collect_bytes=False,
+    )
     return seen
 
 
@@ -158,29 +196,9 @@ def collect_reachable_object_bytes(
     catalog_hash: str,
     read_object_bytes: Callable[[str], bytes],
 ) -> dict[str, bytes]:
-    pending = [_require_hash64("catalog_hash", catalog_hash)]
-    pending_set = set(pending)
-    seen: set[str] = set()
-    objects: dict[str, bytes] = {}
-
-    while pending:
-        object_hash = pending.pop()
-        pending_set.discard(object_hash)
-        if object_hash in seen:
-            continue
-
-        canonical_bytes = read_object_bytes(object_hash)
-        _object_type, payload = decode_object_envelope(
-            canonical_bytes,
-            expected_hash=object_hash,
-        )
-
-        seen.add(object_hash)
-        objects[object_hash] = canonical_bytes
-
-        for _ref_type, ref_hash in iter_object_refs(payload):
-            if ref_hash not in seen and ref_hash not in pending_set:
-                pending.append(ref_hash)
-                pending_set.add(ref_hash)
-
+    _seen, objects = _collect_reachable_objects(
+        catalog_hash=catalog_hash,
+        read_object_bytes=read_object_bytes,
+        collect_bytes=True,
+    )
     return objects

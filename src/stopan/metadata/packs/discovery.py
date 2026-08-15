@@ -20,6 +20,7 @@ from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.packs.remote import (
     MetadataPackSource,
+    is_remote_metadata_pack_member,
     list_metadata_packs_from_target as _list_packs_from_target,
 )
 
@@ -159,9 +160,17 @@ def collect_metadata_pack_sources(
     except Exception as exc:
         raise error_cls(str(exc)) from exc
 
-    targets = [member for member in resolved.cluster.members if str(member.address or "").strip()]
+    targets = [
+        member
+        for member in resolved.cluster.members
+        if is_remote_metadata_pack_member(
+            member,
+            self_addr=self_addr,
+            self_node_id=resolved.cluster.self_node_id,
+        )
+    ]
     if not targets:
-        raise error_cls("Membership no devolvió miembros elegibles del cluster.")
+        raise error_cls("Membership no devolvió miembros remotos elegibles del cluster.")
 
     parallelism = max(1, int(target_parallelism))
     sources: list[MetadataPackSource] = []

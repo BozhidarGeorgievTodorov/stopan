@@ -582,7 +582,7 @@ def find_reusable_latest_object_pack(
 
     for path in sorted(resolved_pack_dir.glob("*.stopanmetapack")):
         try:
-            inspection = pack_service.inspect_pack_summary(
+            inspection = pack_service.validate_pack(
                 path,
                 identity_file=identity_file,
                 passphrase=passphrase,

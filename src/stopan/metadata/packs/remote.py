@@ -74,6 +74,27 @@ def metadata_pack_target_label(source: MetadataPackSource) -> str:
     return f"{node}@{source.address}"
 
 
+def is_remote_metadata_pack_member(
+    member: object,
+    *,
+    self_addr: str,
+    self_node_id: str | None,
+) -> bool:
+    address = str(getattr(member, "address", "") or "").strip()
+    if not address:
+        return False
+
+    normalized_self_addr = str(self_addr or "").strip()
+    if normalized_self_addr and address == normalized_self_addr:
+        return False
+
+    node_id = str(getattr(member, "node_id", "") or "").strip()
+    normalized_self_node_id = str(self_node_id or "").strip()
+    if normalized_self_node_id and node_id == normalized_self_node_id:
+        return False
+    return True
+
+
 def _hrw_score(*, owner_id: str, pack_hash: str, cluster_token: str, node_id: str, address: str) -> int:
     payload = "\x00".join(
         [
@@ -99,19 +120,19 @@ def select_metadata_pack_targets(
     self_node_id: str | None,
 ) -> list[MetadataPackTarget]:
     candidates: list[MetadataPackTarget] = []
-    normalized_self_addr = str(self_addr or "").strip()
-    normalized_self_node_id = str(self_node_id or "").strip()
-
     for member in members:
-        node_id = str(getattr(member, "node_id", "") or "").strip()
-        address = str(getattr(member, "address", "") or "").strip()
-        if not address:
+        if not is_remote_metadata_pack_member(
+            member,
+            self_addr=self_addr,
+            self_node_id=self_node_id,
+        ):
             continue
-        if normalized_self_addr and address == normalized_self_addr:
-            continue
-        if normalized_self_node_id and node_id == normalized_self_node_id:
-            continue
-        candidates.append(MetadataPackTarget(node_id=node_id, address=address))
+        candidates.append(
+            MetadataPackTarget(
+                node_id=str(getattr(member, "node_id", "") or "").strip(),
+                address=str(getattr(member, "address", "") or "").strip(),
+            )
+        )
 
     candidates.sort(
         key=lambda target: _hrw_score(

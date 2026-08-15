@@ -292,20 +292,42 @@ def verify_metadata_packs_from_network(
             grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
             grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
             desired_copies_by_hash=desired_map,
-            max_candidates=max_candidates,
+            max_candidates=None,
         )
     except Exception as exc:
         raise MetadataPackVerificationError(str(exc)) from exc
 
-    entries = list(discovery.entries)
-    results = tuple(_verification_result_from_entry(item) for item in entries)
+    entries_by_hash = {entry.pack_hash: entry for entry in discovery.entries}
+    candidate_hashes = sorted(set(entries_by_hash) | set(desired_map))
+    if max_candidates is not None and int(max_candidates) > 0:
+        candidate_hashes = candidate_hashes[: int(max_candidates)]
 
+    results_list: list[MetadataPackVerificationResult] = []
+    for candidate_hash in candidate_hashes:
+        entry = entries_by_hash.get(candidate_hash)
+        if entry is not None:
+            results_list.append(_verification_result_from_entry(entry))
+            continue
+
+        desired_copies = desired_map.get(candidate_hash)
+        results_list.append(
+            _missing_pack_result(
+                pack_hash=candidate_hash,
+                desired_copies=desired_copies,
+                desired_copies_source=(
+                    "publication_record" if desired_copies is not None else "unknown"
+                ),
+                reason="metadata pack publicado localmente no encontrado en ningún nodo remoto consultado",
+            )
+        )
+
+    results = tuple(results_list)
     stats = _verification_stats(
         results=results,
         list_targets_attempted=discovery.stats.list_targets_attempted,
         list_targets_succeeded=discovery.stats.list_targets_succeeded,
         sources_seen=discovery.stats.sources_seen,
-        publications_known=discovery.stats.publications_known,
+        publications_known=sum(1 for item in results if item.desired_copies is not None),
         list_errors=discovery.stats.list_errors,
     )
     return MetadataPackVerificationRunResult(owner_id=owner, stats=stats, results=results)

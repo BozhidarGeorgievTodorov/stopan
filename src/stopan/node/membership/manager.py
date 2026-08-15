@@ -361,6 +361,10 @@ class MembershipManager:
     def _swim_loop(self) -> None:
         """Ejecuta rondas periódicas de ping directo e indirecto."""
         while not self._stop.wait(float(self.settings.protocol_period_s)):
+            # La expiración de sospechas no depende de que quede algún miembro
+            # ALIVE disponible para sondear en esta ronda.
+            self._expire_suspects()
+
             peers = self.get_alive_peers()
             if not peers:
                 continue

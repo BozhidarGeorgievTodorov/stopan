@@ -41,6 +41,8 @@ class CASRepository:
       - las escrituras usan archivo temporal y rename atómico;
       - get() descomprime y verifica el payload contra su hash de contenido;
       - get_compressed() devuelve el blob comprimido sin validarlo;
+      - get_validated_compressed() conserva el blob comprimido, pero solo lo
+        devuelve después de comprobar el contenido descomprimido;
       - el repositorio asume que chunk_hash ya llega validado como hash canónico de chunk.
     """
 
@@ -104,6 +106,17 @@ class CASRepository:
             raise CASMissingChunkError(f"Chunk no encontrado en CAS: {chunk_hash}") from exc
         except OSError as exc:
             raise CASRepositoryError(f"No se pudo leer el chunk {chunk_hash} en CAS: {exc}") from exc
+
+    def get_validated_compressed(self, chunk_hash: str) -> bytes:
+        """
+        Devuelve el blob comprimido solo si su contenido corresponde a chunk_hash.
+
+        La comprobación descomprime el blob una única vez para validar BLAKE3 y
+        conserva los bytes comprimidos originales para su posterior transporte.
+        """
+        compressed_data = self.get_compressed(chunk_hash)
+        self._decompress_and_validate(chunk_hash, compressed_data)
+        return compressed_data
 
     def _write_once(self, path: str, data: bytes) -> bool:
         """

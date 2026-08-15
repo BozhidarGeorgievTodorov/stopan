@@ -259,8 +259,8 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         """
         Devuelve blobs comprimidos del CAS local por batch.
 
-        La validación de integridad extremo-a-extremo la realiza el cliente restore
-        al descomprimir y comprobar BLAKE3 contra chunk_hash.
+        El custodio valida el contenido antes de entregarlo. El consumidor remoto
+        vuelve a comprobar la integridad extremo-a-extremo al descomprimirlo.
         """
         require_cluster_token_metadata(self._cluster_token, context)
 
@@ -282,7 +282,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
                     continue
 
                 try:
-                    chunk_data = self.repo.get_compressed(chunk_hash)
+                    chunk_data = self.repo.get_validated_compressed(chunk_hash)
                     results.append(
                         p2p_storage_pb2.RetrievedChunk(
                             chunk_hash=chunk_hash,

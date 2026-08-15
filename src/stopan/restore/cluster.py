@@ -46,7 +46,7 @@ class LazyClusterResolver:
         self.membership_seed = resolve_membership_seed(membership_seed)
         self.rf = normalize_remote_rf(rf)
         self.self_addr = str(self_addr or "").strip()
-        self.cluster_token = str(cluster_token or "").strip()
+        self.cluster_token = str(cluster_token or "")
         self.membership_timeout_s = float(membership_timeout_s)
         self.max_message_bytes = max(int(max_message_bytes), 1)
 

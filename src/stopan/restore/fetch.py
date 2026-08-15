@@ -61,7 +61,7 @@ class ChunkFetchService:
         self.cluster_resolver = cluster_resolver
         self.remote_pool = remote_pool
         self.rf = normalize_remote_rf(rf)
-        self.cluster_token = str(cluster_token or "").strip()
+        self.cluster_token = str(cluster_token or "")
         self.max_chunk_size = max(int(max_chunk_size), 1)
         self.ec_recovery_service = ec_recovery_service
         self.remote_chunk_recovery = bool(remote_chunk_recovery)

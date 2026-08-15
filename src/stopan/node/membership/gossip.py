@@ -36,7 +36,10 @@ class GossipBuffer:
         """Devuelve como máximo limit eventos recientes."""
         with self._lock:
             self._gc_locked()
-            return [event for _, event in self._events[-max(0, int(limit)) :]]
+            max_events = max(0, int(limit))
+            if max_events == 0:
+                return []
+            return [event for _, event in self._events[-max_events:]]
 
     def _gc_locked(self) -> None:
         """Elimina eventos que superan el TTL. Requiere _lock adquirido."""

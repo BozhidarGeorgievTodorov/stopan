@@ -32,7 +32,7 @@ class ClusterMembershipClient:
 
         self.seed_addr = seed_addr
         self.self_addr = str(self_addr or "").strip()
-        self.cluster_token = str(cluster_token or "").strip()
+        self.cluster_token = str(cluster_token or "")
         self.timeout_s = float(timeout_s)
         self.max_message_bytes = max(int(max_message_bytes), 1)
 

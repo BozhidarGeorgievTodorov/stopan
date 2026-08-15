@@ -309,6 +309,54 @@ class MetadataPackStore:
                 _LOGGER.warning(message)
         return deleted_bytes
 
+    def _rollback_new_publication_unlocked(
+        self,
+        *,
+        owner_id: str,
+        pack_hash: str,
+        pack_path: Path,
+    ) -> None:
+        """
+        Revierte una publicación nueva que no puede considerarse aceptada.
+
+        El sidecar se retira antes que el pack para que un fallo posterior al
+        borrar los bytes no deje una publicación todavía descubrible como válida.
+        """
+        signature_path = self.signature_path(owner_id=owner_id, pack_hash=pack_hash)
+        errors: list[str] = []
+        removed_any = False
+
+        for artifact_path, label in (
+            (signature_path, "firma"),
+            (pack_path, "metadata pack"),
+        ):
+            try:
+                artifact_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                errors.append(f"no se pudo inspeccionar {label} {artifact_path}: {exc}")
+                continue
+
+            try:
+                validate_gc_regular_file(root_dir=self.root_dir, path=artifact_path)
+                artifact_path.unlink()
+                removed_any = True
+            except (OSError, GarbageCollectionPathError) as exc:
+                errors.append(f"no se pudo retirar {label} {artifact_path}: {exc}")
+
+        if removed_any:
+            try:
+                fsync_dir(pack_path.parent, strict=True)
+            except OSError as exc:
+                errors.append(f"fsync de directorio falló {pack_path.parent}: {exc}")
+
+        if errors:
+            raise MetadataPackStoreError(
+                "no se pudo revertir completamente la publicación del metadata pack: "
+                + " | ".join(errors)
+            )
+
     def _prune_records_unlocked(
         self,
         *,
@@ -430,11 +478,13 @@ class MetadataPackStore:
 
         pruned_count = 0
         pruned_bytes = 0
+        prune_errors: list[str] = []
 
         expired_count, expired_bytes, _ = self._prune_expired_records_unlocked(
             records=self._all_pack_records_unlocked(),
             protected_pack_hash=pack_hash,
             dry_run=False,
+            errors=prune_errors,
         )
         pruned_count += expired_count
         pruned_bytes += expired_bytes
@@ -451,12 +501,19 @@ class MetadataPackStore:
         owner_count_excess = max(0, owner_count_after - self.max_packs_per_owner)
         owner_bytes_excess = max(0, owner_bytes_after - self.max_total_bytes_per_owner)
         if owner_count_excess or owner_bytes_excess:
-            count, bytes_deleted = self._prune_records_unlocked(
-                candidates=owner_records,
-                bytes_needed=owner_bytes_excess,
-                count_needed=owner_count_excess,
-                protected_pack_hash=pack_hash,
-            )
+            try:
+                count, bytes_deleted = self._prune_records_unlocked(
+                    candidates=owner_records,
+                    bytes_needed=owner_bytes_excess,
+                    count_needed=owner_count_excess,
+                    protected_pack_hash=pack_hash,
+                    errors=prune_errors,
+                )
+            except MetadataPackQuotaError as exc:
+                detail = str(exc)
+                if prune_errors:
+                    detail += "; incidencias de borrado: " + " | ".join(prune_errors)
+                raise MetadataPackQuotaError(detail) from exc
             pruned_count += count
             pruned_bytes += bytes_deleted
 
@@ -468,13 +525,23 @@ class MetadataPackStore:
         global_bytes = sum(record.size_bytes for record in global_records)
         global_bytes_excess = max(0, global_bytes + incoming_size - self.max_total_store_bytes)
         if global_bytes_excess:
-            count, bytes_deleted = self._prune_records_unlocked(
-                candidates=global_records,
-                bytes_needed=global_bytes_excess,
-                protected_pack_hash=pack_hash,
-            )
+            try:
+                count, bytes_deleted = self._prune_records_unlocked(
+                    candidates=global_records,
+                    bytes_needed=global_bytes_excess,
+                    protected_pack_hash=pack_hash,
+                    errors=prune_errors,
+                )
+            except MetadataPackQuotaError as exc:
+                detail = str(exc)
+                if prune_errors:
+                    detail += "; incidencias de borrado: " + " | ".join(prune_errors)
+                raise MetadataPackQuotaError(detail) from exc
             pruned_count += count
             pruned_bytes += bytes_deleted
+
+        for message in prune_errors:
+            _LOGGER.warning("Incidencia durante la poda posterior a publicación: %s", message)
 
         return pruned_count, pruned_bytes
 
@@ -641,11 +708,6 @@ class MetadataPackStore:
                 except OSError:
                     pass
                 existing_size = int(path.stat().st_size)
-                pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
-                    owner_id=owner,
-                    pack_hash=pack,
-                    incoming_size=existing_size,
-                )
                 existing_public, existing_signature = self._read_signature_record(owner_id=owner, pack_hash=pack)
                 return StoreMetadataPackResult(
                     owner_id=owner,
@@ -656,36 +718,53 @@ class MetadataPackStore:
                     already_present=True,
                     public_key_b64=existing_public,
                     signature_b64=existing_signature,
-                    pruned_packs=pruned_count,
-                    pruned_bytes=pruned_bytes,
+                    pruned_packs=0,
+                    pruned_bytes=0,
                 )
 
             self._validate_incoming_quota_limits_unlocked(incoming_size=len(data))
 
             ensure_private_dir(path.parent)
-            pack_written = False
             try:
                 atomic_write_bytes(path, data, mode=0o600)
-                pack_written = True
                 self._write_signature_record(
                     owner_id=owner,
                     pack_hash=pack,
                     public_key_b64=public_key_b64,
                     signature_b64=signature_b64,
                 )
-            except Exception:
-                if pack_written:
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
+            except Exception as exc:
+                try:
+                    self._rollback_new_publication_unlocked(
+                        owner_id=owner,
+                        pack_hash=pack,
+                        pack_path=path,
+                    )
+                except MetadataPackStoreError as rollback_exc:
+                    raise MetadataPackStoreError(
+                        f"falló la publicación de metadata pack y su reversión: {rollback_exc}"
+                    ) from exc
                 raise
 
-            pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
-                owner_id=owner,
-                pack_hash=pack,
-                incoming_size=len(data),
-            )
+            try:
+                pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
+                    owner_id=owner,
+                    pack_hash=pack,
+                    incoming_size=len(data),
+                )
+            except Exception as exc:
+                try:
+                    self._rollback_new_publication_unlocked(
+                        owner_id=owner,
+                        pack_hash=pack,
+                        pack_path=path,
+                    )
+                except MetadataPackStoreError as rollback_exc:
+                    raise MetadataPackStoreError(
+                        "falló la aplicación de cuotas y no pudo revertirse la publicación "
+                        f"del metadata pack: {rollback_exc}"
+                    ) from exc
+                raise
 
             return StoreMetadataPackResult(
                 owner_id=owner,
@@ -787,11 +866,6 @@ class MetadataPackStore:
                 except OSError:
                     pass
                 existing_size = int(destination.stat().st_size)
-                pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
-                    owner_id=owner,
-                    pack_hash=pack_hash,
-                    incoming_size=existing_size,
-                )
                 existing_public, existing_signature = self._read_signature_record(
                     owner_id=owner,
                     pack_hash=pack_hash,
@@ -805,36 +879,53 @@ class MetadataPackStore:
                     already_present=True,
                     public_key_b64=existing_public,
                     signature_b64=existing_signature,
-                    pruned_packs=pruned_count,
-                    pruned_bytes=pruned_bytes,
+                    pruned_packs=0,
+                    pruned_bytes=0,
                 )
 
             self._validate_incoming_quota_limits_unlocked(incoming_size=size_bytes)
 
             ensure_private_dir(destination.parent)
-            pack_written = False
             try:
                 atomic_copy_file(source_path, destination, mode=0o600)
-                pack_written = True
                 self._write_signature_record(
                     owner_id=owner,
                     pack_hash=pack_hash,
                     public_key_b64=public_key_b64,
                     signature_b64=signature_b64,
                 )
-            except Exception:
-                if pack_written:
-                    try:
-                        destination.unlink()
-                    except OSError:
-                        pass
+            except Exception as exc:
+                try:
+                    self._rollback_new_publication_unlocked(
+                        owner_id=owner,
+                        pack_hash=pack_hash,
+                        pack_path=destination,
+                    )
+                except MetadataPackStoreError as rollback_exc:
+                    raise MetadataPackStoreError(
+                        f"falló la publicación de metadata pack y su reversión: {rollback_exc}"
+                    ) from exc
                 raise
 
-            pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
-                owner_id=owner,
-                pack_hash=pack_hash,
-                incoming_size=size_bytes,
-            )
+            try:
+                pruned_count, pruned_bytes = self._enforce_post_store_quotas_unlocked(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                    incoming_size=size_bytes,
+                )
+            except Exception as exc:
+                try:
+                    self._rollback_new_publication_unlocked(
+                        owner_id=owner,
+                        pack_hash=pack_hash,
+                        pack_path=destination,
+                    )
+                except MetadataPackStoreError as rollback_exc:
+                    raise MetadataPackStoreError(
+                        "falló la aplicación de cuotas y no pudo revertirse la publicación "
+                        f"del metadata pack: {rollback_exc}"
+                    ) from exc
+                raise
 
             return StoreMetadataPackResult(
                 owner_id=owner,

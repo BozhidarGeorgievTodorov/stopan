@@ -1,9 +1,9 @@
 """
 Chunking de archivos mediante Content-Defined Chunking.
 
-Este módulo divide streams de archivo en chunks de tamaño variable usando una
-extensión nativa basada en Rabin. Cada chunk se identifica por el BLAKE3 del
-contenido raw que se entrega al CAS.
+Este módulo divide streams de archivo en chunks de tamaño variable mediante
+FastCDC. Cada chunk se identifica por el BLAKE3 del contenido raw que se
+entrega al CAS.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import BinaryIO
 
 import blake3
 
-from stopan.chunking import fast_rabin
+from stopan.chunking import fastcdc
 from stopan.errors import StopanConfigValueError
 
 
@@ -29,8 +29,8 @@ class FileChunker:
     Divide archivos en chunks de tamaño variable usando CDC y mmap.
 
     Invariantes de diseño:
-      - Los tamaños (avg_chunk_size) deben ser estrictamente potencias de dos 
-        para permitir optimizaciones a nivel de bits (máscaras AND).
+      - avg_chunk_size debe ser una potencia de dos para derivar la selectividad
+        de las máscaras normalizadas de FastCDC.
       - Se utiliza mmap para recorrer archivos sin cargarlos completos en memoria.
       - La computación intensiva en CPU se delega a una extensión nativa.
     """
@@ -39,8 +39,6 @@ class FileChunker:
         "avg_chunk_size",
         "min_chunk_size",
         "max_chunk_size",
-        "relaxed_mask",
-        "strong_mask",
     )
 
     def __init__(
@@ -68,14 +66,11 @@ class FileChunker:
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
 
-        self.relaxed_mask = avg_chunk_size - 1
-        self.strong_mask = (avg_chunk_size * 2) - 1
-
     def chunk_stream(self, file_stream: BinaryIO) -> Iterator[tuple[str, bytes]]:
         """Genera pares (chunk_hash, chunk_data) para un stream abierto."""
-        yield from self._chunk_fast_c(file_stream)
+        yield from self._chunk_fastcdc(file_stream)
 
-    def _chunk_fast_c(self, file_stream: BinaryIO) -> Iterator[tuple[str, bytes]]:
+    def _chunk_fastcdc(self, file_stream: BinaryIO) -> Iterator[tuple[str, bytes]]:
         file_descriptor = file_stream.fileno()
         file_size = os.fstat(file_descriptor).st_size
 
@@ -97,10 +92,8 @@ class FileChunker:
             file_size = os.fstat(file_descriptor).st_size
 
         with mmap.mmap(file_descriptor, length=0, access=mmap.ACCESS_READ) as mapped_file:
-            boundaries = fast_rabin.get_chunk_boundaries(
+            boundaries = fastcdc.iter_boundaries(
                 mapped_file,
-                self.strong_mask,
-                self.relaxed_mask,
                 self.min_chunk_size,
                 self.avg_chunk_size,
                 self.max_chunk_size,
@@ -112,12 +105,12 @@ class FileChunker:
                     end = int(end)
                     if end <= start:
                         raise RuntimeError(
-                            "fast_rabin devolvió puntos de corte no crecientes: "
+                            "fastcdc devolvió puntos de corte no crecientes: "
                             f"start={start} end={end} file_size={file_size}"
                         )
                     if end > file_size:
                         raise RuntimeError(
-                            "fast_rabin devolvió un punto de corte más allá del EOF: "
+                            "fastcdc devolvió un punto de corte más allá del EOF: "
                             f"end={end} file_size={file_size}"
                         )
 

@@ -78,7 +78,7 @@ Si un archivo no cambia respecto al snapshot completo anterior de la misma raíz
 
 ## Chunking y CAS
 
-`FileChunker` divide archivos con Content-Defined Chunking usando una extensión nativa basada en Rabin. El tamaño medio por defecto es 65536 bytes, con mínimo 16384 y máximo 262144.
+`FileChunker` divide archivos con Content-Defined Chunking mediante una extensión nativa FastCDC. El tamaño de referencia por defecto es 65536 bytes, con mínimo 16384 y máximo 262144.
 
 Los archivos de hasta `min_chunk_size` se emiten directamente como un único chunk. Para archivos mayores, el chunker usa `mmap` y calcula los límites en la extensión nativa, liberando el GIL durante esa búsqueda para que distintos workers puedan ejecutar CDC en paralelo. Cada chunk se identifica con BLAKE3 sobre bytes raw.
 

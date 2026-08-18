@@ -34,7 +34,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-La instalación editable usa `setup.py`, que declara el paquete `stopan`, el entry point `stopan=stopan.cli.root:main`, los `.proto` y la extensión C `stopan.chunking.fast_rabin`.
+La instalación editable usa `setup.py`, que declara el paquete `stopan`, el entry point `stopan=stopan.cli.root:main`, los `.proto` y la extensión C `stopan.chunking.fastcdc`.
 
 ## Extensión C
 

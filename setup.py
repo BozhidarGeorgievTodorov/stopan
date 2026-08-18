@@ -47,8 +47,8 @@ setup(
     },
     ext_modules=[
         Extension(
-            "stopan.chunking.fast_rabin",
-            sources=["src/stopan/chunking/fast_rabin.c"],
+            "stopan.chunking.fastcdc",
+            sources=["src/stopan/chunking/fastcdc.c"],
         )
     ],
     entry_points={

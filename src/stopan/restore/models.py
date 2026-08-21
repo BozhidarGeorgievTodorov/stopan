@@ -22,4 +22,8 @@ class RestoreRunStats:
     chunks_failed: int = 0
     remote_chunks_corrupt: int = 0
     ec_recovery_failures: int = 0
+    files_reused: int = 0
+    files_resumed: int = 0
+    chunks_reused: int = 0
+    bytes_reused: int = 0
     bytes_written: int = 0

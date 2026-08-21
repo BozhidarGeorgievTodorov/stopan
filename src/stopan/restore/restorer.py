@@ -3,19 +3,23 @@ Reconstrucción de snapshots en disco.
 
 SnapshotRestorer reconstruye la jerarquía de directorios y archivos a partir de
 metadata y chunks raw obtenidos mediante ChunkFetchService. La escritura se hace
-en un directorio .incomplete y cada archivo pasa primero por un temporal privado.
+en un directorio .incomplete y cada archivo se construye en un parcial persistente
+verificable por su receta antes de publicarse dentro del árbol de trabajo.
 """
 
 from __future__ import annotations
 
 import os
 import stat
-import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
 
-from stopan.cli.output import format_duration, format_speed
-from stopan.common.fs import atomic_rename_noreplace
+import blake3
+
+from stopan.cli.output import format_bytes, format_duration, format_speed
+from stopan.common.fs import atomic_rename_noreplace, fsync_dir
 from stopan.metadata.database import MetadataDB
 from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.models import RestoreRunStats
@@ -26,6 +30,7 @@ from stopan.restore.errors import RestoreDataError, RestorePathError
 
 
 RESTORE_PROGRESS_EVERY_ITEMS = 100
+RESTORE_RESUME_SYNC_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +44,13 @@ class RestoreResult:
     work_dir: str | None = None
     error: str | None = None
     stats: RestoreRunStats | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedPrefix:
+    next_chunk_order: int
+    chunks: int
+    bytes: int
 
 
 class SnapshotRestorer:
@@ -70,8 +82,8 @@ class SnapshotRestorer:
         Ejecuta el restore de snapshot_id.
 
         Si el directorio final ya existe, rechaza la operación para no asumir que
-        contiene una restauración válida. Si existe el directorio .incomplete,
-        continúa trabajando sobre él para permitir reintentos.
+        contiene una restauración válida. Los reintentos verifican tanto archivos
+        completos de ``.incomplete`` como prefijos persistidos por fragmentos.
         """
         started_at = time.perf_counter()
         stats = self.fetch_service.stats
@@ -110,7 +122,7 @@ class SnapshotRestorer:
                 stats=stats,
             )
 
-        items_gen = self.db.iter_snapshot_restore_items(snapshot_id)
+        items_gen = self.db.get_snapshot_items(snapshot_id)
         first_entry = next(items_gen, None)
         if first_entry is None:
             message = f"Snapshot {snapshot_id} está vacío."
@@ -127,9 +139,13 @@ class SnapshotRestorer:
             os.makedirs(paths.incomplete_dir, exist_ok=True)
             validate_restore_root(paths.incomplete_dir)
             self._ensure_work_directory_permissions(paths.incomplete_dir)
+
+            os.makedirs(paths.resume_dir, mode=0o700, exist_ok=True)
+            validate_restore_root(paths.resume_dir)
+            os.chmod(paths.resume_dir, 0o700)
         except (OSError, RestorePathError) as exc:
             raise StopanStorageError(
-                f"No se pudo preparar el directorio de restore {paths.incomplete_dir}: {exc}"
+                f"No se pudo preparar el estado de restore de {paths.incomplete_dir}: {exc}"
             ) from exc
 
         print(f"Restaurando Snapshot {snapshot_id} en '{paths.incomplete_dir}/'...")
@@ -150,20 +166,10 @@ class SnapshotRestorer:
             target_parallelism=self.batch_target_parallelism,
             window=self.prefetch_window,
         )
-        current_tmp_path: str | None = None
-        try:
-            temp_workspace = tempfile.TemporaryDirectory(
-                prefix=f".stopan-restore-{snapshot_uuid[:12]}-",
-                dir=os.path.dirname(paths.incomplete_dir),
-                ignore_cleanup_errors=True,
-            )
-        except OSError as exc:
-            raise StopanStorageError(
-                f"No se pudo preparar el espacio temporal de restore junto a {paths.incomplete_dir}: {exc}"
-            ) from exc
+        current_resume_path: str | None = None
 
         try:
-            for item, recipe_chunk_hashes in iter_items():
+            for item in iter_items():
                 stats.processed_items += 1
 
                 try:
@@ -200,8 +206,8 @@ class SnapshotRestorer:
                 if stats.processed_items % RESTORE_PROGRESS_EVERY_ITEMS == 0:
                     self._print_progress(stats)
 
-                current_tmp_path = None
                 success_file = True
+                current_resume_path = paths.resume_file(str(item["path"]))
 
                 try:
                     recipe_id = item.get("recipe_id")
@@ -209,23 +215,138 @@ class SnapshotRestorer:
                         raise RestoreDataError(
                             f"Archivo {item['path']} sin receta asociada"
                         )
-                    chunk_hashes = recipe_chunk_hashes
-                    current_tmp_path = os.path.join(
-                        temp_workspace.name,
-                        f"{int(item['id'])}.tmp",
+                    recipe_id = int(recipe_id)
+                    expected_chunk_count, expected_size = self.db.get_recipe_restore_summary(
+                        recipe_id
                     )
-                    with open(current_tmp_path, "wb") as handle:
-                        for chunk_hash, raw_chunk in prefetcher.iter_raw_chunks(chunk_hashes):
-                            try:
-                                handle.write(raw_chunk)
-                                stats.bytes_written += len(raw_chunk)
-                            except Exception as exc:
-                                print(
-                                    f"   Error escribiendo chunk {chunk_hash[:8]} "
-                                    f"de {item['path']}: {exc}"
+                    item_size = int(item.get("size", -1))
+                    if item_size != expected_size:
+                        raise RestoreDataError(
+                            f"Tamaño inconsistente para {item['path']}: "
+                            f"item={item_size} receta={expected_size}"
+                        )
+
+                    if self._validate_completed_file(
+                        full_path,
+                        recipe_id=recipe_id,
+                        expected_chunk_count=expected_chunk_count,
+                        expected_size=expected_size,
+                    ):
+                        self._discard_resume_file(current_resume_path)
+                        self.apply_item_metadata(full_path, item, is_dir=False)
+                        stats.files_reused += 1
+                        stats.files_restored += 1
+                        stats.chunks_reused += expected_chunk_count
+                        stats.bytes_reused += expected_size
+                        stats.successful_items += 1
+                        current_resume_path = None
+                        continue
+
+                    resume_existed = os.path.lexists(current_resume_path)
+                    resume_name_synced = resume_existed
+                    bytes_since_sync = 0
+                    durable_checkpoints = expected_size >= RESTORE_RESUME_SYNC_BYTES
+
+                    with self._open_resume_file(current_resume_path) as handle:
+                        try:
+                            prefix = self._verify_resume_prefix(
+                                handle,
+                                recipe_id=recipe_id,
+                                expected_chunk_count=expected_chunk_count,
+                                expected_size=expected_size,
+                            )
+                            if prefix.chunks > 0 or prefix.bytes > 0:
+                                stats.chunks_reused += prefix.chunks
+                                stats.bytes_reused += prefix.bytes
+                            if resume_existed and (
+                                prefix.chunks > 0 or expected_chunk_count == 0
+                            ):
+                                stats.files_resumed += 1
+
+                            handle.seek(prefix.bytes)
+                            next_order = prefix.next_chunk_order
+                            records = self.db.iter_recipe_chunk_entries(
+                                recipe_id,
+                                start_order=next_order,
+                            )
+                            for chunk_order, chunk_hash, chunk_size, raw_chunk in (
+                                prefetcher.iter_raw_chunk_records(records)
+                            ):
+                                if chunk_order != next_order:
+                                    raise RestoreDataError(
+                                        f"Orden de chunk inesperado en {item['path']}: "
+                                        f"esperado={next_order} obtenido={chunk_order}"
+                                    )
+                                if len(raw_chunk) != chunk_size:
+                                    raise RestoreDataError(
+                                        f"Tamaño de chunk inconsistente en {item['path']}: "
+                                        f"hash={chunk_hash[:8]} esperado={chunk_size} "
+                                        f"obtenido={len(raw_chunk)}"
+                                    )
+                                written = handle.write(raw_chunk)
+                                if written != len(raw_chunk):
+                                    raise RestoreDataError(
+                                        f"Escritura incompleta en {item['path']}: "
+                                        f"hash={chunk_hash[:8]} esperado={len(raw_chunk)} "
+                                        f"escrito={written}"
+                                    )
+                                stats.bytes_written += written
+                                bytes_since_sync += written
+                                next_order += 1
+
+                                if (
+                                    durable_checkpoints
+                                    and bytes_since_sync >= RESTORE_RESUME_SYNC_BYTES
+                                ):
+                                    self._sync_resume_checkpoint(
+                                        handle,
+                                        paths.resume_dir,
+                                        sync_parent=not resume_name_synced,
+                                    )
+                                    resume_name_synced = True
+                                    bytes_since_sync = 0
+
+                            handle.flush()
+                            final_size = int(os.fstat(handle.fileno()).st_size)
+                            if next_order != expected_chunk_count:
+                                raise RestoreDataError(
+                                    f"Receta incompleta para {item['path']}: "
+                                    f"esperados={expected_chunk_count} procesados={next_order}"
                                 )
-                                success_file = False
-                                break
+                            if final_size != expected_size:
+                                raise RestoreDataError(
+                                    f"Tamaño final inconsistente para {item['path']}: "
+                                    f"esperado={expected_size} obtenido={final_size}"
+                                )
+
+                            # En archivos grandes, el último tramo debe quedar tan
+                            # durable como los checkpoints anteriores antes de mover
+                            # el parcial fuera del espacio de reanudación.
+                            if durable_checkpoints:
+                                self._sync_resume_checkpoint(
+                                    handle,
+                                    paths.resume_dir,
+                                    sync_parent=not resume_name_synced,
+                                )
+                                resume_name_synced = True
+                        except KeyboardInterrupt:
+                            # Ctrl+C es una interrupción ordenada: persiste también
+                            # el último tramo, aunque todavía no alcance el umbral
+                            # periódico. Ante un corte de energía se conservará, como
+                            # mínimo, el último checkpoint que el kernel haya confirmado.
+                            if int(os.fstat(handle.fileno()).st_size) > 0:
+                                try:
+                                    self._sync_resume_checkpoint(
+                                        handle,
+                                        paths.resume_dir,
+                                        sync_parent=not resume_name_synced,
+                                    )
+                                except OSError as sync_exc:
+                                    print(
+                                        "   No se pudo sincronizar el último avance "
+                                        f"de {item['path']}: {sync_exc}"
+                                    )
+                            raise
 
                 except Exception as exc:
                     print(f"   Error crítico en archivo {item['path']}: {exc}")
@@ -237,34 +358,32 @@ class SnapshotRestorer:
                         # inmediatamente antes de publicar para detectar cambios
                         # simbólicos introducidos desde la resolución inicial.
                         full_path = safe_restore_path(paths.incomplete_dir, item["path"])
-                        os.replace(current_tmp_path, full_path)
-                        current_tmp_path = None
+                        os.replace(current_resume_path, full_path)
+                        current_resume_path = None
                         self.apply_item_metadata(full_path, item, is_dir=False)
                         stats.files_restored += 1
                         stats.successful_items += 1
                     except Exception as exc:
                         print(f"   Error finalizando archivo {item['path']}: {exc}")
-                        if current_tmp_path and os.path.exists(current_tmp_path):
-                            os.remove(current_tmp_path)
-                        current_tmp_path = None
                         stats.files_failed += 1
                         print(
                             f"   Archivo {item['path']} no restaurado. "
-                            "Se reintentará en la próxima ejecución."
+                            "Se conservará su parcial verificable para el próximo intento."
                         )
                 else:
-                    if current_tmp_path and os.path.exists(current_tmp_path):
-                        os.remove(current_tmp_path)
-                    current_tmp_path = None
                     stats.files_failed += 1
-                    print(f"   Archivo {item['path']} no restaurado. Se reintentará en la próxima ejecución.")
+                    print(
+                        f"   Archivo {item['path']} no restaurado. "
+                        "Se conservará su parcial verificable para el próximo intento."
+                    )
+                current_resume_path = None
 
         except KeyboardInterrupt:
             print("\n\nRestauración cancelada (Ctrl+C).")
-            if current_tmp_path and os.path.exists(current_tmp_path):
-                os.remove(current_tmp_path)
-                print("Limpieza de archivo temporal completada.")
-            print(f"Progreso guardado en {paths.incomplete_dir}. Repite el comando para continuar.")
+            print(
+                "El progreso verificable por fragmentos se conserva para el próximo intento "
+                f"junto a {paths.incomplete_dir}."
+            )
             return RestoreResult(
                 snapshot_id=snapshot_id,
                 completed=False,
@@ -276,10 +395,27 @@ class SnapshotRestorer:
                 stats=stats,
             )
 
-        finally:
-            temp_workspace.cleanup()
-
         if stats.successful_items == stats.processed_items and stats.processed_items > 0:
+            try:
+                os.rmdir(paths.resume_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                message = (
+                    "No se pudo cerrar el estado de reanudación antes de publicar el restore: "
+                    f"{exc}"
+                )
+                print(message)
+                return RestoreResult(
+                    snapshot_id=snapshot_id,
+                    completed=False,
+                    processed_items=stats.processed_items,
+                    successful_items=stats.successful_items,
+                    work_dir=paths.incomplete_dir,
+                    error=message,
+                    stats=stats,
+                )
+
             if os.path.lexists(paths.final_dir):
                 message = (
                     f"El destino final apareció durante la restauración y no se sobrescribirá: "
@@ -360,6 +496,225 @@ class SnapshotRestorer:
             stats=stats,
         )
 
+    def _validate_completed_file(
+        self,
+        path: str,
+        *,
+        recipe_id: int,
+        expected_chunk_count: int,
+        expected_size: int,
+    ) -> bool:
+        """Comprueba si un archivo de staging coincide exactamente con su receta."""
+
+        try:
+            path_stat = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+        if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_nlink != 1:
+            return False
+        if int(path_stat.st_size) != expected_size:
+            return False
+
+        # Un intento anterior puede haber aplicado un modo sin lectura. Dentro
+        # del staging se recupera temporalmente lectura para poder verificarlo.
+        current_mode = stat.S_IMODE(path_stat.st_mode)
+        if not current_mode & stat.S_IRUSR:
+            try:
+                os.chmod(path, current_mode | stat.S_IRUSR)
+            except OSError:
+                return False
+
+        try:
+            with self._open_regular_file(path, writable=False, create=False) as handle:
+                verified_chunks = 0
+                verified_bytes = 0
+                for chunk_order, chunk_hash, chunk_size in self.db.iter_recipe_chunk_entries(
+                    recipe_id
+                ):
+                    if chunk_order != verified_chunks:
+                        raise RestoreDataError(
+                            f"Receta no contigua: recipe_id={recipe_id} "
+                            f"esperado={verified_chunks} obtenido={chunk_order}"
+                        )
+                    raw = self._read_exact(handle, chunk_size)
+                    if len(raw) != chunk_size:
+                        return False
+                    if blake3.blake3(raw).hexdigest() != chunk_hash:
+                        return False
+                    verified_chunks += 1
+                    verified_bytes += chunk_size
+
+                if verified_chunks != expected_chunk_count:
+                    raise RestoreDataError(
+                        f"Número de chunks inconsistente en recipe_id={recipe_id}: "
+                        f"esperado={expected_chunk_count} obtenido={verified_chunks}"
+                    )
+                if verified_bytes != expected_size:
+                    raise RestoreDataError(
+                        f"Tamaño de receta inconsistente en recipe_id={recipe_id}: "
+                        f"esperado={expected_size} obtenido={verified_bytes}"
+                    )
+                return handle.read(1) == b""
+        except (OSError, RestorePathError):
+            return False
+
+    def _verify_resume_prefix(
+        self,
+        handle: BinaryIO,
+        *,
+        recipe_id: int,
+        expected_chunk_count: int,
+        expected_size: int,
+    ) -> _VerifiedPrefix:
+        """Conserva solo el prefijo del parcial demostrable mediante la receta."""
+
+        file_size = int(os.fstat(handle.fileno()).st_size)
+        handle.seek(0)
+        verified_chunks = 0
+        verified_bytes = 0
+
+        for chunk_order, chunk_hash, chunk_size in self.db.iter_recipe_chunk_entries(recipe_id):
+            if chunk_order != verified_chunks:
+                raise RestoreDataError(
+                    f"Receta no contigua: recipe_id={recipe_id} "
+                    f"esperado={verified_chunks} obtenido={chunk_order}"
+                )
+            if verified_bytes + chunk_size > file_size:
+                break
+
+            raw = self._read_exact(handle, chunk_size)
+            if len(raw) != chunk_size:
+                break
+            if blake3.blake3(raw).hexdigest() != chunk_hash:
+                break
+
+            verified_chunks += 1
+            verified_bytes += chunk_size
+            if verified_chunks == expected_chunk_count:
+                break
+
+        if verified_chunks > expected_chunk_count or verified_bytes > expected_size:
+            raise RestoreDataError(
+                f"Prefijo fuera de la receta: recipe_id={recipe_id} "
+                f"chunks={verified_chunks}/{expected_chunk_count} "
+                f"bytes={verified_bytes}/{expected_size}"
+            )
+
+        # Cualquier cola no verificada, incluido un chunk escrito a medias tras
+        # un corte de energía, se descarta antes de continuar.
+        handle.seek(verified_bytes)
+        handle.truncate(verified_bytes)
+
+        return _VerifiedPrefix(
+            next_chunk_order=verified_chunks,
+            chunks=verified_chunks,
+            bytes=verified_bytes,
+        )
+
+    @staticmethod
+    def _read_exact(handle: BinaryIO, size: int) -> bytes:
+        """Lee hasta size bytes o EOF sin asumir que read() complete la petición."""
+
+        remaining = int(size)
+        parts: list[bytes] = []
+        while remaining > 0:
+            block = handle.read(remaining)
+            if not block:
+                break
+            parts.append(block)
+            remaining -= len(block)
+        if not parts:
+            return b""
+        if len(parts) == 1:
+            return parts[0]
+        return b"".join(parts)
+
+    @staticmethod
+    def _open_regular_file(
+        path: str,
+        *,
+        writable: bool,
+        create: bool,
+    ) -> BinaryIO:
+        """Abre un archivo regular sin seguir symlinks cuando la plataforma lo permite."""
+
+        flags = os.O_RDWR if writable else os.O_RDONLY
+        if create:
+            flags |= os.O_CREAT
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+        elif os.path.lexists(path):
+            existing = os.lstat(path)
+            if stat.S_ISLNK(existing.st_mode):
+                raise RestorePathError(f"El parcial de restore no puede ser un enlace: {path}")
+
+        fd = os.open(path, flags, 0o600)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise RestorePathError(f"El estado de restore no es un archivo regular: {path}")
+            if opened.st_nlink != 1:
+                raise RestorePathError(
+                    f"El estado de restore tiene enlaces adicionales y no es reutilizable: {path}"
+                )
+            if writable:
+                try:
+                    os.fchmod(fd, 0o600)
+                except AttributeError:
+                    os.chmod(path, 0o600)
+            return os.fdopen(fd, "r+b" if writable else "rb")
+        except Exception:
+            os.close(fd)
+            raise
+
+    @classmethod
+    def _open_resume_file(cls, path: str) -> BinaryIO:
+        handle = cls._open_regular_file(path, writable=True, create=True)
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise RestorePathError(
+                f"Otro proceso está utilizando el parcial de restore: {path}"
+            ) from exc
+        except ImportError as exc:
+            handle.close()
+            raise RestorePathError(
+                "La plataforma no dispone de un bloqueo de archivo compatible con "
+                "la reanudación segura del restore"
+            ) from exc
+        except Exception:
+            handle.close()
+            raise
+        return handle
+
+    @staticmethod
+    def _sync_resume_checkpoint(
+        handle: BinaryIO,
+        resume_dir: str,
+        *,
+        sync_parent: bool,
+    ) -> None:
+        """Hace durable un checkpoint del parcial sin mantener metadata adicional."""
+
+        handle.flush()
+        os.fsync(handle.fileno())
+        if sync_parent:
+            fsync_dir(Path(resume_dir), strict=True)
+
+    @staticmethod
+    def _discard_resume_file(path: str) -> None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
     @staticmethod
     def _ensure_work_directory_permissions(path: str) -> None:
         """
@@ -399,13 +754,16 @@ class SnapshotRestorer:
 
     @staticmethod
     def _print_progress(stats: RestoreRunStats) -> None:
+        suffix = ""
+        if stats.bytes_reused:
+            suffix = f" reutilizados={stats.bytes_reused}"
         print(
             "   progreso: "
             f"ítems={stats.processed_items} "
             f"archivos={stats.files_restored} "
             f"directorios={stats.directories_created} "
             f"fallidos={stats.files_failed} "
-            f"bytes={stats.bytes_written}"
+            f"bytes={stats.bytes_written}{suffix}"
         )
 
     @staticmethod
@@ -418,6 +776,14 @@ class SnapshotRestorer:
             f"archivos_fallidos={stats.files_failed} | "
             f"bytes={stats.bytes_written}"
         )
+        if stats.files_reused or stats.files_resumed or stats.chunks_reused:
+            print(
+                "Reanudación: "
+                f"archivos_reutilizados={stats.files_reused} | "
+                f"archivos_reanudados={stats.files_resumed} | "
+                f"chunks_reutilizados={stats.chunks_reused} | "
+                f"bytes_reutilizados={format_bytes(stats.bytes_reused)}"
+            )
         if elapsed is not None:
             print(f"Tiempo: {format_duration(elapsed)}")
             print(f"Velocidad: {format_speed(stats.bytes_written, elapsed)}")

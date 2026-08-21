@@ -2,8 +2,8 @@
 Rutas seguras para restore.
 
 Este módulo evita que rutas guardadas en metadata puedan escapar del directorio
-destino durante la restauración y centraliza la convención de directorios
-.incomplete usados para escrituras seguras.
+destino durante la restauración y centraliza las rutas de staging y reanudación
+usadas para publicar el resultado de forma segura.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import stat
 from dataclasses import dataclass
+
+import blake3
 
 from stopan.restore.errors import RestorePathError
 
@@ -144,19 +146,32 @@ def safe_restore_path(base_dir: str, rel_path: str) -> str:
 @dataclass(frozen=True, slots=True)
 class RestorePaths:
     """
-    Par de rutas usado para restaurar un snapshot de forma segura.
+    Rutas usadas para restaurar un snapshot de forma segura y reanudable.
 
-    incomplete_dir recibe la escritura inicial. Al completar el restore, se
-    puede promover a final_dir evitando exponer árboles restaurados a medias.
+    ``incomplete_dir`` contiene únicamente elementos completos del árbol de
+    trabajo. ``resume_dir`` conserva parciales verificables por fragmentos y
+    ``final_dir`` solo aparece al publicar la restauración completa.
     """
 
     final_dir: str
     incomplete_dir: str
+    resume_dir: str
 
     @staticmethod
     def for_snapshot(base_output_dir: str, snapshot_uuid: str) -> "RestorePaths":
-        """Construye las rutas final e incompleta para un snapshot concreto."""
+        """Construye las rutas final, de staging y de reanudación de un snapshot."""
 
         final_dir = os.path.join(base_output_dir, f"snapshot_{snapshot_uuid}")
         incomplete_dir = final_dir + ".incomplete"
-        return RestorePaths(final_dir=final_dir, incomplete_dir=incomplete_dir)
+        resume_dir = incomplete_dir + ".resume"
+        return RestorePaths(
+            final_dir=final_dir,
+            incomplete_dir=incomplete_dir,
+            resume_dir=resume_dir,
+        )
+
+    def resume_file(self, rel_path: str) -> str:
+        """Deriva una ruta estable y opaca para el parcial de un elemento."""
+
+        digest = blake3.blake3(os.fsencode(rel_path)).hexdigest()
+        return os.path.join(self.resume_dir, f"{digest}.part")

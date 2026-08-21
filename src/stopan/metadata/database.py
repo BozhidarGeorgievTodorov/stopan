@@ -979,15 +979,75 @@ class MetadataDB:
 
     def get_recipe_chunks(self, recipe_id: int) -> Iterator[str]:
         """Genera los hashes de una receta en su orden canónico."""
-        cursor = self.conn.execute("""
-            SELECT chunk_hash
+        for _order, chunk_hash, _chunk_size in self.iter_recipe_chunk_entries(recipe_id):
+            yield chunk_hash
+
+    def get_recipe_restore_summary(self, recipe_id: int) -> tuple[int, int]:
+        """Devuelve ``(chunk_count, total_size)`` para validar una restauración."""
+        row = self.conn.execute(
+            """
+            SELECT chunk_count, total_size
+            FROM recipes
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (int(recipe_id),),
+        ).fetchone()
+        if row is None:
+            raise MetadataDatabaseValueError(f"Recipe does not exist: {recipe_id}")
+
+        chunk_count = int(row["chunk_count"])
+        total_size = int(row["total_size"])
+        if chunk_count < 0 or total_size < 0:
+            raise MetadataDatabaseError(
+                f"Resumen de receta inválido durante restore: recipe_id={recipe_id} "
+                f"chunk_count={chunk_count} total_size={total_size}"
+            )
+        if (chunk_count == 0) != (total_size == 0):
+            raise MetadataDatabaseError(
+                f"Resumen de receta inconsistente durante restore: recipe_id={recipe_id} "
+                f"chunk_count={chunk_count} total_size={total_size}"
+            )
+        return chunk_count, total_size
+
+    def iter_recipe_chunk_entries(
+        self,
+        recipe_id: int,
+        *,
+        start_order: int = 0,
+    ) -> Iterator[tuple[int, str, int]]:
+        """Genera ``(orden, hash, tamaño)`` sin materializar la receta completa."""
+        first_order = int(start_order)
+        if first_order < 0:
+            raise ValueError("start_order debe ser >= 0")
+
+        cursor = self.conn.execute(
+            """
+            SELECT chunk_order, chunk_hash, chunk_size
             FROM recipe_chunks
             WHERE recipe_id = ?
+              AND chunk_order >= ?
             ORDER BY chunk_order ASC
-        """, (recipe_id,))
+            """,
+            (int(recipe_id), first_order),
+        )
 
+        expected_order = first_order
         for row in cursor:
-            yield row["chunk_hash"]
+            chunk_order = int(row["chunk_order"])
+            if chunk_order != expected_order:
+                raise MetadataDatabaseError(
+                    "recipe_chunks no es contigua durante restore: "
+                    f"recipe_id={recipe_id} esperado={expected_order} obtenido={chunk_order}"
+                )
+            chunk_size = int(row["chunk_size"])
+            if chunk_size < 1:
+                raise MetadataDatabaseError(
+                    f"chunk_size inválido durante restore: recipe_id={recipe_id} "
+                    f"order={chunk_order} size={chunk_size}"
+                )
+            yield chunk_order, str(row["chunk_hash"]), chunk_size
+            expected_order += 1
 
     def get_item_chunks(self, item_id: int) -> Iterator[str]:
         """Genera la receta de hashes de un archivo."""

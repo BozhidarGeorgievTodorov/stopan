@@ -34,34 +34,44 @@ class OrderedBatchChunkPrefetcher:
         Cada ventana se resuelve en lote, pero los resultados se emiten según el
         orden original para que el restorer pueda escribir secuencialmente.
         """
-                
-        window_hashes: list[str] = []
 
-        for chunk_hash in chunk_hashes:
-            window_hashes.append(chunk_hash)
-            if len(window_hashes) >= self.window:
-                yield from self._flush_window(window_hashes)
-                window_hashes = []
+        records = ((index, chunk_hash, 0) for index, chunk_hash in enumerate(chunk_hashes))
+        for _order, chunk_hash, _size, raw_chunk in self.iter_raw_chunk_records(records):
+            yield chunk_hash, raw_chunk
 
-        if window_hashes:
-            yield from self._flush_window(window_hashes)
+    def iter_raw_chunk_records(
+        self,
+        records: Iterable[tuple[int, str, int]],
+    ) -> Iterator[tuple[int, str, int, bytes]]:
+        """Resuelve registros de receta por ventanas preservando orden y tamaño esperado."""
 
-    def _flush_window(self, window_hashes: list[str]) -> Iterator[tuple[str, bytes]]:
-        """
-        Resuelve una ventana y produce sus chunks en el orden solicitado.
+        window_records: list[tuple[int, str, int]] = []
+        for record in records:
+            window_records.append(record)
+            if len(window_records) >= self.window:
+                yield from self._flush_record_window(window_records)
+                window_records = []
 
-        Si algún chunk no se resuelve, propaga el error asociado para abortar el
-        restore de forma explícita.
-        """
-        
+        if window_records:
+            yield from self._flush_record_window(window_records)
+
+    def _flush_record_window(
+        self,
+        window_records: list[tuple[int, str, int]],
+    ) -> Iterator[tuple[int, str, int, bytes]]:
+        """Resuelve una ventana de registros y devuelve cada resultado en orden."""
+
+        window_hashes = [chunk_hash for _order, chunk_hash, _size in window_records]
         results = self.fetch_service.fetch_many_raw_chunks(
             window_hashes,
             target_parallelism=self.target_parallelism,
         )
-        for chunk_hash in window_hashes:
+        for chunk_order, chunk_hash, chunk_size in window_records:
             value = results.get(chunk_hash)
             if value is None:
-                raise ChunkUnavailableError(f"Chunk {chunk_hash[:8]} no resuelto en ventana de restore")
+                raise ChunkUnavailableError(
+                    f"Chunk {chunk_hash[:8]} no resuelto en ventana de restore"
+                )
             if isinstance(value, Exception):
                 raise value
-            yield chunk_hash, value
+            yield chunk_order, chunk_hash, chunk_size, value

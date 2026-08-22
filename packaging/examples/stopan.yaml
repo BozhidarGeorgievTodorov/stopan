@@ -60,6 +60,7 @@ restore:
 
 membership:
   protocol_period_s: 1.0
+  bootstrap_retry_interval_s: 5.0
   ping_timeout_s: 0.25
   rpc_timeout_s: 2.0
   suspect_timeout_s: 6.0

@@ -232,6 +232,7 @@ _FIELD_CONVERTERS: dict[str, dict[str, Callable[[Any], Any]]] = {
     },
     "membership": {
         "protocol_period_s": _as_float,
+        "bootstrap_retry_interval_s": _as_float,
         "ping_timeout_s": _as_float,
         "suspect_timeout_s": _as_float,
         "indirect_ping_fanout": _as_int,

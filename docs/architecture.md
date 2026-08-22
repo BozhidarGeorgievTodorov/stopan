@@ -139,7 +139,7 @@ El almacenamiento remoto de chunks pasa por un commit engine interno con cola y 
 
 ## Membership y vista de clúster
 
-El proceso de nodo mantiene membership con un protocolo tipo SWIM. Los clientes operativos no mantienen membership permanente. Para `push`, `verify`, restore remoto o metadata packs, resuelven una vista del clúster en el momento de la operación.
+El proceso de nodo mantiene membership con un protocolo tipo SWIM. Al arrancar intenta descubrir el clúster mediante los seeds externos configurados. Si ninguno está disponible, el proceso sigue activo y reintenta esa incorporación con backoff exponencial acotado y jitter hasta descubrir al menos un par. Cada activación prueba un único seed y los contactos se recorren en round-robin. A partir de ese momento los seeds dejan de intervenir y la evolución ordinaria de la vista depende de sondeos y gossip. Los clientes operativos no mantienen membership permanente. Para `push`, `verify`, restore remoto o metadata packs, resuelven una vista del clúster en el momento de la operación.
 
 `ClusterView` representa la vista canónica usada por placement. Contiene miembros elegibles y, si se pudo resolver, el `self_node_id`.
 

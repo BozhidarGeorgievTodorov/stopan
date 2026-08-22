@@ -14,6 +14,8 @@ from stopan.config.defaults import (
     DEFAULT_GRPC_KEEPALIVE_TIME_MS,
     DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS,
     DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS,
+    DEFAULT_MEMBERSHIP_BOOTSTRAP_RETRY_INTERVAL_S,
+    MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S,
     DEFAULT_MEMBERSHIP_GOSSIP_TTL_S,
     DEFAULT_MEMBERSHIP_INDIRECT_PING_FANOUT,
     DEFAULT_MEMBERSHIP_MAX_GOSSIP_EVENTS,
@@ -48,6 +50,7 @@ class MembershipSettings:
 
     cluster_token: str = ""
     protocol_period_s: float = DEFAULT_MEMBERSHIP_PROTOCOL_PERIOD_S
+    bootstrap_retry_interval_s: float = DEFAULT_MEMBERSHIP_BOOTSTRAP_RETRY_INTERVAL_S
     ping_timeout_s: float = DEFAULT_MEMBERSHIP_PING_TIMEOUT_S
     rpc_timeout_s: float = DEFAULT_MEMBERSHIP_RPC_TIMEOUT_S
     suspect_timeout_s: float = DEFAULT_MEMBERSHIP_SUSPECT_TIMEOUT_S
@@ -63,6 +66,13 @@ class MembershipSettings:
         """Valida que los parámetros de membership sean utilizables."""
         if float(self.protocol_period_s) <= 0:
             raise MembershipConfigError("membership.protocol_period_s debe ser > 0")
+        if float(self.bootstrap_retry_interval_s) <= 0:
+            raise MembershipConfigError("membership.bootstrap_retry_interval_s debe ser > 0")
+        if float(self.bootstrap_retry_interval_s) > MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S:
+            raise MembershipConfigError(
+                "membership.bootstrap_retry_interval_s debe ser <= "
+                f"{MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S}"
+            )
         if float(self.ping_timeout_s) <= 0:
             raise MembershipConfigError("membership.ping_timeout_s debe ser > 0")
         if float(self.rpc_timeout_s) <= 0:

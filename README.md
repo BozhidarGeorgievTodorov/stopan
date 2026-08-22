@@ -85,7 +85,7 @@ sudo stopan init node \
   --bind-addr '[::]:50051'
 ```
 
-En un clúster con varios nodos, se pueden declarar seeds durante la inicialización:
+En un clúster con varios nodos, se pueden declarar seeds durante la inicialización. Si no están disponibles justo al arrancar, el nodo mantiene el servicio y reintenta la incorporación con una espera creciente y acotada hasta descubrir un par:
 
 ```bash
 sudo stopan init node \

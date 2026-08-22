@@ -14,6 +14,7 @@ from collections.abc import Iterable
 
 import grpc
 
+from stopan.config.defaults import MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S
 from stopan.protos import membership_pb2
 from stopan.node.errors import MembershipConfigError
 from stopan.node.identity import NodeIdentityStore
@@ -33,6 +34,14 @@ from .validation import (
 
 _STOP_JOIN_MIN_TIMEOUT_S = 2.0
 _STOP_JOIN_EXTRA_TIMEOUT_S = 0.5
+
+# Los reintentos de bootstrap deben recuperarse rápido de una indisponibilidad
+# breve sin convertir un nodo aislado o mal configurado en una fuente de tráfico
+# constante. El intervalo configurado actúa como base y crece exponencialmente
+# hasta este techo. El jitter evita que varios nodos arrancados a la vez queden
+# sincronizados contra los mismos seeds.
+_BOOTSTRAP_RETRY_BACKOFF_FACTOR = 2.0
+_BOOTSTRAP_RETRY_JITTER_RATIO = 0.20
 
 
 def _member_event(*, node_id: str, address: str, incarnation: int, state: int) -> membership_pb2.MemberEvent:
@@ -132,6 +141,16 @@ class MembershipManager:
         self._thread: threading.Thread | None = None
         self._seq = 0
 
+        # Bootstrap es una fase de descubrimiento inicial, no un mecanismo de
+        # reparación permanente. Si existen seeds externos, se reintenta hasta
+        # descubrir al menos un miembro ALIVE y después SWIM toma el relevo.
+        self._bootstrap_seeds: tuple[str, ...] = ()
+        self._bootstrap_retry_index = 0
+        self._bootstrap_complete = threading.Event()
+        self._next_bootstrap_retry_at: float | None = None
+        self._bootstrap_retry_nominal_s = float(self.settings.bootstrap_retry_interval_s)
+        self._bootstrap_seed_failures: dict[str, str] = {}
+
     @property
     def cluster_token(self) -> str:
         """Token compartido usado para autorizar RPCs de membership."""
@@ -167,6 +186,7 @@ class MembershipManager:
                 timeout=max(
                     _STOP_JOIN_MIN_TIMEOUT_S,
                     float(self.settings.protocol_period_s) + _STOP_JOIN_EXTRA_TIMEOUT_S,
+                    float(self.settings.rpc_timeout_s) + _STOP_JOIN_EXTRA_TIMEOUT_S,
                 )
             )
 
@@ -177,44 +197,139 @@ class MembershipManager:
         self.channels.close_all()
 
     def bootstrap_join(self, seeds: Iterable[str]) -> None:
-        """Intenta unirse al cluster usando seeds iniciales de membership."""
-        normalized_seeds = []
-        seen = set()
+        """Intenta el descubrimiento inicial y programa reintentos si sigue aislado."""
+        normalized_seeds = self._normalize_bootstrap_seeds(seeds)
+        self._bootstrap_seeds = normalized_seeds
+        self._bootstrap_retry_index = 0
+        self._bootstrap_retry_nominal_s = float(self.settings.bootstrap_retry_interval_s)
+
+        if not normalized_seeds:
+            self._bootstrap_complete.set()
+            self._next_bootstrap_retry_at = None
+            return
+
+        self._bootstrap_complete.clear()
+
+        # Se conserva el intento inmediato del arranque. Los seeds actúan como
+        # alternativas de entrada: en cuanto uno permite descubrir un par, no
+        # hace falta bloquear el arranque probando el resto.
+        for seed in normalized_seeds:
+            if self._refresh_bootstrap_completion():
+                break
+            self._join_seed(seed)
+
+        if not self._refresh_bootstrap_completion():
+            self._schedule_next_bootstrap_retry()
+
+    def _normalize_bootstrap_seeds(self, seeds: Iterable[str]) -> tuple[str, ...]:
+        """Normaliza seeds externos, elimina duplicados y descarta entradas inválidas."""
+        normalized: list[str] = []
+        seen: set[str] = set()
+
         for raw_seed in seeds:
             seed = str(raw_seed).strip()
             if not seed or seed == self.address or seed in seen:
                 continue
             seen.add(seed)
-            normalized_seeds.append(seed)
 
-        if not normalized_seeds:
-            return
+            if not is_valid_address(seed):
+                print(f"AVISO: seed de membership inválido ignorado: {seed!r}")
+                continue
 
+            normalized.append(seed)
+
+        return tuple(normalized)
+
+    def _join_seed(self, seed: str) -> None:
+        """Ejecuta un Join contra un seed y absorbe la vista devuelta."""
         me = membership_pb2.NodeInfo(
             node_id=self.node_id,
             address=self.address,
             incarnation=self.incarnation,
         )
 
-        for seed in normalized_seeds:
-            if not is_valid_address(seed):
-                print(f"AVISO: seed de membership inválido ignorado: {seed!r}")
-                continue
+        try:
+            stub = self.channels.get(seed)
+            response = stub.Join(
+                membership_pb2.JoinRequest(self=me, cluster_token=self.cluster_token),
+                timeout=float(self.settings.rpc_timeout_s),
+            )
+            for node in response.members:
+                self.apply_nodeinfo(node, state=membership_pb2.ALIVE, source="join")
+            self.apply_gossip(response.gossip, source="join-gossip")
 
-            try:
-                stub = self.channels.get(seed)
-                response = stub.Join(
-                    membership_pb2.JoinRequest(self=me, cluster_token=self.cluster_token),
-                    timeout=float(self.settings.rpc_timeout_s),
-                )
-                for node in response.members:
-                    self.apply_nodeinfo(node, state=membership_pb2.ALIVE, source="join")
-                self.apply_gossip(response.gossip, source="join-gossip")
-            except grpc.RpcError as exc:
-                details = getattr(exc, "details", lambda: str(exc))()
-                print(f"AVISO: join contra seed {seed} falló: {details}")
-            except ValueError as exc:
-                print(f"AVISO: join contra seed {seed} omitido: {exc}")
+            if seed in self._bootstrap_seed_failures:
+                self._bootstrap_seed_failures.pop(seed, None)
+                print(f"Membership: join contra seed {seed} restablecido")
+        except grpc.RpcError as exc:
+            details = getattr(exc, "details", lambda: str(exc))()
+            self._report_bootstrap_failure(seed, f"falló: {details}")
+        except ValueError as exc:
+            self._report_bootstrap_failure(seed, f"omitido: {exc}")
+
+    def _report_bootstrap_failure(self, seed: str, detail: str) -> None:
+        """Informa solo cuando cambia el fallo observado para evitar spam de reintentos."""
+        if self._bootstrap_seed_failures.get(seed) == detail:
+            return
+
+        self._bootstrap_seed_failures[seed] = detail
+        print(f"AVISO: join contra seed {seed} {detail}")
+
+    def _complete_bootstrap(self) -> None:
+        """Cierra de forma irreversible la fase de descubrimiento inicial."""
+        self._bootstrap_complete.set()
+        self._next_bootstrap_retry_at = None
+
+    def _refresh_bootstrap_completion(self) -> bool:
+        """Fija el bootstrap como completo al conocer un par ALIVE por cualquier vía."""
+        if self._bootstrap_complete.is_set():
+            return True
+
+        if not self.get_alive_peers():
+            return False
+
+        self._complete_bootstrap()
+        return True
+
+    def _schedule_next_bootstrap_retry(self) -> None:
+        """Programa el siguiente reintento con backoff acotado y jitter."""
+        base_interval_s = float(self.settings.bootstrap_retry_interval_s)
+        max_interval_s = MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S
+        nominal_s = min(self._bootstrap_retry_nominal_s, max_interval_s)
+
+        jitter_s = nominal_s * _BOOTSTRAP_RETRY_JITTER_RATIO
+        min_delay_s = max(0.0, nominal_s - jitter_s)
+        max_delay_s = min(max_interval_s, nominal_s + jitter_s)
+        delay_s = random.uniform(min_delay_s, max_delay_s)
+
+        self._next_bootstrap_retry_at = time.monotonic() + delay_s
+        self._bootstrap_retry_nominal_s = min(
+            max_interval_s,
+            nominal_s * _BOOTSTRAP_RETRY_BACKOFF_FACTOR,
+        )
+
+    def _retry_bootstrap_if_due(self) -> None:
+        """Reintenta un único seed cuando el descubrimiento inicial sigue pendiente."""
+        if self._bootstrap_complete.is_set() or not self._bootstrap_seeds:
+            return
+
+        if self._refresh_bootstrap_completion():
+            return
+
+        now = time.monotonic()
+        next_retry_at = self._next_bootstrap_retry_at
+        if next_retry_at is not None and now < next_retry_at:
+            return
+
+        seed = self._bootstrap_seeds[self._bootstrap_retry_index]
+        self._bootstrap_retry_index = (
+            self._bootstrap_retry_index + 1
+        ) % len(self._bootstrap_seeds)
+
+        self._join_seed(seed)
+
+        if not self._refresh_bootstrap_completion():
+            self._schedule_next_bootstrap_retry()
 
     def get_alive_peers(self) -> list[MemberRecord]:
         """Devuelve peers ALIVE excluyendo el nodo local."""
@@ -257,6 +372,8 @@ class MembershipManager:
             if current is None:
                 self._members[event.node_id] = _new_record_from_event(event, observed_at=observed_at)
                 self.gossip.add(event)
+                if event.state == membership_pb2.ALIVE:
+                    self._complete_bootstrap()
                 return
 
             if event.incarnation > current.incarnation:
@@ -267,6 +384,8 @@ class MembershipManager:
                     replace_incarnation=True,
                 )
                 self.gossip.add(event)
+                if event.state == membership_pb2.ALIVE:
+                    self._complete_bootstrap()
                 return
 
             if event.incarnation < current.incarnation:
@@ -280,6 +399,8 @@ class MembershipManager:
                     replace_incarnation=False,
                 )
                 self.gossip.add(event)
+                if event.state == membership_pb2.ALIVE:
+                    self._complete_bootstrap()
 
     def apply_gossip(self, events: Iterable[membership_pb2.MemberEvent], *, source: str) -> None:
         """Aplica gossip entrante respetando el límite configurado."""
@@ -359,40 +480,60 @@ class MembershipManager:
         self.apply_event(event, source="local-dead")
 
     def _swim_loop(self) -> None:
-        """Ejecuta rondas periódicas de ping directo e indirecto."""
-        while not self._stop.wait(float(self.settings.protocol_period_s)):
-            # La expiración de sospechas no depende de que quede algún miembro
-            # ALIVE disponible para sondear en esta ronda.
+        """Coordina reintentos de bootstrap y rondas periódicas de SWIM."""
+        protocol_period_s = float(self.settings.protocol_period_s)
+        next_protocol_at = time.monotonic() + protocol_period_s
+
+        while True:
+            now = time.monotonic()
+            wake_at = next_protocol_at
+
+            if not self._bootstrap_complete.is_set() and self._bootstrap_seeds:
+                retry_at = self._next_bootstrap_retry_at
+                if retry_at is not None:
+                    wake_at = min(wake_at, retry_at)
+
+            if self._stop.wait(max(0.0, wake_at - now)):
+                return
+
+            self._retry_bootstrap_if_due()
+
+            now = time.monotonic()
+            if now < next_protocol_at:
+                continue
+
+            next_protocol_at = now + protocol_period_s
+            self._run_swim_round()
+
+    def _run_swim_round(self) -> None:
+        """Ejecuta una ronda de detección de fallos y expiración de sospechas."""
+        # La expiración de sospechas no depende de que quede algún miembro
+        # ALIVE disponible para sondear en esta ronda.
+        self._expire_suspects()
+
+        peers = self.get_alive_peers()
+        if not peers:
+            return
+
+        target = random.choice(peers)
+        self._seq += 1
+        seq = self._seq
+
+        if self._ping(target, seq):
             self._expire_suspects()
+            return
 
-            peers = self.get_alive_peers()
-            if not peers:
-                continue
+        helpers = [peer for peer in peers if peer.node_id != target.node_id]
+        random.shuffle(helpers)
+        helpers = helpers[: int(self.settings.indirect_ping_fanout)]
 
-            target = random.choice(peers)
-            self._seq += 1
-            seq = self._seq
-
-            if self._ping(target, seq):
+        for helper in helpers:
+            if self._ping_req(helper=helper, target=target, seq=seq):
                 self._expire_suspects()
-                continue
+                return
 
-            helpers = [peer for peer in peers if peer.node_id != target.node_id]
-            random.shuffle(helpers)
-            helpers = helpers[: int(self.settings.indirect_ping_fanout)]
-
-            indirect_ok = False
-            for helper in helpers:
-                if self._ping_req(helper=helper, target=target, seq=seq):
-                    indirect_ok = True
-                    break
-
-            if indirect_ok:
-                self._expire_suspects()
-                continue
-
-            self._mark_suspect(target.node_id, target.address, target.incarnation)
-            self._expire_suspects()
+        self._mark_suspect(target.node_id, target.address, target.incarnation)
+        self._expire_suspects()
 
     def _expire_suspects(self) -> None:
         """Promueve SUSPECT a DEAD al superar suspect_timeout_s."""

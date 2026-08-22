@@ -68,6 +68,8 @@ sudo stopan init node \
 
 `advertise_addr` debe ser resoluble y alcanzable desde el resto de máquinas. Puede usarse DNS local o IP fija, por ejemplo `192.168.1.10:50051`.
 
+Los seeds externos son puntos de entrada, no miembros fijados permanentemente. Si están temporalmente inaccesibles durante el arranque, el nodo continúa funcionando y vuelve a intentar la incorporación con una espera creciente, acotada y desincronizada mediante jitter hasta descubrir un par. El primer nodo puede arrancar aislado porque `stopan init node` usa su propio `advertise_addr` como seed cuando no se proporciona ninguno y ese contacto propio se descarta durante el bootstrap.
+
 `stopan init node` no inicializa la identidad de metadata. Solo configura nodo, clúster y política básica de protección de datos.
 
 ## Inicializar metadata

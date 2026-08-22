@@ -62,7 +62,7 @@ node:
 
 `token` es un token compartido por los nodos que deben verse entre sí. Los RPC de membership, almacenamiento y metadata packs lo usan como barrera lógica. `stopan node` exige que sea no vacío y rechaza el arranque si la credencial no está configurada. No sustituye a TLS, VPN, firewall ni control de red.
 
-`seeds` es la lista de direcciones iniciales usadas para descubrir miembros. En una instalación estable conviene poner varios nodos que normalmente estén encendidos. Si `stopan init node` se ejecuta sin `--seed`, escribe como seed el propio `advertise_addr`.
+`seeds` es la lista de direcciones iniciales usadas para descubrir miembros. El nodo intenta contactarlas al arrancar y, si existen seeds externos pero todavía no ha descubierto ningún par, reintenta la incorporación periódicamente hasta conseguirlo. Después el mantenimiento de la vista queda en manos del protocolo de membership y los seeds dejan de utilizarse como mecanismo de reparación. En una instalación estable conviene poner varios nodos que normalmente estén encendidos. Si `stopan init node` se ejecuta sin `--seed`, escribe como seed el propio `advertise_addr`, que se ignora como contacto externo y permite arrancar un primer nodo aislado.
 
 Ejemplo:
 
@@ -228,6 +228,8 @@ restore:
 
 `protocol_period_s` marca la cadencia del protocolo.
 
+`bootstrap_retry_interval_s` marca el intervalo nominal inicial de incorporación mientras hay seeds externos configurados y todavía no se ha descubierto ningún par. Debe estar en el intervalo `(0, 30]` s. Tras fallos sucesivos, la espera crece exponencialmente hasta un máximo de 30 s y se introduce una pequeña variación aleatoria para evitar que varios nodos aislados reintenten de forma sincronizada. Cada reintento prueba un único seed y los contactos se recorren en round-robin.
+
 `ping_timeout_s` es el timeout de ping directo.
 
 `rpc_timeout_s` es el timeout para llamadas RPC de membership usadas por clientes y operaciones distribuidas.
@@ -243,6 +245,7 @@ Ejemplo:
 ```yaml
 membership:
   protocol_period_s: 1.0
+  bootstrap_retry_interval_s: 5.0
   ping_timeout_s: 0.25
   rpc_timeout_s: 2.0
   suspect_timeout_s: 6.0

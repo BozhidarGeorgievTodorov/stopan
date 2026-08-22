@@ -21,6 +21,8 @@ from stopan.config.defaults import (
     DEFAULT_GRPC_KEEPALIVE_TIME_MS,
     DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS,
     DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    DEFAULT_MEMBERSHIP_BOOTSTRAP_RETRY_INTERVAL_S,
+    MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S,
     DEFAULT_MEMBERSHIP_GOSSIP_TTL_S,
     DEFAULT_MEMBERSHIP_INDIRECT_PING_FANOUT,
     DEFAULT_MEMBERSHIP_MAX_GOSSIP_EVENTS,
@@ -100,7 +102,14 @@ def _require_int(name: str, value: object, *, min_value: int) -> None:
         raise StopanConfigValueError(f"{name} debe ser >= {min_value}; recibido {value}")
 
 
-def _require_float(name: str, value: object, *, min_value: float, inclusive: bool = False) -> None:
+def _require_float(
+    name: str,
+    value: object,
+    *,
+    min_value: float,
+    inclusive: bool = False,
+    max_value: float | None = None,
+) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise StopanConfigTypeError(f"{name} debe ser numérico; recibido {type(value).__name__}")
 
@@ -110,6 +119,9 @@ def _require_float(name: str, value: object, *, min_value: float, inclusive: boo
             raise StopanConfigValueError(f"{name} debe ser >= {min_value}; recibido {value}")
     elif numeric <= min_value:
         raise StopanConfigValueError(f"{name} debe ser > {min_value}; recibido {value}")
+
+    if max_value is not None and numeric > max_value:
+        raise StopanConfigValueError(f"{name} debe ser <= {max_value}; recibido {value}")
 
 
 def _require_str_tuple(name: str, value: object) -> None:
@@ -250,6 +262,7 @@ class RestoreConfig:
 @dataclass(frozen=True)
 class MembershipConfig:
     protocol_period_s: float = DEFAULT_MEMBERSHIP_PROTOCOL_PERIOD_S
+    bootstrap_retry_interval_s: float = DEFAULT_MEMBERSHIP_BOOTSTRAP_RETRY_INTERVAL_S
     ping_timeout_s: float = DEFAULT_MEMBERSHIP_PING_TIMEOUT_S
     rpc_timeout_s: float = DEFAULT_MEMBERSHIP_RPC_TIMEOUT_S
     suspect_timeout_s: float = DEFAULT_MEMBERSHIP_SUSPECT_TIMEOUT_S
@@ -259,6 +272,12 @@ class MembershipConfig:
 
     def __post_init__(self) -> None:
         _require_float("membership.protocol_period_s", self.protocol_period_s, min_value=0.0)
+        _require_float(
+            "membership.bootstrap_retry_interval_s",
+            self.bootstrap_retry_interval_s,
+            min_value=0.0,
+            max_value=MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S,
+        )
         _require_float("membership.ping_timeout_s", self.ping_timeout_s, min_value=0.0)
         _require_float("membership.rpc_timeout_s", self.rpc_timeout_s, min_value=0.0)
         _require_float("membership.suspect_timeout_s", self.suspect_timeout_s, min_value=0.0)

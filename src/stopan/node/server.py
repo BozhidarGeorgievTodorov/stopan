@@ -76,6 +76,7 @@ def serve(config: StopanConfig) -> None:
     membership_settings = MembershipSettings(
         cluster_token=cluster_token,
         protocol_period_s=config.membership.protocol_period_s,
+        bootstrap_retry_interval_s=config.membership.bootstrap_retry_interval_s,
         ping_timeout_s=config.membership.ping_timeout_s,
         rpc_timeout_s=config.membership.rpc_timeout_s,
         suspect_timeout_s=config.membership.suspect_timeout_s,

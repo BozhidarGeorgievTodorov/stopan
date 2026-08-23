@@ -293,7 +293,6 @@ class MembershipManager:
 
     def _schedule_next_bootstrap_retry(self) -> None:
         """Programa el siguiente reintento con backoff acotado y jitter."""
-        base_interval_s = float(self.settings.bootstrap_retry_interval_s)
         max_interval_s = MEMBERSHIP_BOOTSTRAP_RETRY_MAX_INTERVAL_S
         nominal_s = min(self._bootstrap_retry_nominal_s, max_interval_s)
 

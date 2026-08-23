@@ -186,9 +186,9 @@ El flujo de `push` EC es:
 - resolver membership y comprobar capacidad remota
 - buscar packs pendientes de reintento
 - buscar chunks nuevos según scope
-- agrupar chunks en data packs hasta el tamaño objetivo
-- generar shards
-- colocar cada shard en un nodo remoto distinto
+- agrupar chunks en data packs sin desbordar el tamaño objetivo con varios chunks
+- generar shards y comprobar sus límites de almacenamiento y transporte
+- colocar cada shard en un nodo remoto distinto y procesar targets independientes en paralelo
 - registrar pack, chunks del pack y shards en SQLite
 - marcar el estado del pack
 

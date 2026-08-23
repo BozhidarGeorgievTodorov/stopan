@@ -7,4 +7,5 @@ data_push:
   # ec_k: 2
   # ec_m: 1
   # ec_pack_size_bytes: 8388608
+  # target_parallelism: 4
   # limit: 10000

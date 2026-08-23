@@ -22,6 +22,7 @@ protection:
   ec_k: 2
   ec_m: 1
   ec_pack_size_bytes: 8388608
+  ec_target_parallelism: 4
 
 backup:
   workers: 4

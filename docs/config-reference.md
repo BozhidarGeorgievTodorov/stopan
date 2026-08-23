@@ -84,7 +84,9 @@ cluster:
 
 `ec_k` y `ec_m` configuran el modo EC. `ec_k` es el número de shards de datos necesarios y `ec_m` el número de shards de paridad. Para proteger datos con EC hacen falta al menos `ec_k + ec_m` nodos remotos elegibles, porque el origen queda excluido del placement.
 
-`ec_pack_size_bytes` controla el tamaño objetivo de los data packs EC antes de generar shards. Debe ser compatible con los límites gRPC y de almacenamiento configurados.
+`ec_pack_size_bytes` controla el tamaño objetivo de los data packs EC antes de generar shards. El builder no desborda ese objetivo con varios chunks: si el siguiente no cabe, cierra primero el pack abierto. Un chunk individual mayor que el objetivo puede formar un pack singleton. Antes de enviar, Stopan comprueba que cada shard resultante cabe en el límite de almacenamiento y en los mensajes gRPC necesarios tanto para replicarlo como para recuperarlo.
+
+`ec_target_parallelism` limita cuántos custodios de shards EC se procesan en paralelo durante `stopan push --protection-mode ec`. Cada target conserva su secuencia de consulta de presencia y replicación, pero targets distintos pueden avanzar concurrentemente.
 
 Ejemplo:
 
@@ -95,6 +97,7 @@ protection:
   ec_k: 2
   ec_m: 1
   ec_pack_size_bytes: 8388608
+  ec_target_parallelism: 4
 ```
 
 ## Sección `backup`

@@ -44,7 +44,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--ec-pack-size-bytes",
         type=int,
         default=None,
-        help="Tamaño objetivo máximo del payload de cada data pack EC. Default: protection.ec_pack_size_bytes.",
+        help="Tamaño objetivo del payload de cada data pack EC. Default: protection.ec_pack_size_bytes.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Límite de chunks a procesar en esta ejecución.")
     parser.add_argument(
@@ -107,7 +107,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             args,
             (
                 Flag("remote_copies", "--remote-copies"),
-                Flag("target_parallelism", "--target-parallelism"),
                 Flag("probe_batch_hashes", "--probe-batch-hashes"),
                 Flag("stream_inflight", "--stream-inflight"),
                 Flag("probe_timeout_s", "--probe-timeout-s"),
@@ -127,6 +126,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 IntRange("ec_k", "--ec-k", 1),
                 IntRange("ec_m", "--ec-m", 0),
                 IntRange("ec_pack_size_bytes", "--ec-pack-size-bytes", 1),
+                IntRange("target_parallelism", "--target-parallelism", 1),
             ),
         )
 
@@ -177,8 +177,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ec_k=int(choose(args.ec_k, cfg.protection.ec_k)),
             ec_m=int(choose(args.ec_m, cfg.protection.ec_m)),
             ec_pack_size_bytes=int(choose(args.ec_pack_size_bytes, cfg.protection.ec_pack_size_bytes)),
+            target_parallelism=int(
+                choose(args.target_parallelism, cfg.protection.ec_target_parallelism)
+            ),
             stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
             max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+            max_shard_size=int(cfg.storage.max_chunk_size),
             commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
             db_file=cfg.node.catalog_file,
             local_chunk_dir=cfg.storage.local_chunk_dir,

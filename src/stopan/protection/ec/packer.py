@@ -1,8 +1,9 @@
 """
 Construcción de data packs post-deduplicación.
 
-El target size es un límite superior operativo. Al finalizar un push, el caller
-debe forzar flush del builder aunque el pack abierto sea pequeño.
+El target size acota los packs formados por varios chunks. Un chunk individual
+mayor puede formar un pack singleton. Al finalizar un push, el caller debe forzar
+flush del builder aunque el pack abierto sea pequeño.
 """
 
 from __future__ import annotations
@@ -50,6 +51,23 @@ class DataPackBuilder:
     def is_empty(self) -> bool:
         return not self._chunks
 
+    def would_exceed_target(self, *, data_size: int) -> bool:
+        """
+        Indica si añadir otro chunk excedería el target de un pack ya abierto.
+
+        Un chunk individual mayor que el target se admite como pack singleton.
+        El límite evita únicamente que varios chunks desborden el target por el
+        último elemento añadido.
+        """
+        if isinstance(data_size, bool) or not isinstance(data_size, int):
+            raise ErasureCodingError("data_size debe ser int")
+        if data_size < 0:
+            raise ErasureCodingError("data_size debe ser >= 0")
+        return bool(
+            self._chunks
+            and self._current_size + data_size > self.target_size_bytes
+        )
+
     def add_chunk(self, *, chunk_hash: str, data: bytes) -> bool:
         chunk_hash, data = _validated_chunk_payload(chunk_hash=chunk_hash, data=data)
         return self._append_validated_chunk(chunk_hash=chunk_hash, data=data)
@@ -59,6 +77,11 @@ class DataPackBuilder:
         return self._append_validated_chunk(chunk_hash=chunk_hash, data=data)
 
     def _append_validated_chunk(self, *, chunk_hash: str, data: bytes) -> bool:
+        if self.would_exceed_target(data_size=len(data)):
+            raise ErasureCodingError(
+                "el chunk excedería target_size_bytes del pack abierto; "
+                "debe hacerse flush antes de añadirlo"
+            )
         self._chunks.append((chunk_hash, data))
         self._current_size += len(data)
         return self._current_size >= self.target_size_bytes

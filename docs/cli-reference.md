@@ -52,7 +52,7 @@ stopan backup --help
 | Comando | Modo | Acepta | Rechaza o limita | Nota |
 |---|---|---|---|---|
 | `push` | `replication` | `--remote-copies`, `--strict-remote-copies`, `--probe-batch-hashes`, `--stream-inflight` | Opciones exclusivas de EC | Replica chunks completos. |
-| `push` | `ec` | `--ec-k`, `--ec-m`, `--ec-pack-size-bytes` | Opciones exclusivas de replicación | Distribuye shards de data packs. |
+| `push` | `ec` | `--ec-k`, `--ec-m`, `--ec-pack-size-bytes`, `--target-parallelism` | Opciones exclusivas de replicación | Distribuye shards de data packs. |
 | `verify` | `replication` | `--probe-batch-hashes` | `--pack-hash` | Consulta presencia de chunks. |
 | `verify` | `ec` | `--pack-hash` | `--probe-batch-hashes` | Consulta presencia de shards. |
 | `restore` | `none` | `--out`, `--prefetch-window` | `--membership-seed`, `--replication-targets` | No usa red. |
@@ -319,6 +319,7 @@ Opciones específicas:
 --ec-k N
 --ec-m N
 --ec-pack-size-bytes BYTES
+--target-parallelism N
 ```
 
 `--ec-k` es el número de data shards por data pack.
@@ -329,12 +330,14 @@ Stopan necesita colocar `ec_k + ec_m` shards en nodos remotos elegibles distinto
 
 `--ec-m 0` está permitido, pero no aporta redundancia. En ese caso se necesitan todos los shards para reconstruir el pack.
 
-`--ec-pack-size-bytes` controla el tamaño objetivo de los data packs que se convierten en shards EC. Es un ajuste de rendimiento y granularidad, no un factor de redundancia.
+`--ec-pack-size-bytes` controla el tamaño objetivo de los data packs que se convierten en shards EC. Es un ajuste de rendimiento y granularidad, no un factor de redundancia. El pack abierto se cierra antes de añadir un chunk que haría superar ese objetivo; un chunk individual mayor puede formar un pack singleton.
+
+`--target-parallelism` controla cuántos targets de shards EC se procesan en paralelo. Dentro de cada target se mantiene la secuencia probe → envío de shards ausentes → confirmaciones.
 
 Ejemplo:
 
 ```bash
-stopan push --protection-mode ec --ec-k 2 --ec-m 1
+stopan push --protection-mode ec --ec-k 2 --ec-m 1 --target-parallelism 4
 ```
 
 Validaciones específicas:
@@ -343,6 +346,7 @@ Validaciones específicas:
 --ec-k debe ser al menos 1.
 --ec-m puede ser 0 o mayor.
 --ec-pack-size-bytes debe ser al menos 1.
+--target-parallelism debe ser al menos 1.
 Las opciones exclusivas de replication se rechazan en modo EC.
 ```
 

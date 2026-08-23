@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from stopan.common.sequences import ordered_unique_by
 from stopan.protection.ec.models import (
     ErasureCodingError,
+    ErasureCodingConfigError,
     require_hash64,
     require_non_negative_int,
 )
@@ -170,6 +171,12 @@ class RemoteDataPackShardClientPool(P2PStorageProtectionClient):
         if not ordered:
             return []
 
+        for item in ordered:
+            ensure_data_pack_shard_fits_transport(
+                item,
+                max_message_bytes=self.max_message_bytes,
+            )
+
         stub = self._get_stub(addr)
         response_iter = stub.ReplicateDataPackShards(
             (self._pb_replicate_request(item) for item in ordered),
@@ -296,3 +303,87 @@ def _dedupe_payloads(
             raise ErasureCodingError("payload duplicado con datos distintos")
         ordered.setdefault(key, shard)
     return list(ordered.values())
+
+
+def replicate_data_pack_shard_request_size_bytes(
+    item: RemoteDataPackShardPayload,
+) -> int:
+    """Devuelve el tamaño protobuf del mensaje ReplicateDataPackShardRequest."""
+    if not isinstance(item, RemoteDataPackShardPayload):
+        raise ErasureCodingError("item debe ser RemoteDataPackShardPayload")
+
+    # Campos 1 y 3 son hashes ASCII de 64 bytes. Sus tags y longitudes ocupan
+    # un byte cada uno. shard_index se omite en proto3 cuando vale 0.
+    size = (1 + 1 + 64) + (1 + 1 + 64)
+    if item.ref.shard_index != 0:
+        size += 1 + _protobuf_varint_size(item.ref.shard_index)
+
+    data_size = len(item.data)
+    size += 1 + _protobuf_varint_size(data_size) + data_size
+    return size
+
+
+def ensure_replicate_data_pack_shard_fits_message(
+    item: RemoteDataPackShardPayload,
+    *,
+    max_message_bytes: int,
+) -> None:
+    max_message_bytes = int(max_message_bytes)
+    if max_message_bytes <= 0:
+        raise ErasureCodingConfigError("grpc.max_message_bytes debe ser > 0")
+
+    request_size = replicate_data_pack_shard_request_size_bytes(item)
+    if request_size > max_message_bytes:
+        raise ErasureCodingConfigError(
+            "shard EC demasiado grande para un mensaje gRPC: "
+            f"request_size={request_size} > max_message_bytes={max_message_bytes}; "
+            f"shard_size={len(item.data)} shard_index={item.ref.shard_index}"
+        )
+
+
+def retrieve_data_pack_shard_response_size_bytes(
+    item: RemoteDataPackShardPayload,
+) -> int:
+    """Tamaño protobuf de una respuesta batch que contiene únicamente este shard."""
+    if not isinstance(item, RemoteDataPackShardPayload):
+        raise ErasureCodingError("item debe ser RemoteDataPackShardPayload")
+
+    # RetrievedDataPackShard: hashes, índice, status=FOUND, shard_data y detail="ok".
+    inner_size = (1 + 1 + 64) + (1 + 1 + 64)
+    if item.ref.shard_index != 0:
+        inner_size += 1 + _protobuf_varint_size(item.ref.shard_index)
+    inner_size += 1 + 1  # status enum FOUND=1
+    inner_size += 1 + _protobuf_varint_size(len(item.data)) + len(item.data)
+    inner_size += 1 + 1 + 2  # detail="ok"
+
+    # RetrieveDataPackShardBatchResponse.results es un campo repeated message.
+    return 1 + _protobuf_varint_size(inner_size) + inner_size
+
+
+def ensure_data_pack_shard_fits_transport(
+    item: RemoteDataPackShardPayload,
+    *,
+    max_message_bytes: int,
+) -> None:
+    ensure_replicate_data_pack_shard_fits_message(
+        item,
+        max_message_bytes=max_message_bytes,
+    )
+
+    response_size = retrieve_data_pack_shard_response_size_bytes(item)
+    if response_size > int(max_message_bytes):
+        raise ErasureCodingConfigError(
+            "shard EC demasiado grande para recuperarse en un mensaje gRPC: "
+            f"response_size={response_size} > max_message_bytes={int(max_message_bytes)}; "
+            f"shard_size={len(item.data)} shard_index={item.ref.shard_index}"
+        )
+
+
+def _protobuf_varint_size(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ErasureCodingError("varint protobuf requiere entero >= 0")
+    size = 1
+    while value >= 0x80:
+        value >>= 7
+        size += 1
+    return size

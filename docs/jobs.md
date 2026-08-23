@@ -139,6 +139,7 @@ data_push:
   ec_k: 2
   ec_m: 1
   ec_pack_size_bytes: 8388608
+  target_parallelism: 4
 ```
 
 Campos soportados:
@@ -163,7 +164,7 @@ max_message_bytes
 membership_seed
 ```
 
-En `protection_mode: ec`, los campos de replicación no aplican.
+En `protection_mode: ec`, `target_parallelism` controla cuántos targets EC se procesan en paralelo. `probe_batch_hashes`, `stream_inflight`, `probe_timeout_s`, `remote_copies` y `strict_remote_copies` siguen siendo exclusivos de replicación.
 
 ## Data verify
 

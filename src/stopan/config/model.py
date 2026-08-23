@@ -17,6 +17,7 @@ from stopan.config.defaults import (
     DEFAULT_GC_RECEIVED_METADATA_PACK_MAX_AGE_DAYS,
     DEFAULT_GC_RECOVERED_METADATA_PACK_MAX_AGE_DAYS,
     DEFAULT_EC_PACK_SIZE_BYTES,
+    DEFAULT_EC_TARGET_PARALLELISM,
     DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS,
     DEFAULT_GRPC_KEEPALIVE_TIME_MS,
     DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS,
@@ -168,6 +169,7 @@ class ProtectionConfig:
     ec_k: int = DEFAULT_PROTECTION_EC_K
     ec_m: int = DEFAULT_PROTECTION_EC_M
     ec_pack_size_bytes: int = DEFAULT_EC_PACK_SIZE_BYTES
+    ec_target_parallelism: int = DEFAULT_EC_TARGET_PARALLELISM
 
     def __post_init__(self) -> None:
         _require_int("protection.remote_copies", self.remote_copies, min_value=0)
@@ -175,6 +177,7 @@ class ProtectionConfig:
         _require_int("protection.ec_k", self.ec_k, min_value=1)
         _require_int("protection.ec_m", self.ec_m, min_value=0)
         _require_int("protection.ec_pack_size_bytes", self.ec_pack_size_bytes, min_value=1)
+        _require_int("protection.ec_target_parallelism", self.ec_target_parallelism, min_value=1)
 
 
 @dataclass(frozen=True)

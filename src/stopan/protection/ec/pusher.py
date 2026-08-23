@@ -15,7 +15,11 @@ from stopan.metadata.objects.graph.auto_export import (
     export_after_successful_metadata_change,
 )
 from stopan.protection.ec.metadata_adapter import spec_from_erasure_metadata
-from stopan.protection.ec.models import ErasureCodingError, ErasureSpec
+from stopan.protection.ec.models import (
+    ErasureCodingConfigError,
+    ErasureCodingError,
+    ErasureSpec,
+)
 from stopan.protection.ec.packer import (
     DataPackBuilder,
     _build_data_pack_from_validated_chunks,
@@ -25,6 +29,7 @@ from stopan.protection.ec.push_execution import (
     build_data_pack_push_update,
     push_data_pack_shards,
     register_data_pack_metadata,
+    validate_data_pack_delivery_limits,
 )
 from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
 from stopan.protection.ec.states import data_pack_state
@@ -69,8 +74,10 @@ def push_erasure_data_packs_to_network(
     ec_k: int,
     ec_m: int,
     ec_pack_size_bytes: int,
+    target_parallelism: int,
     stream_timeout_s: float,
     max_message_bytes: int,
+    max_shard_size: int,
     commit_every: int,
     db_file: str,
     local_chunk_dir: str,
@@ -83,6 +90,12 @@ def push_erasure_data_packs_to_network(
 ) -> ErasurePushStats:
     spec = ErasureSpec(data_shards=int(ec_k), parity_shards=int(ec_m))
     pack_size = max(int(ec_pack_size_bytes), 1)
+    target_parallelism = int(target_parallelism)
+    max_shard_size = int(max_shard_size)
+    if target_parallelism < 1:
+        raise ErasureCodingConfigError("ec target_parallelism debe ser >= 1")
+    if max_shard_size < 1:
+        raise ErasureCodingConfigError("storage.max_chunk_size debe ser >= 1")
     commit_every = max(int(commit_every), 1)
     self_addr = str(self_addr or "").strip()
     cluster_token = str(cluster_token or "")
@@ -157,7 +170,8 @@ def push_erasure_data_packs_to_network(
         print(f"Self: {origin_node_id[:8]}@{self_addr}")
         print(
             f"EC: data_shards={spec.data_shards} parity_shards={spec.parity_shards} "
-            f"total_shards={spec.total_shards} pack_size={pack_size}"
+            f"total_shards={spec.total_shards} pack_size={pack_size} "
+            f"target_parallelism={target_parallelism}"
         )
         print(f"Remote candidates: {remote_candidate_count}")
         print(f"new_pack_placement_epoch={new_pack_placement_epoch[:12]}")
@@ -207,6 +221,8 @@ def push_erasure_data_packs_to_network(
                 cluster=cluster,
                 origin_node_id=origin_node_id,
                 cluster_token=cluster_token,
+                target_parallelism=target_parallelism,
+                max_shard_size=max_shard_size,
                 stats=stats,
             )
             stats.attempted_chunks += pack_chunk_count
@@ -229,9 +245,28 @@ def push_erasure_data_packs_to_network(
                     stats.failed_chunks += 1
                     continue
 
+                if builder.would_exceed_target(data_size=len(data)):
+                    push_update = _flush_and_push_pack(
+                        builder=builder,
+                        db=db,
+                        pool=pool,
+                        cluster=cluster,
+                        origin_node_id=origin_node_id,
+                        cluster_token=cluster_token,
+                        placement_epoch=new_pack_placement_epoch,
+                        target_parallelism=target_parallelism,
+                        max_shard_size=max_shard_size,
+                        stats=stats,
+                    )
+                    if push_update is not None:
+                        metadata_changed = True
+                        pending_updates.append(push_update)
+                        if len(pending_updates) >= commit_every:
+                            flush_push_updates()
+
                 try:
                     must_flush = builder._add_prevalidated_chunk(chunk_hash=chunk_hash, data=data)
-                except ErasureCodingError as exc:
+                except ErasureCodingError:
                     stats.failed_chunks += 1
                     continue
 
@@ -246,6 +281,8 @@ def push_erasure_data_packs_to_network(
                         origin_node_id=origin_node_id,
                         cluster_token=cluster_token,
                         placement_epoch=new_pack_placement_epoch,
+                        target_parallelism=target_parallelism,
+                        max_shard_size=max_shard_size,
                         stats=stats,
                     )
                     if push_update is not None:
@@ -263,6 +300,8 @@ def push_erasure_data_packs_to_network(
                 origin_node_id=origin_node_id,
                 cluster_token=cluster_token,
                 placement_epoch=new_pack_placement_epoch,
+                target_parallelism=target_parallelism,
+                max_shard_size=max_shard_size,
                 stats=stats,
             )
             if push_update is not None:
@@ -311,6 +350,8 @@ def _flush_and_push_pack(
     origin_node_id: str,
     cluster_token: str,
     placement_epoch: str,
+    target_parallelism: int,
+    max_shard_size: int,
     stats: "_MutableErasurePushStats",
 ) -> ErasureDataPackPushUpdate | None:
     pack = builder.flush()
@@ -325,6 +366,8 @@ def _flush_and_push_pack(
         origin_node_id=origin_node_id,
         cluster_token=cluster_token,
         placement_epoch=placement_epoch,
+        target_parallelism=target_parallelism,
+        max_shard_size=max_shard_size,
         stats=stats,
         refresh_existing=False,
     )
@@ -339,6 +382,8 @@ def _retry_existing_pack(
     cluster,
     origin_node_id: str,
     cluster_token: str,
+    target_parallelism: int,
+    max_shard_size: int,
     stats: "_MutableErasurePushStats",
 ) -> tuple[int, ErasureDataPackPushUpdate | ErasureDataPackPushErrorUpdate | None]:
     chunks = db.get_erasure_pack_chunks(record.pack_hash)
@@ -420,6 +465,8 @@ def _retry_existing_pack(
         origin_node_id=origin_node_id,
         cluster_token=cluster_token,
         placement_epoch=record_placement_epoch,
+        target_parallelism=target_parallelism,
+        max_shard_size=max_shard_size,
         stats=stats,
         refresh_existing=True,
     )
@@ -442,9 +489,16 @@ def _push_pack(
     origin_node_id: str,
     cluster_token: str,
     placement_epoch: str,
+    target_parallelism: int,
+    max_shard_size: int,
     stats: "_MutableErasurePushStats",
     refresh_existing: bool,
 ) -> ErasureDataPackPushUpdate:
+    validate_data_pack_delivery_limits(
+        pack=pack,
+        max_shard_size=max_shard_size,
+        max_message_bytes=pool.max_message_bytes,
+    )
     stats.attempted_packs += 1
     placements = plan_data_pack_shard_placement(
         pack_hash=pack.pack_hash,
@@ -467,6 +521,7 @@ def _push_pack(
         pack=pack,
         placements=placements,
         pool=pool,
+        target_parallelism=target_parallelism,
     )
     stats.stored_shards += push_result.stored_shards
     stats.already_present_shards += push_result.already_present_shards

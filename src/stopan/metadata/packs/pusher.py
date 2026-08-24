@@ -1,8 +1,8 @@
 """
 Publicación de metadata packs en la red P2P.
 
-Selecciona targets remotos por HRW y transmite packs cifrados y firmados mediante
-un flujo de bloques de MetadataPackService.StoreMetadataPack.
+Selecciona targets remotos por HRW, consulta primero la presencia exacta del pack
+y transmite por StoreMetadataPack únicamente a los custodios que lo necesitan.
 """
 
 from __future__ import annotations
@@ -18,14 +18,19 @@ from stopan.metadata.packs.crypto import decrypt_pack_payload
 from stopan.metadata.packs.hashes import validate_pack_hash
 from stopan.metadata.packs.payload import validate_pack_payload
 from stopan.metadata.packs.remote import (
+    MetadataPackProbeState,
+    MetadataPackSource,
+    MetadataPackTarget,
     MetadataPackTargetResult,
     is_remote_metadata_pack_member,
+    probe_metadata_pack_from_target_detailed,
     select_metadata_pack_targets,
     store_metadata_pack_on_target,
 )
 from stopan.cluster.resolver import require_cluster_view
 from stopan.node.lifecycle import current_local_operation_matches
 from stopan.protection.policy import normalize_remote_rf
+from stopan.protos import p2p_storage_pb2
 
 
 class MetadataPackPushError(StopanNetworkError, RuntimeError):
@@ -60,6 +65,148 @@ class MetadataPackPushResult:
     @property
     def protected(self) -> bool:
         return self.stats.protected
+
+
+def _push_metadata_pack_to_target(
+    target: MetadataPackTarget,
+    *,
+    owner_id: str,
+    pack_hash: str,
+    pack_path: Path,
+    pack_size_bytes: int,
+    public_key_b64: str,
+    signature_b64: str,
+    cluster_token: str,
+    timeout_s: float,
+    max_message_bytes: int,
+    grpc_keepalive_time_ms: int,
+    grpc_keepalive_timeout_ms: int,
+    grpc_keepalive_permit_without_calls: bool,
+) -> MetadataPackTargetResult:
+    """Asegura la presencia del pack en un target sin retransmitirlo si ya está.
+
+    Un fallo operativo del probe se conserva como fallo del target y no se
+    interpreta como ausencia. DATA_LOSS es la excepción deliberada: permite que
+    StoreMetadataPack repare un sidecar inválido, mientras que un pack corrupto
+    vuelve a ser rechazado por la propia admisión.
+    """
+
+    try:
+        probe = probe_metadata_pack_from_target_detailed(
+            target,
+            owner_id=owner_id,
+            pack_hash=pack_hash,
+            cluster_token=cluster_token,
+            timeout_s=timeout_s,
+            max_message_bytes=max_message_bytes,
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        )
+        if probe.state == MetadataPackProbeState.ERROR:
+            return _metadata_pack_target_error(
+                target,
+                detail=f"probe remoto falló: {probe.detail or 'error desconocido'}",
+            )
+
+        if probe.state == MetadataPackProbeState.PRESENT:
+            if probe.source is None:
+                return _metadata_pack_target_error(
+                    target,
+                    detail="probe remoto devolvió PRESENT sin evidencia del pack",
+                )
+            return _metadata_pack_present_result(
+                target,
+                source=probe.source,
+                expected_size_bytes=pack_size_bytes,
+                expected_public_key_b64=public_key_b64,
+                expected_signature_b64=signature_b64,
+            )
+
+        if probe.state not in {
+            MetadataPackProbeState.MISSING,
+            MetadataPackProbeState.DATA_LOSS,
+        }:
+            return _metadata_pack_target_error(
+                target,
+                detail=f"estado inesperado del probe: {probe.state}",
+            )
+
+        # DATA_LOSS conserva la capacidad previa de una republicación para
+        # reparar un sidecar perdido o inválido. Si el pack está corrupto,
+        # StoreMetadataPack volverá a detectarlo y rechazará el target.
+        return store_metadata_pack_on_target(
+            target,
+            owner_id=owner_id,
+            pack_hash=pack_hash,
+            pack_path=pack_path,
+            pack_size_bytes=pack_size_bytes,
+            public_key_b64=public_key_b64,
+            signature_b64=signature_b64,
+            cluster_token=cluster_token,
+            timeout_s=timeout_s,
+            max_message_bytes=max_message_bytes,
+            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+        )
+    except Exception as exc:
+        return _metadata_pack_target_error(
+            target,
+            detail=f"publicación remota falló: {exc}",
+        )
+
+
+def _metadata_pack_present_result(
+    target: MetadataPackTarget,
+    *,
+    source: MetadataPackSource,
+    expected_size_bytes: int,
+    expected_public_key_b64: str,
+    expected_signature_b64: str,
+) -> MetadataPackTargetResult:
+    """Convierte un probe PRESENT en el mismo contrato de éxito que Store."""
+
+    if int(source.size_bytes) != int(expected_size_bytes):
+        return _metadata_pack_target_error(
+            target,
+            detail=(
+                "el probe devolvió un tamaño distinto: "
+                f"esperado={int(expected_size_bytes)} recibido={int(source.size_bytes)}"
+            ),
+        )
+    if (
+        source.public_key_b64 != expected_public_key_b64
+        or source.signature_b64 != expected_signature_b64
+    ):
+        return _metadata_pack_target_error(
+            target,
+            detail="el probe devolvió un sidecar de firma distinto",
+        )
+
+    return MetadataPackTargetResult(
+        node_id=target.node_id,
+        address=target.address,
+        status=p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ALREADY_PRESENT,
+        detail="ya presente en target remoto",
+        size_bytes=int(source.size_bytes),
+        stored_at_unix=float(source.stored_at_unix),
+        public_key_b64=source.public_key_b64,
+        signature_b64=source.signature_b64,
+    )
+
+
+def _metadata_pack_target_error(
+    target: MetadataPackTarget,
+    *,
+    detail: str,
+) -> MetadataPackTargetResult:
+    return MetadataPackTargetResult(
+        node_id=target.node_id,
+        address=target.address,
+        status=p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ERROR,
+        detail=str(detail),
+    )
 
 
 def push_metadata_pack_to_network(
@@ -200,7 +347,7 @@ def push_metadata_pack_to_network(
         with ThreadPoolExecutor(max_workers=min(parallelism, len(targets))) as executor:
             futures = [
                 executor.submit(
-                    store_metadata_pack_on_target,
+                    _push_metadata_pack_to_target,
                     target,
                     owner_id=owner,
                     pack_hash=pack_hash,

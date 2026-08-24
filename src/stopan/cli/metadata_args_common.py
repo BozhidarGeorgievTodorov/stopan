@@ -42,7 +42,7 @@ def add_metadata_pack_push_args(parser: argparse.ArgumentParser) -> None:
         "--rpc-timeout-s",
         type=float,
         default=None,
-        help="Timeout del RPC StoreMetadataPack en segundos. Default: metadata.pack_rpc_timeout_s.",
+        help="Timeout de los RPC ProbeMetadataPack/StoreMetadataPack. Default: metadata.pack_rpc_timeout_s.",
     )
     parser.add_argument(
         "--max-message-bytes",

@@ -7,7 +7,6 @@ cuotas locales por owner, tamaño total y antigüedad.
 
 from __future__ import annotations
 
-import os
 import logging
 import stat
 import threading
@@ -697,16 +696,15 @@ class MetadataPackStore:
                         f"metadata pack existente corrupto: esperado={pack} calculado={existing_hash}"
                     )
 
+                # La reaceptación puede reparar/normalizar el sidecar firmado, pero
+                # no renueva la antigüedad del pack: las políticas de retención y
+                # cuotas se basan en el mtime de su incorporación al almacén.
                 self._write_signature_record(
                     owner_id=owner,
                     pack_hash=pack,
                     public_key_b64=public_key_b64,
                     signature_b64=signature_b64,
                 )
-                try:
-                    os.utime(path, None)
-                except OSError:
-                    pass
                 existing_size = int(path.stat().st_size)
                 existing_public, existing_signature = self._read_signature_record(owner_id=owner, pack_hash=pack)
                 return StoreMetadataPackResult(
@@ -855,16 +853,14 @@ class MetadataPackStore:
                         f"esperado={pack_hash} calculado={existing_hash}"
                     )
 
+                # Igual que en put_pack_bytes(), completar de nuevo el contrato
+                # firmado no convierte la reaceptación en una renovación de custodia.
                 self._write_signature_record(
                     owner_id=owner,
                     pack_hash=pack_hash,
                     public_key_b64=public_key_b64,
                     signature_b64=signature_b64,
                 )
-                try:
-                    os.utime(destination, None)
-                except OSError:
-                    pass
                 existing_size = int(destination.stat().st_size)
                 existing_public, existing_signature = self._read_signature_record(
                     owner_id=owner,

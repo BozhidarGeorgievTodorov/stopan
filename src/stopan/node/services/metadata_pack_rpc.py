@@ -30,6 +30,7 @@ from stopan.metadata.packs.distributed_store import (
 from stopan.metadata.packs.hashes import calculate_pack_hash_file, validate_pack_hash
 from stopan.metadata.packs.streaming import iter_file_chunks, metadata_pack_stream_chunk_bytes
 from stopan.protos import p2p_storage_pb2, p2p_storage_pb2_grpc
+from stopan.node.lifecycle import NodeDrainController
 
 
 class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServicer):
@@ -52,8 +53,10 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
         max_total_store_bytes: int,
         max_age_days: int,
         max_message_bytes: int,
+        drain_controller: NodeDrainController | None = None,
     ):
         self._cluster_token = str(cluster_token or "")
+        self._drain_controller = drain_controller
         self._stream_chunk_bytes = metadata_pack_stream_chunk_bytes(max_message_bytes)
         self.store = MetadataPackStore(
             pack_store_dir,
@@ -101,6 +104,10 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
         if stale_incoming:
             print(f"Temporales de metadata packs eliminados al arrancar: {stale_incoming}")
 
+    def _admit_work(self, context) -> None:
+        if self._drain_controller is not None:
+            self._drain_controller.admit_rpc(context)
+
     def _check_token(self, request: Any, context: grpc.ServicerContext) -> bool:
         """Valida el cluster_token de una request entrante."""
 
@@ -144,6 +151,26 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
                     detail="cluster_token inválido",
                 )
 
+        except (TypeError, ValueError) as exc:
+            return _store_response(
+                status=p2p_storage_pb2.METADATA_PACK_STORE_STATUS_REJECTED_INVALID_ARGUMENT,
+                detail=str(exc),
+            )
+        except Exception as exc:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(exc))
+            return _store_response(
+                status=p2p_storage_pb2.METADATA_PACK_STORE_STATUS_ERROR,
+                detail=str(exc),
+            )
+
+        # La barrera de drenaje queda fuera del bloque que traduce errores de
+        # almacenamiento. ``context.abort`` termina la RPC mediante una
+        # excepción interna de gRPC y no debe degradarse accidentalmente a
+        # INTERNAL por el ``except Exception`` de la ruta de admisión.
+        self._admit_work(context)
+
+        try:
             owner_id = validate_owner_id(header.owner_id)
             pack_hash = validate_pack_hash(header.pack_hash)
             size_bytes = int(header.size_bytes)
@@ -351,6 +378,8 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
         if not self._check_token(request, context):
             return p2p_storage_pb2.ListMetadataPacksResponse()
 
+        self._admit_work(context)
+
         try:
             owner_id = validate_owner_id(request.owner_id)
             records = self.store.list_packs(owner_id=owner_id)
@@ -386,6 +415,8 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
                 detail="cluster_token inválido",
             )
             return
+
+        self._admit_work(context)
 
         try:
             owner_id = validate_owner_id(request.owner_id)
@@ -473,6 +504,8 @@ class MetadataPackServiceServicer(p2p_storage_pb2_grpc.MetadataPackServiceServic
                 status=p2p_storage_pb2.METADATA_PACK_PROBE_STATUS_ERROR,
                 detail="cluster_token inválido",
             )
+
+        self._admit_work(context)
 
         try:
             owner_id = validate_owner_id(request.owner_id)

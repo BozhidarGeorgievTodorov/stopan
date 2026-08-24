@@ -157,6 +157,14 @@ Para consultar su estado:
 stopan node status
 ```
 
+La parada local puede solicitarse desde el propio CLI:
+
+```bash
+sudo stopan node stop
+```
+
+La parada cierra primero la admisión de trabajo nuevo, anuncia el estado `LEFT` a los pares conocidos y contactos de bootstrap y espera las operaciones CLI y RPC ya iniciadas antes de terminar el proceso. `systemctl stop stopan-node.service` utiliza la misma ruta mediante `SIGTERM`.
+
 El servicio de nodo expone los RPC usados para membership, almacenamiento remoto, shards EC y metadata packs.
 
 ## Protección de metadata

@@ -63,10 +63,12 @@ def plan_data_pack_shard_placement(
     origin_node_id = str(origin_node_id or "").strip()
     if not origin_node_id:
         raise ErasureCodingConfigError("origin_node_id no puede estar vacío")
-    if origin_node_id not in cluster.node_ids:
+    cluster_self_node_id = str(cluster.self_node_id or "").strip()
+    if origin_node_id not in cluster.node_ids and origin_node_id != cluster_self_node_id:
         raise ErasureCodingConfigError(
-            "origin_node_id no pertenece a la vista de membership; "
-            "usa el node_id canónico de ClusterView.self_node_id al colocar shards EC"
+            "origin_node_id no pertenece a la vista de membership ni coincide con "
+            "ClusterView.self_node_id; usa la identidad canónica del nodo origen "
+            "al colocar shards EC"
         )
 
     members = cluster.hrw_targets_excluding(

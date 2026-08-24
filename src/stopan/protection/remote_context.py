@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from stopan.errors import StopanConfigRuntimeError
 from stopan.cluster.resolver import require_cluster_view
 from stopan.cluster.view import ClusterView
+from stopan.node.lifecycle import (
+    current_local_operation_matches,
+    current_local_operation_node_id,
+)
 
 
 DEFAULT_REMOTE_PROTECTION_MISSING_SEED_MESSAGE = (
@@ -58,6 +62,7 @@ def resolve_remote_protection_context(
             or "Falta node.advertise_addr. La protección remota necesita identificar el nodo origen."
         )
 
+    leased_local_identity = current_local_operation_matches(self_addr)
     resolved = require_cluster_view(
         membership_seed=membership_seed,
         self_addr=self_addr,
@@ -65,9 +70,33 @@ def resolve_remote_protection_context(
         timeout_s=timeout_s,
         max_message_bytes=max_message_bytes,
         missing_seed_message=missing_seed_message,
+        allow_empty_members=leased_local_identity,
     )
     cluster = resolved.cluster
     origin_node_id = str(cluster.self_node_id or "").strip()
+    if leased_local_identity:
+        leased_node_id = str(current_local_operation_node_id() or "").strip()
+        if not leased_node_id:
+            raise StopanConfigRuntimeError(
+                "La lease local no contiene una identidad de nodo utilizable."
+            )
+        if origin_node_id and origin_node_id != leased_node_id:
+            raise StopanConfigRuntimeError(
+                "La identidad devuelta por membership no coincide con la del daemon "
+                "que admitió esta operación local."
+            )
+
+        origin_node_id = leased_node_id
+        if cluster.self_node_id != origin_node_id:
+            # Durante una parada ordenada el propio nodo ya no pertenece al
+            # conjunto elegible, pero una operación admitida antes del drenaje
+            # conserva su identidad mediante la lease local. ClusterView separa
+            # explícitamente esa identidad de la lista de candidatos.
+            cluster = ClusterView(
+                self_node_id=origin_node_id,
+                members=cluster.members,
+            )
+
     if not origin_node_id:
         raise StopanConfigRuntimeError(
             "No pude resolver origin_node_id desde membership. "

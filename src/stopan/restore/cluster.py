@@ -13,6 +13,7 @@ import threading
 from stopan.errors import StopanConfigValueError
 from stopan.cluster.resolver import require_cluster_view
 from stopan.protection.policy import normalize_remote_rf
+from stopan.node.lifecycle import current_local_operation_matches
 
 
 def resolve_membership_seed(explicit_seed: str | None = None) -> str | None:
@@ -49,6 +50,10 @@ class LazyClusterResolver:
         self.cluster_token = str(cluster_token or "")
         self.membership_timeout_s = float(membership_timeout_s)
         self.max_message_bytes = max(int(max_message_bytes), 1)
+        # ContextVar no se propaga automáticamente a los hilos auxiliares. La
+        # condición se captura al construir el resolver en el hilo de la
+        # operación CLI ya admitida.
+        self._allow_empty_members = current_local_operation_matches(self.self_addr)
 
         self.origin_node_id = str(origin_node_id).strip()
         if not self.origin_node_id:
@@ -85,6 +90,7 @@ class LazyClusterResolver:
                     "El restore puede ejecutarse sin red, pero para recuperar chunks ausentes "
                     "necesita '--membership-seed' o cluster.seeds en la configuración."
                 ),
+                allow_empty_members=self._allow_empty_members,
             )
 
             self.membership_seed = resolved.seed

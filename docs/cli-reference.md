@@ -501,11 +501,18 @@ stopan node [opciones]
 Sin subcomando, `node` arranca el servidor gRPC configurado. Requiere `node.advertise_addr`. El servidor expone almacenamiento P2P, shards EC, membership y metadata pack storage sobre el mismo proceso gRPC.
 
 
-Subcomando de diagnóstico:
+Subcomandos de ciclo de vida y diagnóstico:
 
 ```bash
+stopan node stop
 stopan node status [opciones]
 ```
+
+`node stop` solicita la parada ordenada del nodo local mediante su canal de control Unix. La solicitud impide nuevas operaciones, publica `LEFT` en membership y espera a que terminen las operaciones CLI y RPC ya admitidas antes de cerrar el proceso. No expone una RPC remota de apagado. En una instalación de sistema, el usuario debe tener acceso a `/run/stopan`, por ejemplo mediante `root` o la cuenta/grupo autorizado para el servicio.
+
+Los comandos operativos `backup`, `push`, `restore`, `verify`, `metadata` y `gc` registran una lease local mientras existe un daemon en ejecución. Si el nodo ya está drenando, una operación nueva se rechaza con un error controlado en lugar de comenzar durante la parada.
+
+`systemctl stop stopan-node.service` entra en la misma ruta de drenaje mediante `SIGTERM`.
 
 `node status` acepta:
 
@@ -519,6 +526,7 @@ Ejemplos:
 
 ```bash
 stopan node
+stopan node stop
 stopan node status
 stopan node status --address 192.168.1.20:50051
 ```
@@ -1300,6 +1308,7 @@ push
 verify
 restore
 node
+node stop
 init node
 init metadata
 metadata graph export

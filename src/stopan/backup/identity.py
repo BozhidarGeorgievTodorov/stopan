@@ -15,6 +15,10 @@ from pathlib import Path
 from stopan.common.fs import atomic_write_bytes
 from stopan.errors import StopanConfigError
 from stopan.cluster.resolver import try_cluster_view
+from stopan.node.lifecycle import (
+    current_local_operation_matches,
+    current_local_operation_node_id,
+)
 
 
 def _canonical_node_id(value: str, *, node_id_file: str) -> str:
@@ -92,9 +96,15 @@ def resolve_origin_node_id(
     Resuelve el origin_node_id del snapshot.
 
     Preferencia:
-      1. membership + self_addr, si está disponible.
-      2. identidad local persistida en node_id_file.
+      1. identidad del daemon que admitió la operación local, si coincide self_addr;
+      2. membership + self_addr, si está disponible;
+      3. identidad local persistida en node_id_file.
     """
+    if current_local_operation_matches(self_addr):
+        leased_node_id = str(current_local_operation_node_id() or "").strip()
+        if leased_node_id:
+            return leased_node_id
+
     if membership_seed:
         try:
             resolved = try_cluster_view(

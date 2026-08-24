@@ -111,6 +111,15 @@ sudo stopan config validate /etc/stopan/stopan.yaml
 
 `stopan node` falla de forma controlada si `node.advertise_addr` está vacío.
 
+Para una parada ordenada puede usarse cualquiera de estas rutas:
+
+```bash
+sudo stopan node stop
+sudo systemctl stop stopan-node.service
+```
+
+En ambos casos el nodo deja de admitir trabajo nuevo, anuncia `LEFT` a la vista de membresía y espera el trabajo ya iniciado antes de terminar. La unidad systemd no impone un timeout de parada porque el drenaje preserva las operaciones en curso.
+
 ## Capacidad mínima
 
 Para replicación completa, cada origen necesita tantos nodos remotos elegibles como indique `remote_copies`. La copia local no cuenta.

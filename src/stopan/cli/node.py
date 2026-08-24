@@ -28,9 +28,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stopan node",
         allow_abbrev=False,
-        description="Arranca un nodo Stopan o consulta su estado operativo.",
+        description="Arranca, detiene o consulta el estado operativo de un nodo Stopan.",
     )
     subparsers = parser.add_subparsers(dest="node_command", metavar="<subcommand>")
+
+    subparsers.add_parser(
+        "stop",
+        allow_abbrev=False,
+        help="Solicita una parada ordenada del nodo local y espera al drenaje.",
+        description=(
+            "Cierra la admisión de trabajo nuevo, anuncia LEFT al clúster y espera "
+            "las operaciones ya iniciadas antes de detener el nodo local."
+        ),
+    )
 
     status_parser = subparsers.add_parser(
         "status",
@@ -264,6 +274,15 @@ def _status(args: argparse.Namespace) -> int:
     return 1
 
 
+def _stop() -> int:
+    from stopan.node.lifecycle import request_local_node_stop
+
+    print("Solicitando parada ordenada del nodo local...", flush=True)
+    request_local_node_stop()
+    print("Nodo local detenido.")
+    return 0
+
+
 def _serve(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
 
@@ -281,6 +300,9 @@ def _serve(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if getattr(args, "node_command", None) == "status":
+    node_command = getattr(args, "node_command", None)
+    if node_command == "status":
         return _status(args)
+    if node_command == "stop":
+        return _stop()
     return _serve(args)

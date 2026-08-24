@@ -38,7 +38,7 @@ COMMANDS: dict[str, CommandSpec] = {
     ),
     "node": CommandSpec(
         module_name="stopan.cli.node",
-        description="Arranca un nodo de almacenamiento y membership",
+        description="Arranca, detiene o consulta un nodo de almacenamiento y membership",
     ),
     "init": CommandSpec(
         module_name="stopan.cli.init",
@@ -56,6 +56,15 @@ COMMANDS: dict[str, CommandSpec] = {
         module_name="stopan.cli.gc",
         description="Ejecuta GC local sobre almacenes de Stopan",
     ),
+}
+
+_OPERATION_LEASE_COMMANDS = {
+    "backup",
+    "push",
+    "restore",
+    "verify",
+    "metadata",
+    "gc",
 }
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -101,7 +110,19 @@ def _load_command_main(spec: CommandSpec) -> CommandMain:
 def _dispatch(command: str, args: Sequence[str]) -> int:
     spec = COMMANDS[command]
     main_func = _load_command_main(spec)
-    return int(main_func(list(args)))
+
+    if command not in _OPERATION_LEASE_COMMANDS or any(
+        arg in {"-h", "--help"} for arg in args
+    ):
+        return int(main_func(list(args)))
+
+    # Si existe un daemon local, la conexión queda abierta durante toda la
+    # operación. Una parada ordenada cierra primero esta admisión y espera las
+    # leases ya concedidas antes de terminar el proceso de nodo.
+    from stopan.node.lifecycle import acquire_local_operation_lease
+
+    with acquire_local_operation_lease(command):
+        return int(main_func(list(args)))
 
 
 def _debug_tracebacks_enabled() -> bool:

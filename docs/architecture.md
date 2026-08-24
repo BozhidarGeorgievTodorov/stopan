@@ -131,7 +131,7 @@ El servidor gRPC registra tres servicios:
 
 `P2PStorage` expone chunks y shards EC. Sus RPC principales son `ProbeMissingChunks`, `ReplicateChunks`, `RetrieveChunkBatch`, `ProbeMissingDataPackShards`, `ReplicateDataPackShards` y `RetrieveDataPackShardBatch`. Los clientes adjuntan `cluster.token` como metadata binaria de gRPC y el servidor rechaza la llamada antes de consultar, leer o escribir contenido cuando la credencial configurada no coincide.
 
-`Membership` expone `Join`, `Ping`, `PingReq` y `GetMembers`.
+`Membership` expone `Join`, `Ping`, `PingReq`, `Leave` y `GetMembers`.
 
 `MetadataPackService` expone `StoreMetadataPack`, `ListMetadataPacks`, `RetrieveMetadataPack` y `ProbeMetadataPack`. La publicación recibe una cabecera seguida de bloques y la recuperación devuelve una cabecera seguida del contenido por bloques. El receptor valida tamaño, hash y firma antes de publicar el fichero de forma atómica.
 
@@ -139,9 +139,13 @@ El almacenamiento remoto de chunks pasa por un commit engine interno con cola y 
 
 ## Membership y vista de clúster
 
-El proceso de nodo mantiene membership con un protocolo tipo SWIM. Al arrancar intenta descubrir el clúster mediante los seeds externos configurados. Si ninguno está disponible, el proceso sigue activo y reintenta esa incorporación con backoff exponencial acotado y jitter hasta descubrir al menos un par. Cada activación prueba un único seed y los contactos se recorren en round-robin. A partir de ese momento los seeds dejan de intervenir y la evolución ordinaria de la vista depende de sondeos y gossip. Los clientes operativos no mantienen membership permanente. Para `push`, `verify`, restore remoto o metadata packs, resuelven una vista del clúster en el momento de la operación.
+El proceso de nodo mantiene membership con un protocolo tipo SWIM. Al arrancar intenta descubrir el clúster mediante los seeds externos configurados. Si ninguno está disponible, el proceso sigue activo y reintenta esa incorporación con backoff exponencial acotado y jitter hasta descubrir al menos un par. Cada activación prueba un único seed y los contactos se recorren en round-robin. A partir de ese momento los seeds dejan de intervenir en el mantenimiento ordinario y la evolución de la vista depende de sondeos y gossip. Los clientes operativos no mantienen membership permanente. Para `push`, `verify`, restore remoto o metadata packs, resuelven una vista del clúster en el momento de la operación.
 
-`ClusterView` representa la vista canónica usada por placement. Contiene miembros elegibles y, si se pudo resolver, el `self_node_id`.
+La salida voluntaria utiliza `LEFT`. Al solicitar la parada, el nodo cierra la admisión de trabajo nuevo y comunica `LEFT` directamente a los pares `ALIVE` conocidos y a los contactos semilla configurados. Los receptores lo incorporan a gossip. El proceso permanece vivo durante el drenaje para terminar RPC y operaciones locales previamente admitidas. Una terminación abrupta no puede publicar `LEFT` y conserva el camino de detección `ALIVE → SUSPECT → DEAD`. Un arranque posterior incrementa `incarnation`, por lo que un `ALIVE` de una ejecución nueva sustituye el `LEFT` de la anterior.
+
+Las operaciones CLI admitidas antes del drenaje conservan mediante el canal de control la identidad estable del daemon que las aceptó. Si resuelven membership después de publicarse `LEFT`, esa identidad permanece como `ClusterView.self_node_id` sin reincorporar al nodo al conjunto de miembros elegibles. Así pueden completar el trabajo ya iniciado sobre los candidatos remotos todavía disponibles.
+
+`ClusterView` representa la vista canónica usada por placement. Contiene miembros elegibles y, cuando corresponde, la identidad del ejecutor en `self_node_id`.
 
 El token de clúster forma parte de la separación lógica entre clústeres. Membership y metadata packs lo transportan dentro de sus mensajes. `P2PStorage` lo transporta mediante metadata binaria de gRPC para cubrir de forma uniforme las consultas de presencia, la replicación y la recuperación de chunks y shards EC. El proceso `stopan node` exige un token no vacío y rechaza el arranque antes de abrir el listener gRPC si falta esta credencial. El mecanismo no identifica criptográficamente al nodo y no sustituye a TLS, una VPN, un cortafuegos ni otro control de red.
 

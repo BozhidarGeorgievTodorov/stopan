@@ -26,6 +26,8 @@ class ClusterView:
     Contrato:
       - el servidor de membership ya filtra miembros no elegibles;
       - este objeto no reinterpreta estados SWIM;
+      - self_node_id identifica al ejecutor y puede no figurar entre members si
+        una operación admitida conserva su identidad durante el drenaje;
       - placement consume esta vista, pero membership sigue perteneciendo al nodo.
     """
 

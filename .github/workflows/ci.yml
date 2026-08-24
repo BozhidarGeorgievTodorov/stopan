@@ -91,6 +91,7 @@ jobs:
           python -m stopan restore --help
           python -m stopan verify --help
           python -m stopan node --help
+          python -m stopan node stop --help
           python -m stopan init --help
           python -m stopan config --help
           python -m stopan metadata --help

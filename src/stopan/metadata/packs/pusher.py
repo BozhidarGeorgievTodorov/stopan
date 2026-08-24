@@ -24,6 +24,7 @@ from stopan.metadata.packs.remote import (
     store_metadata_pack_on_target,
 )
 from stopan.cluster.resolver import require_cluster_view
+from stopan.node.lifecycle import current_local_operation_matches
 from stopan.protection.policy import normalize_remote_rf
 
 
@@ -148,6 +149,7 @@ def push_metadata_pack_to_network(
             timeout_s=membership_timeout_s,
             max_message_bytes=max_message_bytes,
             missing_seed_message="Falta membership seed en la configuración.",
+            allow_empty_members=current_local_operation_matches(self_addr),
         )
     except Exception as exc:
         raise MetadataPackPushError(str(exc)) from exc

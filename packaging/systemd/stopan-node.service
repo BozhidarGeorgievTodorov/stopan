@@ -12,6 +12,8 @@ WorkingDirectory=/var/lib/stopan
 ExecStart=/usr/bin/stopan node
 Restart=on-failure
 RestartSec=5s
+# La parada ordenada drena operaciones ya admitidas antes de terminar el daemon.
+TimeoutStopSec=infinity
 RuntimeDirectory=stopan
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes

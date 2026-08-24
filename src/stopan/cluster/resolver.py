@@ -30,12 +30,15 @@ def require_cluster_view(
     max_message_bytes: int,
     missing_seed_message: str | None = None,
     empty_cluster_message: str | None = None,
+    allow_empty_members: bool = False,
 ) -> ClusterViewResolution:
     """
     Resuelve una vista de cluster para operaciones que requieren membership.
 
     Es el resolver estricto usado por flujos como push, verify o recover.
-    La ausencia de seed, errores de membership o una vista sin miembros se tratan como fallos operativos.
+    La ausencia de seed y los errores de membership se tratan como fallos operativos.
+    Una vista sin miembros también falla salvo que el llamador represente una
+    operación ya admitida que deba poder concluir durante el drenaje local.
     """
     seed = str(membership_seed or "").strip()
     if not seed:
@@ -52,7 +55,7 @@ def require_cluster_view(
         max_message_bytes=int(max_message_bytes),
     ).get_cluster_view()
 
-    if not cluster.members:
+    if not cluster.members and not allow_empty_members:
         raise StopanNetworkError(empty_cluster_message or f"No se pudo obtener miembros elegibles desde seed={seed}")
 
     return ClusterViewResolution(seed=seed, cluster=cluster)

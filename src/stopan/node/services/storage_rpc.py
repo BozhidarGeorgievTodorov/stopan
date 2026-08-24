@@ -20,6 +20,7 @@ from stopan.cas.hashes import is_valid_chunk_hash
 from stopan.cas.repository import CASRepository
 from stopan.node.storage.commit_engine import StorageCommitEngine
 from stopan.node.storage.ec_shard_store import DataPackShardStore
+from stopan.node.lifecycle import NodeDrainController
 from stopan.node.services.ec_storage_rpc import DataPackShardRpcHandler
 from stopan.rpc.auth import require_cluster_token_metadata
 
@@ -43,6 +44,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         commit_workers: int,
         commit_queue_items: int,
         max_chunk_size: int,
+        drain_controller: NodeDrainController | None = None,
     ):
         """
         Servidor P2PStorage backed by CAS local.
@@ -51,6 +53,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         salientes se devuelven comprimidos y el cliente restore valida integridad.
         """
         self._cluster_token = str(cluster_token or "")
+        self._drain_controller = drain_controller
         custody_root = os.path.abspath(custody_dir)
         self.repo = CASRepository(os.path.join(custody_root, "chunks"))
         self.commit_engine = StorageCommitEngine(
@@ -74,6 +77,10 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
     def close(self) -> None:
         self.commit_engine.close()
 
+    def _admit_work(self, context) -> None:
+        if self._drain_controller is not None:
+            self._drain_controller.admit_rpc(context)
+
     def ProbeMissingChunks(self, request, context):
         """
         Devuelve qué chunks no existen localmente en el CAS.
@@ -84,6 +91,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             y al consumir blobs en restore/retrieve mediante BLAKE3.
         """
         require_cluster_token_metadata(self._cluster_token, context)
+        self._admit_work(context)
 
         try:
             invalid = [
@@ -120,6 +128,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
             salida porque el cliente ya no debe contarlos como confirmados.
         """
         require_cluster_token_metadata(self._cluster_token, context)
+        self._admit_work(context)
 
         future_queue: queue.Queue = queue.Queue(maxsize=max(1, self.commit_engine.max_pending))
         sentinel = object()
@@ -263,6 +272,7 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
         vuelve a comprobar la integridad extremo-a-extremo al descomprimirlo.
         """
         require_cluster_token_metadata(self._cluster_token, context)
+        self._admit_work(context)
 
         try:
             results = []
@@ -317,13 +327,16 @@ class StorageNodeServicer(p2p_storage_pb2_grpc.P2PStorageServicer):
 
     def ProbeMissingDataPackShards(self, request, context):
         require_cluster_token_metadata(self._cluster_token, context)
+        self._admit_work(context)
         return self.ec_shard_rpc.probe_missing(request, context)
 
     def ReplicateDataPackShards(self, request_iterator, context):
         require_cluster_token_metadata(self._cluster_token, context)
+        self._admit_work(context)
         yield from self.ec_shard_rpc.replicate(request_iterator, context)
 
     def RetrieveDataPackShardBatch(self, request, context):
         require_cluster_token_metadata(self._cluster_token, context)
+        self._admit_work(context)
         return self.ec_shard_rpc.retrieve_batch(request, context)
 

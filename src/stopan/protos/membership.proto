@@ -6,6 +6,7 @@ service Membership {
   rpc Join(JoinRequest) returns (JoinResponse);
   rpc Ping(PingRequest) returns (PingResponse);
   rpc PingReq(PingReqRequest) returns (PingReqResponse);
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
   rpc GetMembers(GetMembersRequest) returns (GetMembersResponse);
 }
 
@@ -64,6 +65,15 @@ message PingReqRequest {
 message PingReqResponse {
   bool ok = 1; // true si el helper pudo contactar al target
   repeated MemberEvent gossip = 2;
+}
+
+message LeaveRequest {
+  NodeInfo self = 1;
+  string cluster_token = 2;  // aislamiento lógico del cluster
+}
+
+message LeaveResponse {
+  bool accepted = 1;
 }
 
 message GetMembersRequest {

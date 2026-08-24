@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from stopan.cluster.resolver import require_cluster_view
+from stopan.node.lifecycle import current_local_operation_matches
 from stopan.cluster.view import ClusterMember
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
@@ -156,6 +157,7 @@ def collect_metadata_pack_sources(
             timeout_s=membership_timeout_s,
             max_message_bytes=int(max_message_bytes),
             missing_seed_message="Falta membership seed en la configuración.",
+            allow_empty_members=current_local_operation_matches(self_addr),
         )
     except Exception as exc:
         raise error_cls(str(exc)) from exc

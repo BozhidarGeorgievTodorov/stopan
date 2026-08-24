@@ -11,6 +11,7 @@ import random
 import threading
 import time
 from collections.abc import Iterable
+from concurrent import futures
 
 import grpc
 
@@ -32,8 +33,7 @@ from .validation import (
 )
 
 
-_STOP_JOIN_MIN_TIMEOUT_S = 2.0
-_STOP_JOIN_EXTRA_TIMEOUT_S = 0.5
+_LEAVE_MAX_WORKERS = 16
 
 # Los reintentos de bootstrap deben recuperarse rápido de una indisponibilidad
 # breve sin convertir un nodo aislado o mal configurado en una fuente de tráfico
@@ -89,9 +89,9 @@ class MembershipManager:
     """
     Gestiona membership, gossip e incarnation del nodo local.
 
-    Solo los miembros ALIVE se exponen como elegibles para placement. Los estados
-    SUSPECT y DEAD se mantienen para convergencia del protocolo, no para elegir
-    targets remotos.
+    Solo los miembros ALIVE se exponen como elegibles para placement. SUSPECT y
+    DEAD modelan fallos detectados y LEFT una salida voluntaria; ninguno de ellos
+    participa en la selección de targets remotos.
     """
 
     def __init__(
@@ -138,6 +138,8 @@ class MembershipManager:
         )
 
         self._stop = threading.Event()
+        self._leaving = threading.Event()
+        self._leave_complete = threading.Event()
         self._thread: threading.Thread | None = None
         self._seq = 0
 
@@ -161,9 +163,16 @@ class MembershipManager:
         """Número máximo de eventos gossip por mensaje."""
         return int(self.settings.max_gossip_events)
 
+    @property
+    def leaving(self) -> bool:
+        """Indica si el nodo ya ha iniciado una salida voluntaria."""
+        return self._leaving.is_set()
+
     def start(self) -> None:
         """Arranca el bucle de membership si aún no está activo."""
         with self._lifecycle_lock:
+            if self._leaving.is_set():
+                raise RuntimeError("un MembershipManager que ha publicado LEFT no puede reiniciarse")
             if self._thread is not None and self._thread.is_alive():
                 return
 
@@ -175,29 +184,131 @@ class MembershipManager:
             )
             self._thread.start()
 
-    def stop(self) -> None:
-        """Solicita parada, espera al bucle y cierra canales remotos."""
+    def _stop_protocol_loop(self) -> None:
+        """Detiene únicamente el bucle SWIM, conservando los canales abiertos."""
         with self._lifecycle_lock:
             self._stop.set()
             thread = self._thread
 
         if thread is not None and thread is not threading.current_thread():
-            thread.join(
-                timeout=max(
-                    _STOP_JOIN_MIN_TIMEOUT_S,
-                    float(self.settings.protocol_period_s) + _STOP_JOIN_EXTRA_TIMEOUT_S,
-                    float(self.settings.rpc_timeout_s) + _STOP_JOIN_EXTRA_TIMEOUT_S,
-                )
-            )
+            # Todas las E/S iniciadas por el bucle SWIM tienen deadline propio.
+            # Esperar realmente al hilo conserva una frontera fuerte: cuando
+            # este método retorna ya no queda actividad periódica capaz de usar
+            # los canales de membership durante el teardown.
+            thread.join()
 
         with self._lifecycle_lock:
-            if self._thread is thread:
+            if self._thread is thread and (thread is None or not thread.is_alive()):
                 self._thread = None
 
+    def stop(self) -> None:
+        """Detiene el manager sin iniciar una salida voluntaria nueva."""
+        if self._leaving.is_set() and not self._leave_complete.is_set():
+            self._leave_complete.wait()
+        self._stop_protocol_loop()
         self.channels.close_all()
 
-    def bootstrap_join(self, seeds: Iterable[str]) -> None:
-        """Intenta el descubrimiento inicial y programa reintentos si sigue aislado."""
+    def leave(self) -> None:
+        """Publica LEFT de forma best-effort y detiene la actividad periódica."""
+        with self._lifecycle_lock:
+            if self._leaving.is_set():
+                first_leave = False
+            else:
+                self._leaving.set()
+                self._stop.set()
+                first_leave = True
+
+        if not first_leave:
+            self._leave_complete.wait()
+            return
+
+        try:
+            # El estado local cambia antes de cualquier E/S remota. Desde este
+            # punto GetMembers deja de exponer al propio nodo como elegible y el
+            # evento LEFT queda disponible para respuestas/gossip concurrentes.
+            self._announce_left()
+            peer_addresses = tuple(
+                dict.fromkeys(
+                    [peer.address for peer in self.get_alive_peers()]
+                    + list(self._bootstrap_seeds)
+                )
+            )
+            peer_addresses = tuple(
+                address for address in peer_addresses if address != self.address
+            )
+
+            if peer_addresses:
+                max_workers = min(_LEAVE_MAX_WORKERS, len(peer_addresses))
+                deadline = time.monotonic() + float(self.settings.rpc_timeout_s)
+                executor = futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="membership-leave",
+                )
+                pending = [
+                    executor.submit(self._send_leave, address, deadline=deadline)
+                    for address in peer_addresses
+                ]
+                try:
+                    done, unfinished = futures.wait(
+                        pending,
+                        timeout=max(0.0, deadline - time.monotonic()),
+                    )
+                    for completed in done:
+                        try:
+                            completed.result()
+                        except Exception:
+                            # _send_leave ya encapsula fallos esperables. Esta
+                            # defensa conserva la naturaleza best-effort del
+                            # anuncio directo.
+                            pass
+                    for future in unfinished:
+                        future.cancel()
+                finally:
+                    # Todas las tareas comparten un deadline absoluto. Las que
+                    # comienzan tarde reducen su propio timeout y las que aún no
+                    # han empezado se cancelan, evitando encadenar oleadas de
+                    # rpc_timeout_s al crecer el número de peers.
+                    executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            try:
+                self._stop_protocol_loop()
+            finally:
+                self._leave_complete.set()
+
+    def _send_leave(self, address: str, *, deadline: float) -> None:
+        """Anuncia LEFT a una dirección dentro del presupuesto global de salida."""
+        timeout_s = deadline - time.monotonic()
+        if timeout_s <= 0:
+            return
+
+        try:
+            stub = self.channels.get(address)
+            stub.Leave(
+                membership_pb2.LeaveRequest(
+                    self=membership_pb2.NodeInfo(
+                        node_id=self.node_id,
+                        address=self.address,
+                        incarnation=self.incarnation,
+                    ),
+                    cluster_token=self.cluster_token,
+                ),
+                timeout=timeout_s,
+            )
+        except (grpc.RpcError, ValueError):
+            return
+
+    def bootstrap_join(
+        self,
+        seeds: Iterable[str],
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Intenta el descubrimiento inicial y programa reintentos si sigue aislado.
+
+        ``cancel_event`` permite que la ruta de apagado interrumpa la sucesión de
+        seeds durante el arranque. Una RPC Join ya iniciada conserva su deadline,
+        pero no se inicia un nuevo intento después de recibir la cancelación.
+        """
         normalized_seeds = self._normalize_bootstrap_seeds(seeds)
         self._bootstrap_seeds = normalized_seeds
         self._bootstrap_retry_index = 0
@@ -212,12 +323,17 @@ class MembershipManager:
 
         # Se conserva el intento inmediato del arranque. Los seeds actúan como
         # alternativas de entrada: en cuanto uno permite descubrir un par, no
-        # hace falta bloquear el arranque probando el resto.
+        # hace falta bloquear el arranque probando el resto. Una solicitud de
+        # parada impide encadenar nuevos Join durante esta fase síncrona.
         for seed in normalized_seeds:
+            if self._stop.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                return
             if self._refresh_bootstrap_completion():
                 break
             self._join_seed(seed)
 
+        if self._stop.is_set() or (cancel_event is not None and cancel_event.is_set()):
+            return
         if not self._refresh_bootstrap_completion():
             self._schedule_next_bootstrap_retry()
 
@@ -346,6 +462,11 @@ class MembershipManager:
             for member in self._members.values():
                 if eligible_only and member.state not in ELIGIBLE_STATES:
                     continue
+                if eligible_only and member.node_id == self.node_id and self._leaving.is_set():
+                    # La barrera lógica de salida precede a la publicación del
+                    # MemberEvent LEFT. No exponer el propio nodo en esa ventana
+                    # evita que una consulta concurrente lo seleccione de nuevo.
+                    continue
                 members.append(
                     membership_pb2.NodeInfo(
                         node_id=member.node_id,
@@ -408,6 +529,9 @@ class MembershipManager:
 
     def _handle_self_event(self, event: membership_pb2.MemberEvent, *, source: str) -> None:
         """Procesa eventos sobre el propio node_id."""
+        if self._leaving.is_set():
+            return
+
         if event.address and event.address != self.address:
             print(
                 "AVISO: evento de membership ignorado; posible node_id duplicado "
@@ -443,6 +567,9 @@ class MembershipManager:
 
     def _announce_alive(self) -> None:
         """Publica ALIVE del nodo local con la incarnation actual."""
+        if self._leaving.is_set():
+            return
+
         event = _member_event(
             node_id=self.node_id,
             address=self.address,
@@ -453,6 +580,23 @@ class MembershipManager:
             me = self._members[self.node_id]
             me.incarnation = self.incarnation
             me.state = membership_pb2.ALIVE
+            me.address = self.address
+            me.last_seen = time.monotonic()
+            me.suspect_since = None
+        self.gossip.add(event)
+
+    def _announce_left(self) -> None:
+        """Marca al nodo local como LEFT y conserva el evento para gossip residual."""
+        event = _member_event(
+            node_id=self.node_id,
+            address=self.address,
+            incarnation=self.incarnation,
+            state=membership_pb2.LEFT,
+        )
+        with self._lock:
+            me = self._members[self.node_id]
+            me.incarnation = self.incarnation
+            me.state = membership_pb2.LEFT
             me.address = self.address
             me.last_seen = time.monotonic()
             me.suspect_since = None

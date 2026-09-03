@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
 from stopan.cli.output import print_timing_summary
+from stopan.cli.progress import TerminalProgress
 from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
     build_metadata_object_graph_auto_export,
@@ -165,32 +166,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_runtime_config(args)
     metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
     started_at = time.perf_counter()
+    progress = TerminalProgress()
 
     if args.protection_mode == "ec":
         from stopan.protection.ec.pusher import push_erasure_data_packs_to_network
 
-        stats = push_erasure_data_packs_to_network(
-            membership_seed=args.membership_seed or first_seed(cfg),
-            limit=args.limit,
-            scope=args.scope,
-            snapshot_id=args.snapshot_id,
-            ec_k=int(choose(args.ec_k, cfg.protection.ec_k)),
-            ec_m=int(choose(args.ec_m, cfg.protection.ec_m)),
-            ec_pack_size_bytes=int(choose(args.ec_pack_size_bytes, cfg.protection.ec_pack_size_bytes)),
-            target_parallelism=int(
-                choose(args.target_parallelism, cfg.protection.ec_target_parallelism)
-            ),
-            stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
-            max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-            max_shard_size=int(cfg.storage.max_chunk_size),
-            commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
-            db_file=cfg.node.catalog_file,
-            local_chunk_dir=cfg.storage.local_chunk_dir,
-            self_addr=cfg.node.advertise_addr,
-            cluster_token=cfg.cluster.token,
-            membership_timeout_s=cfg.membership.rpc_timeout_s,
-            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
-        )
+        try:
+            stats = push_erasure_data_packs_to_network(
+                membership_seed=args.membership_seed or first_seed(cfg),
+                limit=args.limit,
+                scope=args.scope,
+                snapshot_id=args.snapshot_id,
+                ec_k=int(choose(args.ec_k, cfg.protection.ec_k)),
+                ec_m=int(choose(args.ec_m, cfg.protection.ec_m)),
+                ec_pack_size_bytes=int(choose(args.ec_pack_size_bytes, cfg.protection.ec_pack_size_bytes)),
+                target_parallelism=int(
+                    choose(args.target_parallelism, cfg.protection.ec_target_parallelism)
+                ),
+                stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
+                max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+                max_shard_size=int(cfg.storage.max_chunk_size),
+                commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
+                db_file=cfg.node.catalog_file,
+                local_chunk_dir=cfg.storage.local_chunk_dir,
+                self_addr=cfg.node.advertise_addr,
+                cluster_token=cfg.cluster.token,
+                membership_timeout_s=cfg.membership.rpc_timeout_s,
+                metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+                progress=progress,
+            )
+        finally:
+            progress.finish()
 
         print("-" * 40)
         print(
@@ -226,27 +232,31 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from stopan.protection.replication.pusher import push_to_network
 
-    stats = push_to_network(
-        membership_seed=args.membership_seed or first_seed(cfg),
-        rf=remote_copies,
-        limit=args.limit,
-        scope=args.scope,
-        snapshot_id=args.snapshot_id,
-        target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
-        probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.replication.probe_batch_hashes)),
-        stream_inflight=int(choose(args.stream_inflight, cfg.replication.stream_inflight)),
-        probe_timeout_s=float(choose(args.probe_timeout_s, cfg.replication.probe_timeout_s)),
-        stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
-        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-        commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
-        strict_rf=bool(choose(args.strict_remote_copies, cfg.protection.strict_remote_copies)),
-        db_file=cfg.node.catalog_file,
-        local_chunk_dir=cfg.storage.local_chunk_dir,
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=cfg.membership.rpc_timeout_s,
-        metadata_object_graph_auto_export=metadata_object_graph_auto_export,
-    )
+    try:
+        stats = push_to_network(
+            membership_seed=args.membership_seed or first_seed(cfg),
+            rf=remote_copies,
+            limit=args.limit,
+            scope=args.scope,
+            snapshot_id=args.snapshot_id,
+            target_parallelism=int(choose(args.target_parallelism, cfg.replication.target_parallelism)),
+            probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.replication.probe_batch_hashes)),
+            stream_inflight=int(choose(args.stream_inflight, cfg.replication.stream_inflight)),
+            probe_timeout_s=float(choose(args.probe_timeout_s, cfg.replication.probe_timeout_s)),
+            stream_timeout_s=float(choose(args.stream_timeout_s, cfg.replication.stream_timeout_s)),
+            max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+            commit_every=int(choose(args.commit_every, cfg.replication.commit_every)),
+            strict_rf=bool(choose(args.strict_remote_copies, cfg.protection.strict_remote_copies)),
+            db_file=cfg.node.catalog_file,
+            local_chunk_dir=cfg.storage.local_chunk_dir,
+            self_addr=cfg.node.advertise_addr,
+            cluster_token=cfg.cluster.token,
+            membership_timeout_s=cfg.membership.rpc_timeout_s,
+            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+            progress=progress,
+        )
+    finally:
+        progress.finish()
 
     print("-" * 40)
     print(

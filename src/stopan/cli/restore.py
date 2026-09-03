@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.progress import TerminalProgress
 from stopan.cli.validation import CLIUsageError, IntRange, validate_int_ranges
 
 
@@ -93,24 +94,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from stopan.restore.service import restore_snapshot
 
-    result = restore_snapshot(
-        args.snapshot_id,
-        membership_seed=(args.membership_seed or first_seed(cfg)) if uses_network else None,
-        base_output_dir=args.out,
-        rf=replication_targets,
-        batch_target_parallelism=int(choose(args.batch_target_parallelism, cfg.restore.batch_target_parallelism)),
-        prefetch_window=int(choose(args.prefetch_window, cfg.restore.prefetch_window)),
-        db_file=cfg.node.catalog_file,
-        local_chunk_dir=cfg.storage.local_chunk_dir,
-        custody_chunk_dir=str(Path(cfg.storage.custody_dir) / "chunks"),
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=cfg.membership.rpc_timeout_s,
-        rpc_timeout_s=cfg.restore.rpc_timeout_s,
-        max_message_bytes=cfg.grpc.max_message_bytes,
-        max_chunk_size=cfg.storage.max_chunk_size,
-        remote_recovery=args.remote_recovery,
-    )
+    progress = TerminalProgress()
+    progress_reporter = progress if progress.enabled else None
+    try:
+        result = restore_snapshot(
+            args.snapshot_id,
+            membership_seed=(args.membership_seed or first_seed(cfg)) if uses_network else None,
+            base_output_dir=args.out,
+            rf=replication_targets,
+            batch_target_parallelism=int(choose(args.batch_target_parallelism, cfg.restore.batch_target_parallelism)),
+            prefetch_window=int(choose(args.prefetch_window, cfg.restore.prefetch_window)),
+            db_file=cfg.node.catalog_file,
+            local_chunk_dir=cfg.storage.local_chunk_dir,
+            custody_chunk_dir=str(Path(cfg.storage.custody_dir) / "chunks"),
+            self_addr=cfg.node.advertise_addr,
+            cluster_token=cfg.cluster.token,
+            membership_timeout_s=cfg.membership.rpc_timeout_s,
+            rpc_timeout_s=cfg.restore.rpc_timeout_s,
+            max_message_bytes=cfg.grpc.max_message_bytes,
+            max_chunk_size=cfg.storage.max_chunk_size,
+            remote_recovery=args.remote_recovery,
+            progress=progress_reporter,
+        )
+    finally:
+        progress.finish()
 
     if getattr(result, "interrupted", False):
         return 130

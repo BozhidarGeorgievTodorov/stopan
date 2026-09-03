@@ -23,6 +23,7 @@ from stopan.protection.concurrency import iter_completed_keyed_tasks
 from stopan.protection.policy import ProtectionState
 from stopan.protection.scope import describe_protection_scope, scoped_erasure_verification_candidates
 from stopan.protection.remote_context import resolve_remote_protection_context
+from stopan.progress import ProgressReporter
 
 
 @dataclass(frozen=True)
@@ -68,12 +69,14 @@ class ErasureDataPackVerifier:
         target_parallelism: int,
         probe_batch_hashes: int,
         cluster,
+        progress: ProgressReporter | None = None,
     ):
         self.db = db
         self.client_pool = client_pool
         self.target_parallelism = max(1, int(target_parallelism))
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
         self.cluster = cluster
+        self.progress = progress
 
     def verify(self, candidates: list[ErasureDataPackRecord]) -> ErasureVerificationStats:
         if not candidates:
@@ -82,12 +85,22 @@ class ErasureDataPackVerifier:
 
         print(f"Verify EC: {len(candidates)} data packs candidatos")
 
-        (
-            outcomes,
-            rpc_failed_calls,
-            rpc_failed_targets,
-            rpc_unverified_assignments,
-        ) = self._verify_candidates(candidates)
+        if self.progress is not None:
+            self.progress.start(
+                "Verificando data packs EC",
+                detail=f"{len(candidates)} packs",
+            )
+
+        try:
+            (
+                outcomes,
+                rpc_failed_calls,
+                rpc_failed_targets,
+                rpc_unverified_assignments,
+            ) = self._verify_candidates(candidates)
+        finally:
+            if self.progress is not None:
+                self.progress.finish()
         verified = 0
         degraded = 0
         failed = 0
@@ -229,6 +242,14 @@ class ErasureDataPackVerifier:
         if not refs_by_address:
             return 0, 0, 0
 
+        if self.progress is not None:
+            self.progress.update(
+                current=0,
+                total=len(refs_by_address),
+                unit="nodos",
+                detail=f"{len(accumulators)} packs",
+            )
+
         tasks = {
             address: (
                 lambda address=address, refs=refs: self._probe_address(address, refs)
@@ -239,6 +260,7 @@ class ErasureDataPackVerifier:
         rpc_failed_targets = 0
         rpc_unverified_assignments = 0
 
+        completed_targets = 0
         for completed in iter_completed_keyed_tasks(
             tasks=tasks,
             max_workers=min(self.target_parallelism, len(tasks)),
@@ -283,6 +305,15 @@ class ErasureDataPackVerifier:
                 message = f"RPC {address}: {outcome.error}"
                 for pack_hash in dict.fromkeys(ref.pack_hash for ref in unprobed_refs):
                     accumulators[pack_hash].errors.append(message)
+
+            completed_targets += 1
+            if self.progress is not None:
+                self.progress.update(
+                    current=completed_targets,
+                    total=len(refs_by_address),
+                    unit="nodos",
+                    detail=f"{len(accumulators)} packs",
+                )
 
         return (
             rpc_failed_calls,
@@ -361,6 +392,7 @@ def verify_erasure_data_packs(
     probe_timeout_s: float,
     max_message_bytes: int,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
+    progress: ProgressReporter | None = None,
 ) -> ErasureVerificationStats:
     db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     client_pool = RemoteDataPackShardClientPool(
@@ -371,6 +403,8 @@ def verify_erasure_data_packs(
     metadata_changed = False
 
     try:
+        if progress is not None:
+            progress.start("Conectando al clúster")
         remote_context = resolve_remote_protection_context(
             membership_seed=membership_seed,
             self_addr=self_addr,
@@ -394,7 +428,11 @@ def verify_erasure_data_packs(
             target_parallelism=target_parallelism,
             probe_batch_hashes=probe_batch_hashes,
             cluster=cluster,
+            progress=progress,
         )
+
+        if progress is not None:
+            progress.finish()
 
         print(f"Verify EC scope: {pack_hash if pack_hash else describe_protection_scope(scope, snapshot_id=snapshot_id)}")
         if include_verified:
@@ -405,6 +443,8 @@ def verify_erasure_data_packs(
         return stats
 
     finally:
+        if progress is not None:
+            progress.finish()
         client_pool.close()
         db.close()
 
@@ -413,4 +453,5 @@ def verify_erasure_data_packs(
             db_file=db_file,
             settings=metadata_object_graph_auto_export,
             context_label="VERIFY_EC",
+            progress=progress,
         )

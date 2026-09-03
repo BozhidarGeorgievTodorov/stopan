@@ -31,6 +31,7 @@ from stopan.protection.scope import (
     describe_protection_scope,
     scoped_replication_push_chunks,
 )
+from stopan.progress import ProgressReporter
 
 from .push_execution import push_chunk_replicas
 from .remote_client import RemoteChunkClientPool
@@ -76,6 +77,7 @@ def push_to_network(
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
     scope: str | None = None,
     snapshot_id: int | None = None,
+    progress: ProgressReporter | None = None,
 ) -> PushStats:
     """
     Replica chunks pendientes en nodos remotos según las copias requeridas.
@@ -100,6 +102,8 @@ def push_to_network(
     processed_bytes = 0
 
     try:
+        if progress is not None:
+            progress.start("Conectando al clúster")
         remote_context = resolve_remote_protection_context(
             membership_seed=membership_seed,
             self_addr=self_addr,
@@ -120,6 +124,9 @@ def push_to_network(
 
         remote_candidate_node_ids = remote_context.remote_candidate_node_ids
         remote_candidate_count = remote_context.remote_candidate_count
+
+        if progress is not None:
+            progress.finish()
 
         if strict_rf and remote_candidate_count < required_remote_copies:
             print("Copias remotas estrictas: no hay suficientes targets remotos elegibles.")
@@ -180,6 +187,14 @@ def push_to_network(
             f"probe_timeout_s={probe_timeout_s} "
             f"stream_timeout_s={stream_timeout_s}"
         )
+
+        if progress is not None:
+            progress.start(
+                "Protegiendo chunks",
+                current=0,
+                total=len(pending_chunks),
+                unit="chunks",
+            )
 
         attempted = 0
         protected = 0
@@ -247,7 +262,17 @@ def push_to_network(
                 if len(pending_updates) >= commit_every:
                     flush_updates()
 
+                if progress is not None:
+                    progress.update(
+                        current=attempted,
+                        total=len(pending_chunks),
+                        unit="chunks",
+                        detail=f"{protected} protegidos",
+                    )
+
             flush_updates()
+            if progress is not None:
+                progress.finish()
             return PushStats(
                 attempted=attempted,
                 protected=protected,
@@ -261,6 +286,8 @@ def push_to_network(
             )
 
         except KeyboardInterrupt:
+            if progress is not None:
+                progress.finish()
             flush_updates()
             print("\nPush interrumpido por el usuario.")
             return PushStats(
@@ -280,6 +307,8 @@ def push_to_network(
             raise
 
     finally:
+        if progress is not None:
+            progress.finish()
         if remote_client is not None:
             remote_client.close()
         db.close()
@@ -289,4 +318,5 @@ def push_to_network(
             db_file=db_file,
             settings=metadata_object_graph_auto_export,
             context_label="PUSH",
+            progress=progress,
         )

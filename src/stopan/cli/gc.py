@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
+from stopan.cli.progress import TerminalProgress
 from stopan.cli.config_utils import add_config_args, choose, load_runtime_config
 from stopan.cli.output import format_bytes
 from stopan.cli.validation import FloatRange, IntRange, validate_float_ranges, validate_int_ranges
@@ -289,25 +290,27 @@ def _cmd_generated_chunks(args: argparse.Namespace) -> int:
     from stopan.metadata.database import MetadataDB, MetadataDBAccessMode
 
     cfg = load_runtime_config(args)
-    db = MetadataDB(
-        cfg.node.catalog_file,
-        init_schema=False,
-        access_mode=MetadataDBAccessMode.READ_ONLY,
-    )
-    try:
-        reachable_hashes = db.gc_protected_chunk_hashes()
-    finally:
-        db.close()
-
+    progress = TerminalProgress()
     with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
-        result = collect_cas_chunks(
-            target=args.command,
-            root_dir=args.chunk_store or cfg.storage.local_chunk_dir,
-            max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_chunk_grace_hours)) * _SECONDS_PER_HOUR),
-            dry_run=bool(args.dry_run),
-            reachable_hashes=reachable_hashes,
-            candidate_reporter=candidates.report,
-        )
+        with progress.task("Recolectando chunks generados"):
+            db = MetadataDB(
+                cfg.node.catalog_file,
+                init_schema=False,
+                access_mode=MetadataDBAccessMode.READ_ONLY,
+            )
+            try:
+                reachable_hashes = db.gc_protected_chunk_hashes()
+            finally:
+                db.close()
+
+            result = collect_cas_chunks(
+                target=args.command,
+                root_dir=args.chunk_store or cfg.storage.local_chunk_dir,
+                max_age_seconds=int(float(choose(args.grace_hours, cfg.gc.generated_chunk_grace_hours)) * _SECONDS_PER_HOUR),
+                dry_run=bool(args.dry_run),
+                reachable_hashes=reachable_hashes,
+                candidate_reporter=candidates.report,
+            )
         _print_local_file_result(result, candidates=candidates)
     return 0
 
@@ -317,14 +320,16 @@ def _cmd_received_chunks(args: argparse.Namespace) -> int:
 
     cfg = load_runtime_config(args)
     max_age_days = int(choose(args.max_age_days, cfg.gc.received_chunk_max_age_days))
+    progress = TerminalProgress()
     with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
-        result = collect_cas_chunks(
-            target=args.command,
-            root_dir=args.chunk_store or (Path(cfg.storage.custody_dir) / "chunks"),
-            max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
-            dry_run=bool(args.dry_run),
-            candidate_reporter=candidates.report,
-        )
+        with progress.task("Recolectando chunks recibidos"):
+            result = collect_cas_chunks(
+                target=args.command,
+                root_dir=args.chunk_store or (Path(cfg.storage.custody_dir) / "chunks"),
+                max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
+                dry_run=bool(args.dry_run),
+                candidate_reporter=candidates.report,
+            )
         _print_local_file_result(result, candidates=candidates)
     return 0
 
@@ -334,14 +339,16 @@ def _cmd_received_ec(args: argparse.Namespace) -> int:
 
     cfg = load_runtime_config(args)
     max_age_days = int(choose(args.max_age_days, cfg.gc.received_ec_max_age_days))
+    progress = TerminalProgress()
     with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
-        result = collect_ec_shards(
-            target=args.command,
-            root_dir=args.ec_store or (Path(cfg.storage.custody_dir) / "ec_shards"),
-            max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
-            dry_run=bool(args.dry_run),
-            candidate_reporter=candidates.report,
-        )
+        with progress.task("Recolectando shards EC recibidos"):
+            result = collect_ec_shards(
+                target=args.command,
+                root_dir=args.ec_store or (Path(cfg.storage.custody_dir) / "ec_shards"),
+                max_age_seconds=None if max_age_days == 0 else max_age_days * _SECONDS_PER_DAY,
+                dry_run=bool(args.dry_run),
+                candidate_reporter=candidates.report,
+            )
         _print_local_file_result(result, candidates=candidates)
     return 0
 
@@ -379,19 +386,27 @@ def _cmd_metadata_object_store(args: argparse.Namespace) -> int:
     )
 
     collector = MetadataObjectGarbageCollector(scrypt_cost=scrypt_cost_from_config(cfg))
+    passphrase = passphrase_for_decrypt(args, cfg)
+    progress = TerminalProgress()
+    label = (
+        "Recolectando metadata object graph"
+        if include_objects
+        else "Recolectando metadata object packs generados"
+    )
     with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
-        result = collector.collect(
-            object_store_dir=object_store_root,
-            identity_file=identity_file,
-            passphrase=passphrase_for_decrypt(args, cfg),
-            object_grace_seconds=int(max(object_grace_hours, 0.0) * _SECONDS_PER_HOUR),
-            pack_grace_seconds=int(max(pack_grace_hours, 0.0) * _SECONDS_PER_HOUR),
-            dry_run=bool(args.dry_run),
-            include_objects=include_objects,
-            include_packs=include_packs,
-            pack_dir=pack_dir,
-            candidate_reporter=candidates.report,
-        )
+        with progress.task(label):
+            result = collector.collect(
+                object_store_dir=object_store_root,
+                identity_file=identity_file,
+                passphrase=passphrase,
+                object_grace_seconds=int(max(object_grace_hours, 0.0) * _SECONDS_PER_HOUR),
+                pack_grace_seconds=int(max(pack_grace_hours, 0.0) * _SECONDS_PER_HOUR),
+                dry_run=bool(args.dry_run),
+                include_objects=include_objects,
+                include_packs=include_packs,
+                pack_dir=pack_dir,
+                candidate_reporter=candidates.report,
+            )
         _print_metadata_object_gc_result(args.command, result, candidates=candidates)
     return 0
 
@@ -400,14 +415,16 @@ def _cmd_received_metadata_packs(args: argparse.Namespace) -> int:
     from stopan.metadata.packs.gc import collect_received_metadata_packs
 
     cfg = load_runtime_config(args)
+    progress = TerminalProgress()
     with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
-        result = collect_received_metadata_packs(
-            cfg=cfg,
-            pack_store=args.pack_store,
-            max_age_days=args.max_age_days,
-            dry_run=bool(args.dry_run),
-            candidate_reporter=candidates.report,
-        )
+        with progress.task("Recolectando metadata packs recibidos"):
+            result = collect_received_metadata_packs(
+                cfg=cfg,
+                pack_store=args.pack_store,
+                max_age_days=args.max_age_days,
+                dry_run=bool(args.dry_run),
+                candidate_reporter=candidates.report,
+            )
         _print_received_metadata_pack_result(result, cfg=cfg, candidates=candidates)
     return 0
 
@@ -416,15 +433,17 @@ def _cmd_recovered_metadata_packs(args: argparse.Namespace) -> int:
     from stopan.metadata.packs.gc import collect_recovered_metadata_packs
 
     cfg = load_runtime_config(args)
+    progress = TerminalProgress()
     with _CandidateSpool(enabled=bool(args.dry_run)) as candidates:
-        result = collect_recovered_metadata_packs(
-            cfg=cfg,
-            object_store=args.object_store,
-            pack_dir=args.pack_dir,
-            max_age_days=args.max_age_days,
-            dry_run=bool(args.dry_run),
-            candidate_reporter=candidates.report,
-        )
+        with progress.task("Recolectando metadata packs recuperados"):
+            result = collect_recovered_metadata_packs(
+                cfg=cfg,
+                object_store=args.object_store,
+                pack_dir=args.pack_dir,
+                max_age_days=args.max_age_days,
+                dry_run=bool(args.dry_run),
+                candidate_reporter=candidates.report,
+            )
         _print_local_file_result(result, candidates=candidates)
     return 0
 

@@ -17,6 +17,7 @@ from stopan.restore.remote_client import RemoteStorageClientPool
 from stopan.restore.restorer import RestoreResult, SnapshotRestorer
 from stopan.restore.errors import RestoreDataError
 from stopan.protection.policy import normalize_remote_rf
+from stopan.progress import ProgressReporter
 
 
 _REMOTE_RECOVERY_MODES = {"none", "replication", "ec", "auto"}
@@ -40,6 +41,7 @@ def restore_snapshot(
     max_message_bytes: int,
     max_chunk_size: int,
     remote_recovery: str = "replication",
+    progress: ProgressReporter | None = None,
 ) -> RestoreResult:
     """
     Restaura un snapshot preparando todos los servicios necesarios.
@@ -83,6 +85,7 @@ def restore_snapshot(
                 cluster_token=cluster_token,
                 membership_timeout_s=membership_timeout_s,
                 max_message_bytes=max_message_bytes,
+                progress=progress,
             )
 
         if use_remote_chunks:
@@ -103,6 +106,7 @@ def restore_snapshot(
                 repo=repo,
                 remote_pool=ec_remote_pool,
                 cluster_resolver=cluster_resolver,
+                progress=progress,
             )
         fetch_service = ChunkFetchService(
             repo=repo,
@@ -114,6 +118,7 @@ def restore_snapshot(
             max_chunk_size=max_chunk_size,
             ec_recovery_service=ec_recovery_service,
             remote_chunk_recovery=use_remote_chunks,
+            progress=progress,
         )
         restorer = SnapshotRestorer(
             db=db,
@@ -121,6 +126,7 @@ def restore_snapshot(
             base_output_dir=base_output_dir,
             batch_target_parallelism=batch_target_parallelism,
             prefetch_window=prefetch_window,
+            progress=progress,
         )
 
         return restorer.restore(snapshot_id)

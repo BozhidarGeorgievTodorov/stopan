@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
 from stopan.cli.validation import IntRange, validate_int_ranges
+from stopan.cli.progress import TerminalProgress
 from stopan.errors import StopanUsageError
 from stopan.cli.metadata_auto_export import (
     add_metadata_auto_export_args,
@@ -108,22 +109,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from stopan.backup.service import backup_directory
 
-    result = backup_directory(
-        source_path,
-        num_threads=workers,
-        fast_local_enabled=fast_local_enabled,
-        fast_remote_enabled=fast_remote_enabled,
-        safe_mode=bool(args.safe_mode),
-        deterministic=bool(args.deterministic),
-        desired_rf=int(choose(args.desired_remote_copies, cfg.protection.remote_copies)),
-        membership_seed=args.membership_seed or first_seed(cfg),
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=cfg.membership.rpc_timeout_s,
-        max_message_bytes=cfg.grpc.max_message_bytes,
-        local_chunk_dir=cfg.storage.local_chunk_dir,
-        db_file=cfg.node.catalog_file,
-        node_id_file=cfg.node.identity_file,
-        metadata_object_graph_auto_export=metadata_object_graph_auto_export,
-    )
+    progress = TerminalProgress()
+    try:
+        result = backup_directory(
+            source_path,
+            num_threads=workers,
+            fast_local_enabled=fast_local_enabled,
+            fast_remote_enabled=fast_remote_enabled,
+            safe_mode=bool(args.safe_mode),
+            deterministic=bool(args.deterministic),
+            desired_rf=int(choose(args.desired_remote_copies, cfg.protection.remote_copies)),
+            membership_seed=args.membership_seed or first_seed(cfg),
+            self_addr=cfg.node.advertise_addr,
+            cluster_token=cfg.cluster.token,
+            membership_timeout_s=cfg.membership.rpc_timeout_s,
+            max_message_bytes=cfg.grpc.max_message_bytes,
+            local_chunk_dir=cfg.storage.local_chunk_dir,
+            db_file=cfg.node.catalog_file,
+            node_id_file=cfg.node.identity_file,
+            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+            progress=progress,
+        )
+    finally:
+        progress.finish()
     return 0 if result is not False else 1

@@ -43,6 +43,7 @@ from stopan.protection.scope import (
     scoped_erasure_push_new_chunks,
     scoped_erasure_push_retry_packs,
 )
+from stopan.progress import ProgressReporter
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ def push_erasure_data_packs_to_network(
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
     scope: str | None = None,
     snapshot_id: int | None = None,
+    progress: ProgressReporter | None = None,
 ) -> ErasurePushStats:
     spec = ErasureSpec(data_shards=int(ec_k), parity_shards=int(ec_m))
     pack_size = max(int(ec_pack_size_bytes), 1)
@@ -120,6 +122,8 @@ def push_erasure_data_packs_to_network(
         metadata_changed = True
 
     try:
+        if progress is not None:
+            progress.start("Conectando al clúster")
         remote_context = resolve_remote_protection_context(
             membership_seed=membership_seed,
             self_addr=self_addr,
@@ -135,6 +139,9 @@ def push_erasure_data_packs_to_network(
         origin_node_id = remote_context.origin_node_id
         remote_candidate_count = remote_context.remote_candidate_count
         new_pack_placement_epoch = remote_context.placement_epoch(remote_targets=spec.total_shards)
+
+        if progress is not None:
+            progress.finish()
         existing_epochs = {
             remote_targets: remote_context.placement_epoch(remote_targets=remote_targets)
             for remote_targets in db.erasure_data_pack_remote_targets()
@@ -212,7 +219,15 @@ def push_erasure_data_packs_to_network(
             required_remote_targets=required_remote_targets,
         )
 
-        for record in retry_packs:
+        if retry_packs and progress is not None:
+            progress.start(
+                "Reintentando data packs",
+                current=0,
+                total=len(retry_packs),
+                unit="packs",
+            )
+
+        for retry_index, record in enumerate(retry_packs, start=1):
             pack_chunk_count, retry_update = _retry_existing_pack(
                 record=record,
                 db=db,
@@ -232,17 +247,49 @@ def push_erasure_data_packs_to_network(
                 pending_updates.append(retry_update)
             if len(pending_updates) + len(pending_error_updates) >= commit_every:
                 flush_push_updates()
+            if progress is not None:
+                progress.update(
+                    current=retry_index,
+                    total=len(retry_packs),
+                    unit="packs",
+                    detail=f"{stats.placed_packs} protegidos",
+                )
+
+        if retry_packs and progress is not None:
+            progress.finish()
 
         if builder is not None:
-            for chunk_hash in pending_chunks:
+            if progress is not None:
+                progress.start(
+                    "Protegiendo chunks (EC)",
+                    current=0,
+                    total=len(pending_chunks),
+                    unit="chunks",
+                )
+
+            for chunk_index, chunk_hash in enumerate(pending_chunks, start=1):
                 try:
                     data = repo.get(chunk_hash)
                 except FileNotFoundError:
                     stats.missing_local_chunks += 1
                     stats.failed_chunks += 1
+                    if progress is not None:
+                        progress.update(
+                            current=chunk_index,
+                            total=len(pending_chunks),
+                            unit="chunks",
+                            detail=f"{stats.attempted_packs} packs",
+                        )
                     continue
                 except CASRepositoryError:
                     stats.failed_chunks += 1
+                    if progress is not None:
+                        progress.update(
+                            current=chunk_index,
+                            total=len(pending_chunks),
+                            unit="chunks",
+                            detail=f"{stats.attempted_packs} packs",
+                        )
                     continue
 
                 if builder.would_exceed_target(data_size=len(data)):
@@ -268,6 +315,13 @@ def push_erasure_data_packs_to_network(
                     must_flush = builder._add_prevalidated_chunk(chunk_hash=chunk_hash, data=data)
                 except ErasureCodingError:
                     stats.failed_chunks += 1
+                    if progress is not None:
+                        progress.update(
+                            current=chunk_index,
+                            total=len(pending_chunks),
+                            unit="chunks",
+                            detail=f"{stats.attempted_packs} packs",
+                        )
                     continue
 
                 stats.packed_chunks += 1
@@ -291,6 +345,14 @@ def push_erasure_data_packs_to_network(
                         if len(pending_updates) >= commit_every:
                             flush_push_updates()
 
+                if progress is not None:
+                    progress.update(
+                        current=chunk_index,
+                        total=len(pending_chunks),
+                        unit="chunks",
+                        detail=f"{stats.attempted_packs} packs",
+                    )
+
         if builder is not None:
             push_update = _flush_and_push_pack(
                 builder=builder,
@@ -310,9 +372,14 @@ def push_erasure_data_packs_to_network(
 
         flush_push_updates()
 
+        if progress is not None:
+            progress.finish()
+
         return stats.freeze()
 
     except KeyboardInterrupt:
+        if progress is not None:
+            progress.finish()
         print("\nPush EC interrumpido por el usuario.")
         flush_push_updates()
         if "stats" in locals():
@@ -327,6 +394,8 @@ def push_erasure_data_packs_to_network(
         raise
 
     finally:
+        if progress is not None:
+            progress.finish()
         if pool is not None:
             pool.close()
         if "stats" in locals() and stats.attempted_packs > 0:
@@ -338,6 +407,7 @@ def push_erasure_data_packs_to_network(
             db_file=db_file,
             settings=metadata_object_graph_auto_export,
             context_label="PUSH_EC",
+            progress=progress,
         )
 
 

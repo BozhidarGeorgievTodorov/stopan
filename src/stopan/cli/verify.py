@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Sequence
 
 from stopan.cli.config_utils import add_config_args, choose, first_seed, load_runtime_config
+from stopan.cli.progress import TerminalProgress
 from stopan.cli.validation import FloatRange, IntRange, validate_float_ranges, validate_int_ranges
 PROTECTION_SCOPE_CHOICES = ("pending", "snapshot", "all-reachable", "all-known-chunks")
 
@@ -86,27 +87,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     
     cfg = load_runtime_config(args)
     metadata_object_graph_auto_export = build_metadata_object_graph_auto_export(args, cfg)
+    progress = TerminalProgress()
 
     if args.protection_mode == "ec":
         from stopan.protection.ec.verifier import verify_erasure_data_packs
 
-        stats = verify_erasure_data_packs(
-            membership_seed=args.membership_seed or first_seed(cfg),
-            self_addr=cfg.node.advertise_addr,
-            cluster_token=cfg.cluster.token,
-            membership_timeout_s=cfg.membership.rpc_timeout_s,
-            db_file=cfg.node.catalog_file,
-            include_verified=bool(args.reverify_verified),
-            limit=args.limit,
-            scope=args.scope,
-            snapshot_id=args.snapshot_id,
-            pack_hash=args.pack_hash,
-            target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
-            probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.verify.probe_batch_hashes)),
-            probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
-            max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
-        )
+        try:
+            stats = verify_erasure_data_packs(
+                membership_seed=args.membership_seed or first_seed(cfg),
+                self_addr=cfg.node.advertise_addr,
+                cluster_token=cfg.cluster.token,
+                membership_timeout_s=cfg.membership.rpc_timeout_s,
+                db_file=cfg.node.catalog_file,
+                include_verified=bool(args.reverify_verified),
+                limit=args.limit,
+                scope=args.scope,
+                snapshot_id=args.snapshot_id,
+                pack_hash=args.pack_hash,
+                target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
+                probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.verify.probe_batch_hashes)),
+                probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
+                max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+                metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+                progress=progress,
+            )
+        finally:
+            progress.finish()
 
         print("-" * 40)
         print(
@@ -120,22 +126,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from stopan.protection.replication.verifier import verify_remote_protection
 
-    stats = verify_remote_protection(
-        membership_seed=args.membership_seed or first_seed(cfg),
-        db_file=cfg.node.catalog_file,
-        self_addr=cfg.node.advertise_addr,
-        cluster_token=cfg.cluster.token,
-        membership_timeout_s=cfg.membership.rpc_timeout_s,
-        include_verified=bool(args.reverify_verified),
-        limit=args.limit,
-        scope=args.scope,
-        snapshot_id=args.snapshot_id,
-        target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
-        probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.verify.probe_batch_hashes)),
-        probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
-        max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
-        metadata_object_graph_auto_export=metadata_object_graph_auto_export,
-    )
+    try:
+        stats = verify_remote_protection(
+            membership_seed=args.membership_seed or first_seed(cfg),
+            db_file=cfg.node.catalog_file,
+            self_addr=cfg.node.advertise_addr,
+            cluster_token=cfg.cluster.token,
+            membership_timeout_s=cfg.membership.rpc_timeout_s,
+            include_verified=bool(args.reverify_verified),
+            limit=args.limit,
+            scope=args.scope,
+            snapshot_id=args.snapshot_id,
+            target_parallelism=int(choose(args.target_parallelism, cfg.verify.target_parallelism)),
+            probe_batch_hashes=int(choose(args.probe_batch_hashes, cfg.verify.probe_batch_hashes)),
+            probe_timeout_s=float(choose(args.probe_timeout_s, cfg.verify.probe_timeout_s)),
+            max_message_bytes=int(choose(args.max_message_bytes, cfg.grpc.max_message_bytes)),
+            metadata_object_graph_auto_export=metadata_object_graph_auto_export,
+            progress=progress,
+        )
+    finally:
+        progress.finish()
 
     print("-" * 40)
     print(

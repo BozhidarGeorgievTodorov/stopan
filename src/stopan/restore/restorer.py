@@ -25,6 +25,7 @@ from stopan.restore.fetch import ChunkFetchService
 from stopan.restore.models import RestoreRunStats
 from stopan.restore.paths import RestorePaths, safe_restore_path, validate_restore_root
 from stopan.restore.prefetcher import OrderedBatchChunkPrefetcher
+from stopan.progress import ProgressReporter, suspend_progress
 from stopan.errors import StopanStorageError
 from stopan.restore.errors import RestoreDataError, RestorePathError
 
@@ -70,12 +71,14 @@ class SnapshotRestorer:
         base_output_dir: str,
         batch_target_parallelism: int,
         prefetch_window: int,
+        progress: ProgressReporter | None = None,
     ):
         self.db = db
         self.fetch_service = fetch_service
         self.base_output_dir = base_output_dir
         self.batch_target_parallelism = max(int(batch_target_parallelism), 1)
         self.prefetch_window = max(int(prefetch_window), 1)
+        self.progress = progress
 
     def restore(self, snapshot_id: int) -> RestoreResult:
         """
@@ -168,14 +171,23 @@ class SnapshotRestorer:
         )
         current_resume_path: str | None = None
 
+        if self.progress is not None:
+            self.progress.start(
+                "Restaurando datos",
+                current=0,
+                unit="ítems",
+                detail="0 B escritos",
+            )
+
         try:
             for item in iter_items():
                 stats.processed_items += 1
+                self._update_interactive_progress(stats)
 
                 try:
                     full_path = safe_restore_path(paths.incomplete_dir, item["path"])
                 except RestorePathError as exc:
-                    print(f"   {exc}")
+                    self._runtime_print(f"   {exc}")
                     continue
 
                 item_type = item.get("item_type")
@@ -186,10 +198,13 @@ class SnapshotRestorer:
                     directories.append((full_path, item))
                     stats.directories_created += 1
                     stats.successful_items += 1
+                    self._update_interactive_progress(stats)
                     continue
 
                 if item_type != "file":
-                    print(f"   Tipo de item no soportado en {item['path']}: {item_type!r}")
+                    self._runtime_print(
+                        f"   Tipo de item no soportado en {item['path']}: {item_type!r}"
+                    )
                     continue
 
                 parent_dir = os.path.dirname(full_path)
@@ -199,11 +214,16 @@ class SnapshotRestorer:
                     prepared_dirs.add(parent_dir)
 
                 if os.path.isdir(full_path):
-                    print(f"   Se esperaba archivo pero existe directorio en {item['path']}")
+                    self._runtime_print(
+                        f"   Se esperaba archivo pero existe directorio en {item['path']}"
+                    )
                     stats.files_failed += 1
                     continue
 
-                if stats.processed_items % RESTORE_PROGRESS_EVERY_ITEMS == 0:
+                if (
+                    self.progress is None
+                    and stats.processed_items % RESTORE_PROGRESS_EVERY_ITEMS == 0
+                ):
                     self._print_progress(stats)
 
                 success_file = True
@@ -239,6 +259,7 @@ class SnapshotRestorer:
                         stats.chunks_reused += expected_chunk_count
                         stats.bytes_reused += expected_size
                         stats.successful_items += 1
+                        self._update_interactive_progress(stats)
                         current_resume_path = None
                         continue
 
@@ -293,6 +314,7 @@ class SnapshotRestorer:
                                 stats.bytes_written += written
                                 bytes_since_sync += written
                                 next_order += 1
+                                self._update_interactive_progress(stats)
 
                                 if (
                                     durable_checkpoints
@@ -342,14 +364,14 @@ class SnapshotRestorer:
                                         sync_parent=not resume_name_synced,
                                     )
                                 except OSError as sync_exc:
-                                    print(
+                                    self._runtime_print(
                                         "   No se pudo sincronizar el último avance "
                                         f"de {item['path']}: {sync_exc}"
                                     )
                             raise
 
                 except Exception as exc:
-                    print(f"   Error crítico en archivo {item['path']}: {exc}")
+                    self._runtime_print(f"   Error crítico en archivo {item['path']}: {exc}")
                     success_file = False
 
                 if success_file:
@@ -363,22 +385,28 @@ class SnapshotRestorer:
                         self.apply_item_metadata(full_path, item, is_dir=False)
                         stats.files_restored += 1
                         stats.successful_items += 1
+                        self._update_interactive_progress(stats)
                     except Exception as exc:
-                        print(f"   Error finalizando archivo {item['path']}: {exc}")
+                        self._runtime_print(
+                            f"   Error finalizando archivo {item['path']}: {exc}"
+                        )
                         stats.files_failed += 1
-                        print(
+                        self._runtime_print(
                             f"   Archivo {item['path']} no restaurado. "
                             "Se conservará su parcial verificable para el próximo intento."
                         )
                 else:
                     stats.files_failed += 1
-                    print(
+                    self._runtime_print(
                         f"   Archivo {item['path']} no restaurado. "
                         "Se conservará su parcial verificable para el próximo intento."
                     )
                 current_resume_path = None
+                self._update_interactive_progress(stats)
 
         except KeyboardInterrupt:
+            if self.progress is not None:
+                self.progress.finish()
             print("\n\nRestauración cancelada (Ctrl+C).")
             print(
                 "El progreso verificable por fragmentos se conserva para el próximo intento "
@@ -394,6 +422,13 @@ class SnapshotRestorer:
                 error="restore interrumpido",
                 stats=stats,
             )
+        except BaseException:
+            if self.progress is not None:
+                self.progress.finish()
+            raise
+
+        if self.progress is not None:
+            self.progress.finish()
 
         if stats.successful_items == stats.processed_items and stats.processed_items > 0:
             try:
@@ -752,6 +787,22 @@ class SnapshotRestorer:
                 # problema al preparar el directorio de trabajo.
                 pass
 
+    def _update_interactive_progress(self, stats: RestoreRunStats) -> None:
+        if self.progress is None:
+            return
+        detail = f"{format_bytes(stats.bytes_written)} escritos"
+        if stats.bytes_reused:
+            detail += f" · {format_bytes(stats.bytes_reused)} reutilizados"
+        self.progress.update(
+            current=stats.processed_items,
+            unit="ítems",
+            detail=detail,
+        )
+
+    def _runtime_print(self, *args, **kwargs) -> None:
+        with suspend_progress(self.progress):
+            print(*args, **kwargs)
+
     @staticmethod
     def _print_progress(stats: RestoreRunStats) -> None:
         suffix = ""
@@ -797,8 +848,7 @@ class SnapshotRestorer:
             f"failed={stats.chunks_failed}"
         )
 
-    @staticmethod
-    def apply_item_metadata(path: str, item: dict, *, is_dir: bool) -> None:
+    def apply_item_metadata(self, path: str, item: dict, *, is_dir: bool) -> None:
         """
         Restaura permisos y mtime del item.
 
@@ -809,5 +859,7 @@ class SnapshotRestorer:
             os.chmod(path, item["mode"])
             os.utime(path, (item["mtime"], item["mtime"]))
         except OSError:
-            print(f"   No se pudieron restaurar permisos/fechas de {kind}: {item['path']}")
+            self._runtime_print(
+                f"   No se pudieron restaurar permisos/fechas de {kind}: {item['path']}"
+            )
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from stopan.common.fs import atomic_write_bytes
 from stopan.errors import StopanConfigError
 from stopan.cluster.resolver import try_cluster_view
+from stopan.progress import ProgressReporter, suspend_progress
 from stopan.node.lifecycle import (
     current_local_operation_matches,
     current_local_operation_node_id,
@@ -91,6 +92,7 @@ def resolve_origin_node_id(
     node_id_file: str,
     membership_timeout_s: float,
     max_message_bytes: int,
+    progress: ProgressReporter | None = None,
 ) -> str:
     """
     Resuelve el origin_node_id del snapshot.
@@ -118,9 +120,10 @@ def resolve_origin_node_id(
                 return resolved.cluster.self_node_id
 
         except Exception as exc:
-            print(
-                "No se pudo resolver origin_node_id desde membership. "
-                f"Se usará la identidad local: {exc}"
-            )
+            with suspend_progress(progress):
+                print(
+                    "No se pudo resolver origin_node_id desde membership. "
+                    f"Se usará la identidad local: {exc}"
+                )
 
     return load_or_create_local_node_id(node_id_file=node_id_file)

@@ -24,6 +24,7 @@ from stopan.metadata.objects.graph.auto_export import (
     MetadataObjectGraphAutoExport,
     export_metadata_object_graph_after_metadata_change,
 )
+from stopan.progress import ProgressReporter
 from stopan.scanning.scanner import TreeWalker
 from stopan.errors import StopanStorageError, StopanUsageError
 from stopan.config.defaults import DEFAULT_BACKUP_WORKERS
@@ -51,6 +52,7 @@ def backup_directory(
     db_file: str,
     node_id_file: str,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
+    progress: ProgressReporter | None = None,
 ) -> None:
     """
     Ejecuta un backup completo de source_path.
@@ -68,27 +70,35 @@ def backup_directory(
 
     started_at = time.perf_counter()
 
-    origin_node_id = resolve_origin_node_id(
-        membership_seed=membership_seed,
-        self_addr=self_addr,
-        cluster_token=cluster_token,
-        node_id_file=node_id_file,
-        membership_timeout_s=membership_timeout_s,
-        max_message_bytes=max_message_bytes,
-    )
+    if progress is not None:
+        progress.start("Preparando respaldo")
+    try:
+        origin_node_id = resolve_origin_node_id(
+            membership_seed=membership_seed,
+            self_addr=self_addr,
+            cluster_token=cluster_token,
+            node_id_file=node_id_file,
+            membership_timeout_s=membership_timeout_s,
+            max_message_bytes=max_message_bytes,
+            progress=progress,
+        )
 
-    policy = build_backup_fast_path_policy(
-        desired_rf=desired_rf,
-        membership_seed=membership_seed,
-        self_addr=self_addr,
-        cluster_token=cluster_token,
-        membership_timeout_s=membership_timeout_s,
-        max_message_bytes=max_message_bytes,
-        fast_local_enabled=fast_local_enabled,
-        fast_remote_enabled=fast_remote_enabled,
-        safe_mode=safe_mode,
-        origin_node_id=origin_node_id,
-    )
+        policy = build_backup_fast_path_policy(
+            desired_rf=desired_rf,
+            membership_seed=membership_seed,
+            self_addr=self_addr,
+            cluster_token=cluster_token,
+            membership_timeout_s=membership_timeout_s,
+            max_message_bytes=max_message_bytes,
+            fast_local_enabled=fast_local_enabled,
+            fast_remote_enabled=fast_remote_enabled,
+            safe_mode=safe_mode,
+            origin_node_id=origin_node_id,
+            progress=progress,
+        )
+    finally:
+        if progress is not None:
+            progress.finish()
 
     workers = _normalize_worker_count(num_threads)
     placement_epoch = policy.placement_epoch
@@ -104,6 +114,9 @@ def backup_directory(
         print("Fast-path: solo chunks locales")
     else:
         print("Fast-path: desactivado")
+
+    if progress is not None:
+        progress.start("Creando respaldo", current=0, unit="archivos")
 
     db = MetadataDB(db_file, access_mode=MetadataDBAccessMode.READ_WRITE)
     snapshot_id: int | None = None
@@ -157,6 +170,12 @@ def backup_directory(
                     )
 
                     totals.add_worker_file(file_size=file_size, stats=stats)
+                    if progress is not None:
+                        progress.update(
+                            current=totals.files,
+                            unit="archivos",
+                            detail=f"{totals.chunks_total} chunks leídos",
+                        )
 
             for walk_batch in _iter_walk_batches(
                 walker,
@@ -209,6 +228,12 @@ def backup_directory(
                     reused_assignments,
                     desired_rf=policy.desired_rf,
                 )
+                if reused_assignments and progress is not None:
+                    progress.update(
+                        current=totals.files,
+                        unit="archivos",
+                        detail=f"{totals.chunks_total} chunks leídos",
+                    )
 
                 for item_id, rel_path, full_path in pending_processing:
                     future = executor.submit(
@@ -235,8 +260,12 @@ def backup_directory(
 
         db.finish_snapshot(snapshot_id, totals.size, totals.files)
         snapshot_completed = True
+        if progress is not None:
+            progress.finish()
 
     except KeyboardInterrupt:
+        if progress is not None:
+            progress.finish()
         if snapshot_id is not None:
             try:
                 db.fail_snapshot(snapshot_id, "backup interrumpido por el usuario")
@@ -253,6 +282,8 @@ def backup_directory(
         raise
 
     finally:
+        if progress is not None:
+            progress.finish()
         db.close()
 
     elapsed = time.perf_counter() - started_at
@@ -278,6 +309,7 @@ def backup_directory(
             db_file=db_file,
             settings=metadata_object_graph_auto_export,
             context_label="BACKUP",
+            progress=progress,
         )
 
 

@@ -24,6 +24,7 @@ from stopan.protection.remote_context import (
     RemoteProtectionContext,
     resolve_remote_protection_context,
 )
+from stopan.progress import ProgressReporter
 
 from .placement import plan_chunk_replication_targets
 from .remote_client import ProbeExecutionResult, RemoteChunkClientPool
@@ -55,6 +56,7 @@ class ChunkProtectionVerifier:
         target_parallelism: int,
         probe_batch_hashes: int,
         max_message_bytes: int,
+        progress: ProgressReporter | None = None,
     ):
         self.db = db
         self.remote_context = remote_context
@@ -67,6 +69,7 @@ class ChunkProtectionVerifier:
         self.probe_timeout_s = float(probe_timeout_s)
         self.target_parallelism = max(1, int(target_parallelism))
         self.probe_batch_hashes = max(1, int(probe_batch_hashes))
+        self.progress = progress
         self._client_pool = RemoteChunkClientPool(
             cluster_token=self.cluster_token,
             probe_timeout_s=probe_timeout_s,
@@ -105,12 +108,22 @@ class ChunkProtectionVerifier:
             f"probe_timeout_s={self.probe_timeout_s}"
         )
 
-        (
-            outcomes,
-            rpc_failed_calls,
-            rpc_failed_targets,
-            rpc_unverified_assignments,
-        ) = self._verify_candidates(candidates)
+        if self.progress is not None:
+            self.progress.start(
+                "Verificando protección",
+                detail=f"{len(candidates)} chunks",
+            )
+
+        try:
+            (
+                outcomes,
+                rpc_failed_calls,
+                rpc_failed_targets,
+                rpc_unverified_assignments,
+            ) = self._verify_candidates(candidates)
+        finally:
+            if self.progress is not None:
+                self.progress.finish()
         verified = 0
         degraded = 0
 
@@ -165,6 +178,13 @@ class ChunkProtectionVerifier:
         rpc_unverified_assignments = 0
 
         if target_chunks:
+            if self.progress is not None:
+                self.progress.update(
+                    current=0,
+                    total=len(target_chunks),
+                    unit="nodos",
+                    detail=f"{len(candidates)} chunks",
+                )
             tasks = {
                 address: (
                     lambda address=address, hashes=hashes: self._execute_target_probe(
@@ -175,6 +195,7 @@ class ChunkProtectionVerifier:
                 for address, hashes in target_chunks.items()
             }
 
+            completed_targets = 0
             for completed in iter_completed_keyed_tasks(
                 tasks=tasks,
                 max_workers=min(self.target_parallelism, len(target_chunks)),
@@ -214,6 +235,15 @@ class ChunkProtectionVerifier:
                     message = f"RPC {result.node_id[:8]}@{result.address}: {result.transport_error}"
                     for chunk_hash in unverified_hashes:
                         accumulators[chunk_hash].errors.append(message)
+
+                completed_targets += 1
+                if self.progress is not None:
+                    self.progress.update(
+                        current=completed_targets,
+                        total=len(target_chunks),
+                        unit="nodos",
+                        detail=f"{len(candidates)} chunks",
+                    )
 
         outcomes: list[VerificationOutcome] = []
         for candidate in candidates:
@@ -329,6 +359,7 @@ def verify_remote_protection(
     probe_timeout_s: float,
     max_message_bytes: int,
     metadata_object_graph_auto_export: MetadataObjectGraphAutoExport | None = None,
+    progress: ProgressReporter | None = None,
 ) -> VerificationStats:
     """
     Ejecuta una verificación remota de chunk_protection.
@@ -343,6 +374,8 @@ def verify_remote_protection(
     metadata_changed = False
 
     try:
+        if progress is not None:
+            progress.start("Conectando al clúster")
         remote_context = resolve_remote_protection_context(
             membership_seed=membership_seed,
             self_addr=self_addr,
@@ -370,7 +403,11 @@ def verify_remote_protection(
             target_parallelism=target_parallelism,
             probe_batch_hashes=probe_batch_hashes,
             max_message_bytes=max_message_bytes,
+            progress=progress,
         )
+
+        if progress is not None:
+            progress.finish()
 
         print(f"Membership seed: {resolved_seed}")
         print(f"Verify scope: {describe_protection_scope(scope, snapshot_id=snapshot_id)}")
@@ -382,6 +419,8 @@ def verify_remote_protection(
         return stats
 
     finally:
+        if progress is not None:
+            progress.finish()
         if verifier is not None:
             verifier.close()
         db.close()
@@ -391,4 +430,5 @@ def verify_remote_protection(
             db_file=db_file,
             settings=metadata_object_graph_auto_export,
             context_label="VERIFY",
+            progress=progress,
         )

@@ -14,6 +14,7 @@ from stopan.errors import StopanConfigValueError
 from stopan.cluster.resolver import require_cluster_view
 from stopan.protection.policy import normalize_remote_rf
 from stopan.node.lifecycle import current_local_operation_matches
+from stopan.progress import ProgressReporter, suspend_progress
 
 
 def resolve_membership_seed(explicit_seed: str | None = None) -> str | None:
@@ -43,6 +44,7 @@ class LazyClusterResolver:
         cluster_token: str,
         membership_timeout_s: float,
         max_message_bytes: int,
+        progress: ProgressReporter | None = None,
     ):
         self.membership_seed = resolve_membership_seed(membership_seed)
         self.rf = normalize_remote_rf(rf)
@@ -50,6 +52,7 @@ class LazyClusterResolver:
         self.cluster_token = str(cluster_token or "")
         self.membership_timeout_s = float(membership_timeout_s)
         self.max_message_bytes = max(int(max_message_bytes), 1)
+        self.progress = progress
         # ContextVar no se propaga automáticamente a los hilos auxiliares. La
         # condición se captura al construir el resolver en el hilo de la
         # operación CLI ya admitida.
@@ -110,15 +113,16 @@ class LazyClusterResolver:
         if not should_announce:
             return
 
-        print(
-            "Activando recuperación remota. "
-            f"Miembros elegibles: {[f'{member.node_id[:8]}@{member.address}' for member in cluster.members]}"
-        )
-        if cluster.self_node_id:
-            print(f"Nodo local: {cluster.self_node_id[:8]}@{self.self_addr}")
+        with suspend_progress(self.progress):
+            print(
+                "Activando recuperación remota. "
+                f"Miembros elegibles: {[f'{member.node_id[:8]}@{member.address}' for member in cluster.members]}"
+            )
+            if cluster.self_node_id:
+                print(f"Nodo local: {cluster.self_node_id[:8]}@{self.self_addr}")
 
-        remote_candidate_count = len(
-            cluster.candidate_node_ids_excluding({self.origin_node_id})
-        )
-        print(f"Origin excluido de protección: {self.origin_node_id[:8]}")
-        print(f"Copias remotas consultables: {min(self.rf, remote_candidate_count)}/{remote_candidate_count}")
+            remote_candidate_count = len(
+                cluster.candidate_node_ids_excluding({self.origin_node_id})
+            )
+            print(f"Origin excluido de protección: {self.origin_node_id[:8]}")
+            print(f"Copias remotas consultables: {min(self.rf, remote_candidate_count)}/{remote_candidate_count}")

@@ -12,6 +12,7 @@ from stopan.backup.models import BackupPolicy
 from stopan.errors import StopanConfigValueError
 from stopan.cluster.resolver import try_cluster_view
 from stopan.protection.policy import normalize_remote_rf
+from stopan.progress import ProgressReporter, suspend_progress
 
 
 def resolve_remote_placement_epoch(
@@ -67,6 +68,7 @@ def build_backup_fast_path_policy(
     fast_remote_enabled: bool,
     safe_mode: bool,
     origin_node_id: str,
+    progress: ProgressReporter | None = None,
 ) -> BackupPolicy:
     desired_rf = normalize_remote_rf(desired_rf, field_name="desired_rf")
     fast_local_enabled = bool(fast_local_enabled)
@@ -105,7 +107,8 @@ def build_backup_fast_path_policy(
         )
 
     if required_remote_copies <= 0:
-        print("Copias remotas deseadas: 0. Usando solo fast-path local.")
+        with suspend_progress(progress):
+            print("Copias remotas deseadas: 0. Usando solo fast-path local.")
         return BackupPolicy(
             desired_rf=desired_rf,
             fast_local_enabled=True,
@@ -114,7 +117,8 @@ def build_backup_fast_path_policy(
         )
 
     if not membership_seed:
-        print("Se pidió fast-path remoto, pero no hay membership seed. Usando solo fast-path local.")
+        with suspend_progress(progress):
+            print("Se pidió fast-path remoto, pero no hay membership seed. Usando solo fast-path local.")
         return BackupPolicy(
             desired_rf=desired_rf,
             fast_local_enabled=True,
@@ -133,7 +137,8 @@ def build_backup_fast_path_policy(
             origin_node_id=origin_node_id,
         )
     except Exception as exc:
-        print(f"No se pudo leer placement_epoch. Usando solo fast-path local: {exc}")
+        with suspend_progress(progress):
+            print(f"No se pudo leer placement_epoch. Usando solo fast-path local: {exc}")
         return BackupPolicy(
             desired_rf=desired_rf,
             fast_local_enabled=True,
@@ -142,7 +147,8 @@ def build_backup_fast_path_policy(
         )
 
     if placement_epoch is None:
-        print("Membership no devolvió una vista elegible usable. Usando solo fast-path local.")
+        with suspend_progress(progress):
+            print("Membership no devolvió una vista elegible usable. Usando solo fast-path local.")
         return BackupPolicy(
             desired_rf=desired_rf,
             fast_local_enabled=True,

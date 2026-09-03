@@ -27,6 +27,7 @@ from stopan.protection.policy import normalize_remote_rf
 from stopan.rpc.errors import format_rpc_error, is_rpc_error
 from stopan.restore.errors import ChunkUnavailableError, RestoreDataError
 from stopan.restore.models import RestoreRunStats
+from stopan.progress import ProgressReporter, suspend_progress
 
 
 class ChunkFetchService:
@@ -55,6 +56,7 @@ class ChunkFetchService:
         max_chunk_size: int,
         ec_recovery_service: ErasureChunkRecoveryService | None = None,
         remote_chunk_recovery: bool = True,
+        progress: ProgressReporter | None = None,
     ):
         self.repo = repo
         self.p2p_local_repo = p2p_local_repo
@@ -65,6 +67,7 @@ class ChunkFetchService:
         self.max_chunk_size = max(int(max_chunk_size), 1)
         self.ec_recovery_service = ec_recovery_service
         self.remote_chunk_recovery = bool(remote_chunk_recovery)
+        self.progress = progress
         self.stats = RestoreRunStats()
 
     def fetch_many_raw_chunks(
@@ -275,6 +278,11 @@ class ChunkFetchService:
                 )
             return result_map
 
+        if self.progress is not None:
+            self.progress.update(
+                detail=f"consultando {len(missing_hashes)} chunks en réplicas remotas"
+            )
+
         cluster = self.cluster_resolver.get_cluster()
         self.cluster_resolver.announce_once()
 
@@ -299,6 +307,7 @@ class ChunkFetchService:
 
         unresolved = {chunk_hash for chunk_hash in missing_hashes if chunk_hash not in result_map}
         max_depth = max((len(target_lists[chunk_hash]) for chunk_hash in unresolved), default=0)
+        recovered_remote = 0
 
         for rank in range(max_depth):
             if not unresolved:
@@ -366,10 +375,11 @@ class ChunkFetchService:
                                 source_label="chunk remoto",
                             )
                         except Exception as exc:
-                            print(
-                                f"   Réplica corrupta ignorada: "
-                                f"{member.address} chunk={chunk_hash[:8]} -> {exc}"
-                            )
+                            with suspend_progress(self.progress):
+                                print(
+                                    f"   Réplica corrupta ignorada: "
+                                    f"{member.address} chunk={chunk_hash[:8]} -> {exc}"
+                                )
                             error_map[chunk_hash].append(
                                 f"{member.address}: chunk corrupto: {exc}"
                             )
@@ -388,11 +398,27 @@ class ChunkFetchService:
                         result_map[chunk_hash] = raw_data
                         self.stats.chunks_from_remote_replication += (multiplicity or {}).get(chunk_hash, 1)
                         unresolved.discard(chunk_hash)
+                        recovered_remote += 1
+                        if self.progress is not None:
+                            self.progress.update(
+                                detail=(
+                                    "réplicas remotas: "
+                                    f"{recovered_remote}/{len(missing_hashes)} chunks recuperados"
+                                )
+                            )
 
         for chunk_hash in list(unresolved):
             result_map[chunk_hash] = ChunkUnavailableError(
                 f"Ningún target HRW devolvió el bloque {chunk_hash[:8]}. "
                 + " | ".join(error_map[chunk_hash])
+            )
+
+        if self.progress is not None:
+            self.progress.update(
+                detail=(
+                    "réplicas remotas: "
+                    f"{recovered_remote}/{len(missing_hashes)} chunks recuperados"
+                )
             )
 
         return result_map

@@ -18,6 +18,7 @@ from stopan.errors import (
     StopanDataError,
 )
 from stopan.metadata.identity.passphrase import ScryptCost
+from stopan.progress import ProgressReporter
 
 
 class MetadataAutoExportError(StopanDataError, RuntimeError):
@@ -98,10 +99,13 @@ def export_metadata_object_graph_after_metadata_change(
     db_file: str,
     settings: MetadataObjectGraphAutoExport | None,
     context_label: str,
+    progress: ProgressReporter | None = None,
 ) -> MetadataObjectGraphAutoExportResult | None:
     if settings is None or not settings.enabled:
         return None
 
+    if progress is not None:
+        progress.start("Actualizando metadata")
     try:
         from stopan.metadata.identity.passphrase import read_passphrase_file
         from stopan.metadata.objects.service import MetadataObjectGraphStoreService
@@ -117,10 +121,15 @@ def export_metadata_object_graph_after_metadata_change(
             include_protection=settings.include_protection,
         )
     except Exception as exc:
+        if progress is not None:
+            progress.finish()
         raise MetadataAutoExportError(
             f"{context_label} completado, pero falló el export del metadata "
             f"object graph cifrado: {exc}"
         ) from exc
+
+    if progress is not None:
+        progress.finish()
 
     print(f"Metadata object graph actualizado tras {context_label.lower()}")
     print(f"   object_store: {result.root_dir}")
@@ -139,6 +148,8 @@ def export_metadata_object_graph_after_metadata_change(
     objects_packed = None
 
     if settings.auto_pack:
+        if progress is not None:
+            progress.start("Creando metadata object pack")
         try:
             from stopan.metadata.packs.object_pack import MetadataObjectPackService
 
@@ -154,10 +165,15 @@ def export_metadata_object_graph_after_metadata_change(
             pack_hash = pack_result.pack_hash
             objects_packed = pack_result.stats.objects_packed
         except Exception as exc:
+            if progress is not None:
+                progress.finish()
             raise MetadataAutoExportError(
                 f"{context_label} completado y object graph actualizado, "
                 f"pero falló metadata auto-pack: {exc}"
             ) from exc
+
+        if progress is not None:
+            progress.finish()
 
         print(f"Metadata object pack creado tras {context_label.lower()}")
         print(f"   path: {pack_result.path}")
@@ -186,6 +202,7 @@ def export_after_successful_metadata_change(
     db_file: str,
     settings: MetadataObjectGraphAutoExport | None,
     context_label: str,
+    progress: ProgressReporter | None = None,
 ) -> MetadataObjectGraphAutoExportResult | None:
     if not metadata_changed or sys.exc_info()[0] is not None:
         return None
@@ -193,5 +210,6 @@ def export_after_successful_metadata_change(
         db_file=db_file,
         settings=settings,
         context_label=context_label,
+        progress=progress,
     )
 

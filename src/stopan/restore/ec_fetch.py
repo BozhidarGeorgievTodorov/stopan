@@ -15,6 +15,7 @@ from stopan.protection.ec.models import DataPackShard
 from stopan.protection.ec.packer import extract_pack_chunks, reconstruct_payload
 from stopan.protection.ec.remote_client import RemoteDataPackShardClientPool
 from stopan.protection.ec.shard_targets import group_erasure_shard_refs_by_address
+from stopan.progress import ProgressReporter, suspend_progress
 
 
 @dataclass(frozen=True)
@@ -40,12 +41,14 @@ class ErasureChunkRecoveryService:
         repo: CASRepository,
         remote_pool: RemoteDataPackShardClientPool,
         cluster_resolver: LazyClusterResolver,
+        progress: ProgressReporter | None = None,
     ):
         self.db = db
         self.repo = repo
         self.remote_pool = remote_pool
         self._announced = False
         self.cluster_resolver = cluster_resolver
+        self.progress = progress
 
     def recover_many_raw_chunks(
         self,
@@ -66,9 +69,15 @@ class ErasureChunkRecoveryService:
         if not jobs:
             return result_map
 
-        self._announce_once(len(jobs), sum(len(job.wanted_hashes) for job in jobs))
+        chunk_count = sum(len(job.wanted_hashes) for job in jobs)
+        if self.progress is not None:
+            self.progress.update(
+                detail=f"EC: recuperando {len(jobs)} data packs para {chunk_count} chunks"
+            )
+        self._announce_once(len(jobs), chunk_count)
 
         max_workers = min(max(int(target_parallelism), 1), len(jobs))
+        completed_packs = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(self._recover_pack_chunks, job): job
@@ -77,6 +86,15 @@ class ErasureChunkRecoveryService:
 
             for future in concurrent.futures.as_completed(future_map):
                 job = future_map[future]
+                completed_packs += 1
+                if self.progress is not None:
+                    self.progress.update(
+                        detail=(
+                            "EC: "
+                            f"{completed_packs}/{len(jobs)} data packs procesados "
+                            f"({chunk_count} chunks solicitados)"
+                        )
+                    )
                 try:
                     recovered = future.result()
                 except Exception as exc:
@@ -197,10 +215,11 @@ class ErasureChunkRecoveryService:
                     first_error = exc
 
         if failed_cache:
-            print(
-                f"   EC restore: no pude cachear {failed_cache} chunks del data pack "
-                f"{pack_hash[:8]} en CAS local: {first_error}"
-            )
+            with suspend_progress(self.progress):
+                print(
+                    f"   EC restore: no pude cachear {failed_cache} chunks del data pack "
+                    f"{pack_hash[:8]} en CAS local: {first_error}"
+                )
 
     def _retrieve_pack_shards(
         self,
@@ -276,7 +295,8 @@ class ErasureChunkRecoveryService:
         if self._announced:
             return
         self._announced = True
-        print(
-            "Activando recuperación por erasure coding. "
-            f"data_packs={pack_count} chunks={chunk_count}"
-        )
+        with suspend_progress(self.progress):
+            print(
+                "Activando recuperación por erasure coding. "
+                f"data_packs={pack_count} chunks={chunk_count}"
+            )

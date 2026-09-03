@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from stopan.cli.config_utils import choose, first_seed, load_runtime_config
+from stopan.cli.progress import TerminalProgress
 from stopan.errors import StopanDataError, StopanStorageError, StopanUsageError
 from stopan.cli.metadata_helpers import (
     distributed_pack_store_from_args,
@@ -255,29 +257,35 @@ def cmd_local_store_pack(args: argparse.Namespace) -> int:
     owner_id = owner_id_from_args(args, cfg)
     identity_file = identity_file_from_args(args, cfg)
     pack_path = Path(args.path).expanduser().resolve()
-    try:
-        calculated_pack_hash = validate_pack_hash(calculate_pack_hash_file(pack_path))
-    except OSError as exc:
-        raise StopanStorageError(f"No se pudo leer el metadata pack {pack_path}: {exc}") from exc
-    if args.expected_pack_hash is not None and validate_pack_hash(args.expected_pack_hash) != calculated_pack_hash:
-        raise StopanDataError(
-            f"pack_hash esperado no coincide con fichero: "
-            f"esperado={args.expected_pack_hash} calculado={calculated_pack_hash}"
-        )
-    signed_owner_id, public_key_b64, signature_b64 = sign_metadata_pack_hash(
-        identity_file=identity_file,
-        passphrase=passphrase_for_decrypt(args, cfg),
-        pack_hash=calculated_pack_hash,
-        expected_owner_id=owner_id,
-    )
     store = distributed_pack_store_from_args(args, cfg)
-    result = store.put_pack_file(
-        owner_id=signed_owner_id,
-        path=args.path,
-        expected_pack_hash=calculated_pack_hash,
-        public_key_b64=public_key_b64,
-        signature_b64=signature_b64,
-    )
+    progress = TerminalProgress()
+
+    with progress.task("Inspeccionando metadata pack local"):
+        try:
+            calculated_pack_hash = validate_pack_hash(calculate_pack_hash_file(pack_path))
+        except OSError as exc:
+            raise StopanStorageError(f"No se pudo leer el metadata pack {pack_path}: {exc}") from exc
+        if args.expected_pack_hash is not None and validate_pack_hash(args.expected_pack_hash) != calculated_pack_hash:
+            raise StopanDataError(
+                f"pack_hash esperado no coincide con fichero: "
+                f"esperado={args.expected_pack_hash} calculado={calculated_pack_hash}"
+            )
+
+    identity_passphrase = passphrase_for_decrypt(args, cfg)
+    with progress.task("Guardando metadata pack local"):
+        signed_owner_id, public_key_b64, signature_b64 = sign_metadata_pack_hash(
+            identity_file=identity_file,
+            passphrase=identity_passphrase,
+            pack_hash=calculated_pack_hash,
+            expected_owner_id=owner_id,
+        )
+        result = store.put_pack_file(
+            owner_id=signed_owner_id,
+            path=args.path,
+            expected_pack_hash=calculated_pack_hash,
+            public_key_b64=public_key_b64,
+            signature_b64=signature_b64,
+        )
 
     print("Metadata pack guardado en pack store local")
     print(f"   owner_id: {result.owner_id}")
@@ -293,7 +301,9 @@ def cmd_local_list_packs(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     owner_id = owner_id_from_args(args, cfg)
     store = distributed_pack_store_from_args(args, cfg)
-    records = store.list_packs(owner_id=owner_id)
+    progress = TerminalProgress()
+    with progress.task("Inspeccionando metadata packs locales"):
+        records = store.list_packs(owner_id=owner_id)
 
     print("Local distributed metadata packs")
     print(f"   owner_id: {owner_id}")
@@ -316,18 +326,20 @@ def cmd_local_retrieve_pack(args: argparse.Namespace) -> int:
     owner_id = owner_id_from_args(args, cfg)
     pack_hash = validate_pack_hash(args.pack_hash)
     store = distributed_pack_store_from_args(args, cfg)
-    out_path = store.retrieve_pack_to_file(
-        owner_id=owner_id,
-        pack_hash=pack_hash,
-        out_path=args.out,
-    )
-    try:
-        size = out_path.stat().st_size
-        calculated = calculate_pack_hash(out_path.read_bytes())
-    except OSError as exc:
-        raise StopanStorageError(f"No se pudo verificar el metadata pack recuperado {out_path}: {exc}") from exc
-    if calculated != pack_hash:
-        raise StopanDataError(f"pack_hash recuperado no coincide: esperado={pack_hash} calculado={calculated}")
+    progress = TerminalProgress()
+    with progress.task("Recuperando metadata pack local"):
+        out_path = store.retrieve_pack_to_file(
+            owner_id=owner_id,
+            pack_hash=pack_hash,
+            out_path=args.out,
+        )
+        try:
+            size = out_path.stat().st_size
+            calculated = calculate_pack_hash(out_path.read_bytes())
+        except OSError as exc:
+            raise StopanStorageError(f"No se pudo verificar el metadata pack recuperado {out_path}: {exc}") from exc
+        if calculated != pack_hash:
+            raise StopanDataError(f"pack_hash recuperado no coincide: esperado={pack_hash} calculado={calculated}")
 
     print("Metadata pack recuperado del pack store local")
     print(f"   owner_id: {owner_id}")
@@ -341,11 +353,16 @@ def cmd_object_store_status(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     object_store_dir = object_store_dir_from_args(args, cfg)
     service = object_graph_service_from_config_defaults(cfg)
-    inspection = service.inspect_store(
-        object_store_dir=object_store_dir,
-        passphrase=(passphrase_for_decrypt(args, cfg) if args.decrypt_latest else None),
-        decrypt_latest=bool(args.decrypt_latest),
-    )
+    decrypt_latest = bool(args.decrypt_latest)
+    passphrase = passphrase_for_decrypt(args, cfg) if decrypt_latest else None
+    progress = TerminalProgress()
+    label = "Descifrando metadata object graph" if decrypt_latest else "Inspeccionando metadata object store"
+    with progress.task(label):
+        inspection = service.inspect_store(
+            object_store_dir=object_store_dir,
+            passphrase=passphrase,
+            decrypt_latest=decrypt_latest,
+        )
 
     header = inspection.header
     print("Metadata object store")
@@ -379,11 +396,13 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
     passphrase = passphrase_for_object_store_export(args, object_store_dir=object_store_dir, cfg=cfg)
 
     service = object_graph_service_from_config(args, cfg)
-    result = service.export_current_state(
-        object_store_dir=object_store_dir,
-        passphrase=passphrase,
-        include_protection=not bool(args.no_protection),
-    )
+    progress = TerminalProgress()
+    with progress.task("Exportando metadata object graph"):
+        result = service.export_current_state(
+            object_store_dir=object_store_dir,
+            passphrase=passphrase,
+            include_protection=not bool(args.no_protection),
+        )
 
     print("Metadata object graph exportado")
     print(f"   object_store: {result.root_dir}")
@@ -402,13 +421,14 @@ def cmd_export_object_graph(args: argparse.Namespace) -> int:
     if bool(args.pack):
         pack_service = object_pack_service_from_config(args, cfg)
         pack_dir = args.pack_dir or cfg.metadata.generated_pack_dir
-        pack_result = pack_service.export_latest_pack(
-            object_store_dir=object_store_dir,
-            passphrase=passphrase,
-            identity_file=identity_file_from_args(args, cfg),
-            out_path=args.pack_out,
-            pack_dir=pack_dir,
-        )
+        with progress.task("Creando metadata object pack"):
+            pack_result = pack_service.export_latest_pack(
+                object_store_dir=object_store_dir,
+                passphrase=passphrase,
+                identity_file=identity_file_from_args(args, cfg),
+                out_path=args.pack_out,
+                pack_dir=pack_dir,
+            )
 
         print("Metadata object pack creado")
         print(f"   path: {pack_result.path}")
@@ -434,16 +454,19 @@ def cmd_import_object_graph(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     object_store_dir = object_store_dir_from_args(args, cfg)
     service = object_graph_service_from_config_defaults(cfg)
-    result = service.import_latest_state(
-        object_store_dir=object_store_dir,
-        passphrase=passphrase_for_decrypt(args, cfg),
-        include_protection=not bool(args.no_protection),
-        default_desired_rf=int(
-            args.default_desired_remote_copies
-            if args.default_desired_remote_copies is not None
-            else cfg.protection.remote_copies
-        ),
-    )
+    passphrase = passphrase_for_decrypt(args, cfg)
+    progress = TerminalProgress()
+    with progress.task("Importando metadata object graph"):
+        result = service.import_latest_state(
+            object_store_dir=object_store_dir,
+            passphrase=passphrase,
+            include_protection=not bool(args.no_protection),
+            default_desired_rf=int(
+                args.default_desired_remote_copies
+                if args.default_desired_remote_copies is not None
+                else cfg.protection.remote_copies
+            ),
+        )
 
     print("Metadata object graph importado")
     print(f"   catalog_file: {result.db_file}")
@@ -491,26 +514,43 @@ def cmd_list_object_packs(args: argparse.Namespace) -> int:
         print("   (none)")
         return 0
 
-    for path in paths:
-        try:
-            inspection = service.inspect_pack_header(path)
-            header = inspection.header
-            stat_result = path.stat()
+    inspected: list[tuple[Path, object | None, os.stat_result | None, Exception | None]] = []
+    progress = TerminalProgress()
+    with progress.task(
+        "Inspeccionando metadata object packs",
+        current=0,
+        total=len(paths),
+        unit="packs",
+    ):
+        for index, path in enumerate(paths, start=1):
+            try:
+                inspection = service.inspect_pack_header(path)
+                stat_result = path.stat()
+                inspected.append((path, inspection, stat_result, None))
+            except Exception as exc:
+                inspected.append((path, None, None, exc))
+            progress.update(current=index, total=len(paths), unit="packs")
+
+    for path, inspection, stat_result, error in inspected:
+        if error is not None:
             print(f"- {path.name}")
             print(f"   path: {path}")
-            print(f"   size: {format_bytes(stat_result.st_size)}")
-            print(f"   mtime: {format_time(stat_result.st_mtime)}")
-            print(f"   pack_hash: {header.pack_hash}")
-            print(f"   format: {header.format} v{header.version}")
-            print(f"   encryption: {header.encryption}")
-            print(f"   recipients: {header.recipient_count}")
-            print(f"   aead: {header.aead_name}")
-            print(f"   compression: {header.compression}")
-            print(f"   ciphertext: {format_bytes(header.ciphertext_bytes)}")
-        except Exception as exc:
-            print(f"- {path.name}")
-            print(f"   path: {path}")
-            print(f"   error: {exc}")
+            print(f"   error: {error}")
+            continue
+
+        assert inspection is not None and stat_result is not None
+        header = inspection.header
+        print(f"- {path.name}")
+        print(f"   path: {path}")
+        print(f"   size: {format_bytes(stat_result.st_size)}")
+        print(f"   mtime: {format_time(stat_result.st_mtime)}")
+        print(f"   pack_hash: {header.pack_hash}")
+        print(f"   format: {header.format} v{header.version}")
+        print(f"   encryption: {header.encryption}")
+        print(f"   recipients: {header.recipient_count}")
+        print(f"   aead: {header.aead_name}")
+        print(f"   compression: {header.compression}")
+        print(f"   ciphertext: {format_bytes(header.ciphertext_bytes)}")
 
     return 0
 
@@ -700,14 +740,16 @@ def push_pack_result_from_path(args: argparse.Namespace, cfg, *, pack_path: str 
 
     from stopan.metadata.packs.pusher import push_metadata_pack_to_network
 
-    result = push_metadata_pack_to_network(
-        pack_path=pack_path,
-        owner_id=owner_id,
-        identity_file=identity_file,
-        identity_passphrase=identity_passphrase,
-        **_metadata_pack_push_kwargs(args, cfg),
-    )
-    record_metadata_pack_publication(cfg, result)
+    progress = TerminalProgress()
+    with progress.task("Distribuyendo metadata object pack"):
+        result = push_metadata_pack_to_network(
+            pack_path=pack_path,
+            owner_id=owner_id,
+            identity_file=identity_file,
+            identity_passphrase=identity_passphrase,
+            **_metadata_pack_push_kwargs(args, cfg),
+        )
+        record_metadata_pack_publication(cfg, result)
     return result
 
 
@@ -737,16 +779,18 @@ def cmd_push(args: argparse.Namespace) -> int:
     pack_service = object_pack_service_from_config(args, cfg)
     pack_dir = args.pack_dir or cfg.metadata.generated_pack_dir
 
+    progress = TerminalProgress()
     reusable = None
     if not args.pack_out:
-        reusable = find_reusable_latest_object_pack(
-            cfg=cfg,
-            pack_service=pack_service,
-            object_store_dir=object_store_dir,
-            pack_dir=pack_dir,
-            identity_file=identity_file,
-            passphrase=passphrase,
-        )
+        with progress.task("Buscando metadata object pack reutilizable"):
+            reusable = find_reusable_latest_object_pack(
+                cfg=cfg,
+                pack_service=pack_service,
+                object_store_dir=object_store_dir,
+                pack_dir=pack_dir,
+                identity_file=identity_file,
+                passphrase=passphrase,
+            )
 
     if reusable is not None:
         pack_path, summary = reusable
@@ -764,13 +808,14 @@ def cmd_push(args: argparse.Namespace) -> int:
         result = push_pack_result_from_path(args, cfg, pack_path=pack_path)
         return print_metadata_pack_push_result(result)
 
-    pack_result = pack_service.export_latest_pack(
-        object_store_dir=object_store_dir,
-        passphrase=passphrase,
-        identity_file=identity_file,
-        out_path=args.pack_out,
-        pack_dir=pack_dir,
-    )
+    with progress.task("Creando metadata object pack"):
+        pack_result = pack_service.export_latest_pack(
+            object_store_dir=object_store_dir,
+            passphrase=passphrase,
+            identity_file=identity_file,
+            out_path=args.pack_out,
+            pack_dir=pack_dir,
+        )
 
     print("Metadata object pack creado para distribución")
     print(f"   path: {pack_result.path}")
@@ -811,28 +856,30 @@ def cmd_recover(args: argparse.Namespace) -> int:
 
     from stopan.metadata.packs.recover import recover_metadata_from_network
 
-    result = recover_metadata_from_network(
-        owner_id=owner_id,
-        identity_file=identity_file_from_args(args, cfg),
-        object_store_dir=object_store_dir,
-        passphrase=passphrase,
-        **_metadata_pack_network_kwargs(args, cfg),
-        max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),
-        scrypt_cost=scrypt_cost_from_args(args, cfg),
-        db_file=cfg.node.catalog_file,
-        import_db=bool(args.import_db),
-        include_protection=not bool(args.no_protection),
-        download_only=bool(args.download_only),
-        default_desired_rf=int(
-            args.default_desired_remote_copies
-            if args.default_desired_remote_copies is not None
-            else cfg.protection.remote_copies
-        ),
-        download_dir=args.download_dir or cfg.metadata.recovered_pack_dir,
-        pack_out=args.pack_out,
-        target_hash=args.target_hash,
-        vault_id=args.vault_id,
-    )
+    progress = TerminalProgress()
+    with progress.task("Recuperando metadata desde la red"):
+        result = recover_metadata_from_network(
+            owner_id=owner_id,
+            identity_file=identity_file_from_args(args, cfg),
+            object_store_dir=object_store_dir,
+            passphrase=passphrase,
+            **_metadata_pack_network_kwargs(args, cfg),
+            max_pack_bytes=int(cfg.metadata.max_distributed_pack_bytes),
+            scrypt_cost=scrypt_cost_from_args(args, cfg),
+            db_file=cfg.node.catalog_file,
+            import_db=bool(args.import_db),
+            include_protection=not bool(args.no_protection),
+            download_only=bool(args.download_only),
+            default_desired_rf=int(
+                args.default_desired_remote_copies
+                if args.default_desired_remote_copies is not None
+                else cfg.protection.remote_copies
+            ),
+            download_dir=args.download_dir or cfg.metadata.recovered_pack_dir,
+            pack_out=args.pack_out,
+            target_hash=args.target_hash,
+            vault_id=args.vault_id,
+        )
 
     print("Metadata recover remoto completado")
     print(f"   owner_id: {result.owner_id}")
@@ -918,12 +965,14 @@ def cmd_discover_metadata_packs(args: argparse.Namespace) -> int:
         owner_id=owner_id,
     )
 
-    result = discover_metadata_packs_from_network(
-        owner_id=owner_id,
-        **_metadata_pack_network_kwargs(args, cfg),
-        desired_copies_by_hash=desired_copies_by_hash,
-        max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
-    )
+    progress = TerminalProgress()
+    with progress.task("Descubriendo metadata packs en la red"):
+        result = discover_metadata_packs_from_network(
+            owner_id=owner_id,
+            **_metadata_pack_network_kwargs(args, cfg),
+            desired_copies_by_hash=desired_copies_by_hash,
+            max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
+        )
 
     stats = result.stats
     print("Metadata packs distribuidos")
@@ -974,16 +1023,18 @@ def cmd_verify_metadata_packs(args: argparse.Namespace) -> int:
         else {}
     )
 
-    result = verify_metadata_packs_from_network(
-        owner_id=owner_id,
-        **_metadata_pack_network_kwargs(args, cfg),
-        desired_copies_by_hash=desired_copies_by_hash,
-        preferred_node_ids_by_hash=custodian_hints_by_hash,
-        pack_hash=args.pack_hash,
-        verify_all=bool(args.all),
-        max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
-    )
-    record_metadata_pack_verification_hints(cfg, owner_id=owner_id, result=result)
+    progress = TerminalProgress()
+    with progress.task("Verificando metadata packs en la red"):
+        result = verify_metadata_packs_from_network(
+            owner_id=owner_id,
+            **_metadata_pack_network_kwargs(args, cfg),
+            desired_copies_by_hash=desired_copies_by_hash,
+            preferred_node_ids_by_hash=custodian_hints_by_hash,
+            pack_hash=args.pack_hash,
+            verify_all=bool(args.all),
+            max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
+        )
+        record_metadata_pack_verification_hints(cfg, owner_id=owner_id, result=result)
 
     stats = result.stats
     print("Verificación de metadata packs distribuidos")
@@ -1017,13 +1068,16 @@ def cmd_pack_object_graph(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     object_store_dir = object_store_dir_from_args(args, cfg)
     service = object_pack_service_from_config(args, cfg)
-    result = service.export_latest_pack(
-        object_store_dir=object_store_dir,
-        passphrase=passphrase_for_decrypt(args, cfg),
-        identity_file=identity_file_from_args(args, cfg),
-        out_path=args.out,
-        pack_dir=args.pack_dir or cfg.metadata.generated_pack_dir,
-    )
+    passphrase = passphrase_for_decrypt(args, cfg)
+    progress = TerminalProgress()
+    with progress.task("Creando metadata object pack"):
+        result = service.export_latest_pack(
+            object_store_dir=object_store_dir,
+            passphrase=passphrase,
+            identity_file=identity_file_from_args(args, cfg),
+            out_path=args.out,
+            pack_dir=args.pack_dir or cfg.metadata.generated_pack_dir,
+        )
 
     print("Metadata object pack creado")
     print(f"   path: {result.path}")
@@ -1053,12 +1107,20 @@ def cmd_inspect_object_pack(args: argparse.Namespace) -> int:
     if full_validation and not decrypt:
         raise StopanUsageError("--full-validation requiere --decrypt")
 
-    if not decrypt:
-        inspection = service.inspect_pack_header(args.path)
+    identity_file = identity_file_from_args(args, cfg) if decrypt else None
+    passphrase = passphrase_for_decrypt(args, cfg) if decrypt else None
+    progress = TerminalProgress()
+    if full_validation:
+        label = "Validando metadata object pack"
+    elif decrypt:
+        label = "Descifrando metadata object pack"
     else:
-        identity_file = identity_file_from_args(args, cfg)
-        passphrase = passphrase_for_decrypt(args, cfg)
-        if full_validation:
+        label = "Inspeccionando metadata object pack"
+
+    with progress.task(label):
+        if not decrypt:
+            inspection = service.inspect_pack_header(args.path)
+        elif full_validation:
             inspection = service.validate_pack(
                 args.path,
                 identity_file=identity_file,
@@ -1105,12 +1167,17 @@ def cmd_inspect_object_pack(args: argparse.Namespace) -> int:
 def cmd_import_object_pack(args: argparse.Namespace) -> int:
     cfg = load_runtime_config(args)
     service = object_pack_service_from_config(args, cfg)
-    result = service.import_pack(
-        args.path,
-        object_store_dir=object_store_dir_from_args(args, cfg),
-        identity_file=identity_file_from_args(args, cfg),
-        passphrase=passphrase_for_decrypt(args, cfg),
-    )
+    object_store_dir = object_store_dir_from_args(args, cfg)
+    identity_file = identity_file_from_args(args, cfg)
+    passphrase = passphrase_for_decrypt(args, cfg)
+    progress = TerminalProgress()
+    with progress.task("Importando metadata object pack"):
+        result = service.import_pack(
+            args.path,
+            object_store_dir=object_store_dir,
+            identity_file=identity_file,
+            passphrase=passphrase,
+        )
 
     print("Metadata object pack importado")
     print(f"   path: {result.path}")

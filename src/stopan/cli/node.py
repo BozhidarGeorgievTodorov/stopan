@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from stopan.cli.config_utils import add_config_args, first_seed, load_runtime_config
+from stopan.cli.progress import TerminalProgress
 from stopan.config.defaults import DEFAULT_STOPAN_CONFIG
 from stopan.config.model import StopanConfig
 from stopan.errors import StopanConfigError
@@ -239,19 +240,22 @@ def _status(args: argparse.Namespace) -> int:
         return 1
 
     print("RPC")
-    membership_ok, membership_detail, members = _check_membership_rpc(
-        address=address,
-        cfg=cfg,
-        timeout_s=timeout_s,
-    )
+    progress = TerminalProgress()
+    with progress.task("Consultando membership"):
+        membership_ok, membership_detail, members = _check_membership_rpc(
+            address=address,
+            cfg=cfg,
+            timeout_s=timeout_s,
+        )
     print(f"   target: {address}")
     print(f"   membership: {membership_detail}")
 
-    storage_ok, storage_detail = _check_storage_rpc(
-        address=address,
-        cfg=cfg,
-        timeout_s=timeout_s,
-    )
+    with progress.task("Comprobando almacenamiento remoto"):
+        storage_ok, storage_detail = _check_storage_rpc(
+            address=address,
+            cfg=cfg,
+            timeout_s=timeout_s,
+        )
     print(f"   storage: {storage_detail}")
     print("   metadata_pack_storage: same gRPC server")
 
@@ -278,7 +282,9 @@ def _stop() -> int:
     from stopan.node.lifecycle import request_local_node_stop
 
     print("Solicitando parada ordenada del nodo local...", flush=True)
-    request_local_node_stop()
+    progress = TerminalProgress()
+    with progress.task("Esperando drenaje del nodo"):
+        request_local_node_stop()
     print("Nodo local detenido.")
     return 0
 

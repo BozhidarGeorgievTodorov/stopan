@@ -3,6 +3,10 @@
 
 : "${STOPAN_BIN:=/usr/bin/stopan}"
 
+# Los jobs escriben en logs persistentes (por ejemplo, journald). El feedback
+# interactivo de una sola línea solo tiene sentido en una terminal humana.
+export STOPAN_NO_PROGRESS=1
+
 stopan_job_die() {
     echo "stopan job: $*" >&2
     exit 2

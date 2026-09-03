@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from stopan.cli.progress import TerminalProgress
 from stopan.cli.validation import IntRange, validate_int_ranges
 from stopan.common.fs import atomic_write_bytes
 from stopan.config.defaults import (
@@ -595,23 +596,25 @@ def _init_metadata(args: argparse.Namespace) -> int:
     )
 
     identity_created = False
-    if identity_exists:
-        _apply_service_file_permissions(identity_path, mode=0o640)
-        identity = load_metadata_private_identity_file(identity_path, passphrase=passphrase).identity
-    else:
-        identity = create_metadata_identity_file(
-            identity_path,
-            passphrase=passphrase,
-            scrypt_cost=ScryptCost(
-                n=int(cfg.metadata.scrypt_n),
-                r=int(cfg.metadata.scrypt_r),
-                p=int(cfg.metadata.scrypt_p),
-                key_length=int(cfg.metadata.key_length),
-            ),
-            force=False,
-        )
-        identity_created = True
-        _apply_service_file_permissions(identity_path, mode=0o640)
+    progress = TerminalProgress()
+    with progress.task("Preparando identidad de metadata"):
+        if identity_exists:
+            _apply_service_file_permissions(identity_path, mode=0o640)
+            identity = load_metadata_private_identity_file(identity_path, passphrase=passphrase).identity
+        else:
+            identity = create_metadata_identity_file(
+                identity_path,
+                passphrase=passphrase,
+                scrypt_cost=ScryptCost(
+                    n=int(cfg.metadata.scrypt_n),
+                    r=int(cfg.metadata.scrypt_r),
+                    p=int(cfg.metadata.scrypt_p),
+                    key_length=int(cfg.metadata.key_length),
+                ),
+                force=False,
+            )
+            identity_created = True
+            _apply_service_file_permissions(identity_path, mode=0o640)
 
     if cfg.metadata.owner_id and cfg.metadata.owner_id != identity.owner_id:
         raise StopanUsageError(

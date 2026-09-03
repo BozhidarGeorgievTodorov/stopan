@@ -585,6 +585,31 @@ def metadata_pack_publication_maps(cfg, *, owner_id: str) -> tuple[dict[str, int
         db.close()
 
 
+def metadata_pack_custodian_hint_map(
+    cfg,
+    *,
+    owner_id: str,
+    pack_hash: str,
+) -> dict[str, tuple[str, ...]]:
+    db = MetadataDB(
+        cfg.node.catalog_file,
+        init_schema=False,
+        access_mode=MetadataDBAccessMode.READ_ONLY,
+    )
+    try:
+        hints = db.get_metadata_pack_custodian_hints(
+            owner_id=owner_id,
+            pack_hashes=(pack_hash,),
+        )
+    finally:
+        db.close()
+
+    grouped: dict[str, list[str]] = {}
+    for hint in hints:
+        grouped.setdefault(hint.pack_hash, []).append(hint.node_id)
+    return {pack_hash: tuple(node_ids) for pack_hash, node_ids in grouped.items()}
+
+
 def metadata_pack_publication_maps_best_effort(
     cfg,
     *,
@@ -619,6 +644,12 @@ def record_metadata_pack_publication(cfg, result) -> None:
     if desired < 1:
         return
 
+    confirmed_node_ids = tuple(
+        item.node_id
+        for item in result.target_results
+        if item.success and item.node_id
+    )
+
     db = MetadataDB(
         cfg.node.catalog_file,
         access_mode=MetadataDBAccessMode.READ_WRITE,
@@ -634,6 +665,29 @@ def record_metadata_pack_publication(cfg, result) -> None:
             stored_targets=int(stats.stored_targets),
             already_present_targets=int(stats.already_present_targets),
             failed_targets=int(stats.failed_targets),
+            custodian_node_ids=confirmed_node_ids,
+        )
+    finally:
+        db.close()
+
+
+def record_metadata_pack_verification_hints(cfg, *, owner_id: str, result) -> None:
+    observed = [
+        (item.pack_hash, tuple(source.node_id for source in item.sources if source.node_id))
+        for item in result.results
+        if item.desired_copies is not None and item.sources
+    ]
+    if not observed:
+        return
+
+    db = MetadataDB(
+        cfg.node.catalog_file,
+        access_mode=MetadataDBAccessMode.READ_WRITE,
+    )
+    try:
+        db.refresh_metadata_pack_custodian_hints(
+            owner_id=owner_id,
+            observations=observed,
         )
     finally:
         db.close()
@@ -910,15 +964,26 @@ def cmd_verify_metadata_packs(args: argparse.Namespace) -> int:
         cfg,
         owner_id=owner_id,
     )
+    custodian_hints_by_hash = (
+        metadata_pack_custodian_hint_map(
+            cfg,
+            owner_id=owner_id,
+            pack_hash=args.pack_hash,
+        )
+        if args.pack_hash is not None
+        else {}
+    )
 
     result = verify_metadata_packs_from_network(
         owner_id=owner_id,
         **_metadata_pack_network_kwargs(args, cfg),
         desired_copies_by_hash=desired_copies_by_hash,
+        preferred_node_ids_by_hash=custodian_hints_by_hash,
         pack_hash=args.pack_hash,
         verify_all=bool(args.all),
         max_candidates=int(choose(args.max_candidates, cfg.metadata.pack_discovery_max_candidates)),
     )
+    record_metadata_pack_verification_hints(cfg, owner_id=owner_id, result=result)
 
     stats = result.stats
     print("Verificación de metadata packs distribuidos")

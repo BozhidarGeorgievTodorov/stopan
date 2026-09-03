@@ -2,19 +2,23 @@
 Verificación de presencia de metadata packs distribuidos.
 
 El verifier audita presencia remota. No descarga packs ni inspecciona payloads
-cifrados: para un pack concreto usa ProbeMetadataPack; para modo general reutiliza
-el discovery enriquecido basado en ListMetadataPacks.
+cifrados: para un pack concreto prioriza los últimos custodios acreditados y
+amplía el sondeo solo cuando no bastan para satisfacer el objetivo. El modo
+general reutiliza el discovery enriquecido basado en ListMetadataPacks.
 
 La política esperada no se toma de flags operativos: se recibe desde metadata
-local persistida. Si no existe publicación local para un pack, el estado queda
-UNKNOWN y se muestran las copias observadas.
+local persistida. Los custodios recordados son solo una pista para ordenar las
+consultas y no forman parte de esa política. Si no existe publicación local para
+un pack, el estado queda UNKNOWN y se muestran las copias observadas.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
+from stopan.cluster.resolver import require_cluster_view
 from stopan.errors import StopanNetworkError
 from stopan.metadata.identity.keys import validate_owner_id
 from stopan.metadata.packs.discovery import (
@@ -23,10 +27,14 @@ from stopan.metadata.packs.discovery import (
     discover_metadata_packs_from_network,
     group_metadata_pack_sources,
     metadata_pack_presence_state,
-    collect_metadata_pack_sources,
 )
 from stopan.metadata.packs.hashes import validate_pack_hash
-from stopan.metadata.packs.remote import MetadataPackSource, probe_metadata_pack_from_target
+from stopan.metadata.packs.remote import (
+    MetadataPackSource,
+    is_remote_metadata_pack_member,
+    probe_metadata_pack_from_target,
+)
+from stopan.node.lifecycle import current_local_operation_matches
 
 
 class MetadataPackVerificationError(StopanNetworkError, RuntimeError):
@@ -182,34 +190,125 @@ def _probe_pack_from_network(
     grpc_keepalive_timeout_ms: int,
     grpc_keepalive_permit_without_calls: bool,
     desired_copies: int | None,
+    preferred_node_ids: Sequence[str] = (),
 ) -> tuple[MetadataPackVerificationResult, MetadataPackVerificationStats]:
-    def probe_target(target) -> tuple[list[MetadataPackSource], str | None]:
-        source, error = probe_metadata_pack_from_target(
-            target,
-            owner_id=owner_id,
-            pack_hash=pack_hash,
+    try:
+        resolved = require_cluster_view(
+            membership_seed=membership_seed,
+            self_addr=self_addr,
             cluster_token=cluster_token,
-            timeout_s=rpc_timeout_s,
+            timeout_s=membership_timeout_s,
             max_message_bytes=int(max_message_bytes),
-            grpc_keepalive_time_ms=grpc_keepalive_time_ms,
-            grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
-            grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+            missing_seed_message="Falta membership seed en la configuración.",
+            allow_empty_members=current_local_operation_matches(self_addr),
         )
-        return ([source] if source is not None else []), error
+    except Exception as exc:
+        raise MetadataPackVerificationError(str(exc)) from exc
 
-    targets, sources, errors = collect_metadata_pack_sources(
-        membership_seed=membership_seed,
-        self_addr=self_addr,
-        cluster_token=cluster_token,
-        membership_timeout_s=membership_timeout_s,
-        target_parallelism=target_parallelism,
-        max_message_bytes=max_message_bytes,
-        error_cls=MetadataPackVerificationError,
-        query_target=probe_target,
+    targets = [
+        member
+        for member in resolved.cluster.members
+        if is_remote_metadata_pack_member(
+            member,
+            self_addr=self_addr,
+            self_node_id=str(getattr(resolved.cluster, "self_node_id", "") or ""),
+        )
+    ]
+
+    preferred_targets: list[object] = []
+    remaining_targets = list(targets)
+    if desired_copies is not None and preferred_node_ids:
+        by_node_id: dict[str, object] = {}
+        for target in targets:
+            node_id = str(getattr(target, "node_id", "") or "").strip()
+            if node_id and node_id not in by_node_id:
+                by_node_id[node_id] = target
+
+        preferred_ids: set[str] = set()
+        for raw_node_id in preferred_node_ids:
+            node_id = str(raw_node_id or "").strip()
+            if not node_id or node_id in preferred_ids:
+                continue
+            target = by_node_id.get(node_id)
+            if target is None:
+                continue
+            preferred_targets.append(target)
+            preferred_ids.add(node_id)
+
+        remaining_targets = [
+            target
+            for target in targets
+            if str(getattr(target, "node_id", "") or "").strip() not in preferred_ids
+        ]
+
+    remaining_targets.sort(
+        key=lambda target: (
+            str(getattr(target, "node_id", "") or ""),
+            str(getattr(target, "address", "") or ""),
+        )
     )
 
+    parallelism = max(1, int(target_parallelism))
+    sources: list[MetadataPackSource] = []
+    errors: list[str] = []
+    attempted = 0
+
+    def probe_group(group: Sequence[object]) -> None:
+        nonlocal attempted
+        offset = 0
+        while offset < len(group):
+            if desired_copies is not None:
+                remaining_needed = int(desired_copies) - len(sources)
+                if remaining_needed <= 0:
+                    return
+                batch_size = min(parallelism, remaining_needed, len(group) - offset)
+            else:
+                batch_size = min(parallelism, len(group) - offset)
+
+            batch = group[offset : offset + batch_size]
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = [
+                    executor.submit(
+                        probe_metadata_pack_from_target,
+                        target,
+                        owner_id=owner_id,
+                        pack_hash=pack_hash,
+                        cluster_token=cluster_token,
+                        timeout_s=rpc_timeout_s,
+                        max_message_bytes=int(max_message_bytes),
+                        grpc_keepalive_time_ms=grpc_keepalive_time_ms,
+                        grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
+                        grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
+                    )
+                    for target in batch
+                ]
+                for future in as_completed(futures):
+                    source, error = future.result()
+                    if source is not None:
+                        sources.append(source)
+                    if error:
+                        errors.append(error)
+
+            attempted += len(batch)
+            offset += len(batch)
+
+    # Con intención local, las pistas se consumen como una fase separada. Solo
+    # si no acreditan el objetivo se abre el sondeo al resto de candidatos.
+    if desired_copies is not None:
+        probe_group(preferred_targets)
+        if len(sources) < int(desired_copies):
+            probe_group(remaining_targets)
+    else:
+        # Sin objetivo local no existe una condición de terminación anticipada.
+        # La verificación dirigida conserva por ello el sondeo amplio.
+        probe_group(remaining_targets)
+
     desired_map = {pack_hash: int(desired_copies)} if desired_copies is not None else {}
-    entries = group_metadata_pack_sources(sources, desired_copies_by_hash=desired_map, max_candidates=None)
+    entries = group_metadata_pack_sources(
+        sources,
+        desired_copies_by_hash=desired_map,
+        max_candidates=None,
+    )
     if entries:
         result = _verification_result_from_entry(entries[0])
     else:
@@ -225,14 +324,13 @@ def _probe_pack_from_network(
         )
     stats = _verification_stats(
         results=(result,),
-        list_targets_attempted=len(targets),
-        list_targets_succeeded=len(targets) - len(errors),
+        list_targets_attempted=attempted,
+        list_targets_succeeded=attempted - len(errors),
         sources_seen=len(sources),
         publications_known=1 if desired_copies is not None else 0,
-        list_errors=errors,
+        list_errors=tuple(errors),
     )
     return result, stats
-
 
 def verify_metadata_packs_from_network(
     *,
@@ -248,6 +346,7 @@ def verify_metadata_packs_from_network(
     grpc_keepalive_timeout_ms: int,
     grpc_keepalive_permit_without_calls: bool,
     desired_copies_by_hash: Mapping[str, int] | None = None,
+    preferred_node_ids_by_hash: Mapping[str, Sequence[str]] | None = None,
     pack_hash: str | None = None,
     verify_all: bool = False,
     max_candidates: int | None = None,
@@ -259,6 +358,7 @@ def verify_metadata_packs_from_network(
         )
     requested_hash = validate_pack_hash(pack_hash) if pack_hash is not None else None
     desired_map = dict(desired_copies_by_hash or {})
+    preferred_map = dict(preferred_node_ids_by_hash or {})
 
     if requested_hash is not None:
         result, stats = _probe_pack_from_network(
@@ -275,6 +375,7 @@ def verify_metadata_packs_from_network(
             grpc_keepalive_timeout_ms=grpc_keepalive_timeout_ms,
             grpc_keepalive_permit_without_calls=grpc_keepalive_permit_without_calls,
             desired_copies=desired_map.get(requested_hash),
+            preferred_node_ids=preferred_map.get(requested_hash, ()),
         )
         return MetadataPackVerificationRunResult(owner_id=owner, stats=stats, results=(result,))
 

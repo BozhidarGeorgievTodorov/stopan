@@ -185,13 +185,21 @@ class MetadataPackPublicationRecord:
     failed_targets: int
 
 
+@dataclass(frozen=True)
+class MetadataPackCustodianHintRecord:
+    owner_id: str
+    pack_hash: str
+    node_id: str
+    last_seen_at: float
+
+
 class MetadataDB:
     """Catálogo operativo local del nodo.
 
     Conserva la identidad lógica del catálogo, las instantáneas y sus recetas,
     los fragmentos conocidos, los estados de protección por replicación y
-    codificación de borrado, y el último resultado de publicación de cada
-    paquete de metadatos.
+    codificación de borrado, el último resultado de publicación de cada paquete
+    de metadatos y las pistas locales de custodios acreditados.
 
     La estructura estable del contenido permanece separada de la evidencia
     mutable generada por los envíos, reintentos y verificaciones.
@@ -471,6 +479,22 @@ class MetadataDB:
                 )
             """)
 
+            # Caché no autoritativa de custodios acreditados recientemente.
+            # Acelera verificaciones dirigidas sin convertir la ubicación en
+            # parte del contrato de protección del paquete.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata_pack_custodian_hints (
+                    owner_id TEXT NOT NULL,
+                    pack_hash TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    last_seen_at REAL NOT NULL,
+                    PRIMARY KEY(owner_id, pack_hash, node_id),
+                    FOREIGN KEY(owner_id, pack_hash)
+                        REFERENCES metadata_pack_publications(owner_id, pack_hash)
+                        ON DELETE CASCADE
+                )
+            """)
+
             # Índices explícitos vinculados a consultas actuales. Las claves
             # primarias y restricciones UNIQUE ya aportan el resto de recorridos.
             cursor.execute("""
@@ -557,6 +581,7 @@ class MetadataDB:
         already_present_targets: int,
         failed_targets: int,
         pushed_at: float | None = None,
+        custodian_node_ids: Iterable[str] = (),
     ) -> None:
         owner = _require_hash64("owner_id", owner_id)
         pack = _require_hash64("pack_hash", pack_hash)
@@ -568,35 +593,46 @@ class MetadataDB:
         already_present = _require_non_negative_int("already_present_targets", already_present_targets)
         failed = _require_non_negative_int("failed_targets", failed_targets)
         pushed = time.time() if pushed_at is None else float(pushed_at)
+        custodians = tuple(sorted({
+            _require_non_empty_text("node_id", node_id)
+            for node_id in custodian_node_ids
+        }))
 
-        self.conn.execute("""
-            INSERT INTO metadata_pack_publications (
-                owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
-                attempted_targets, successful_targets, stored_targets,
-                already_present_targets, failed_targets
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            self.conn.execute("""
+                INSERT INTO metadata_pack_publications (
+                    owner_id, pack_hash, desired_copies, pushed_at, pack_size_bytes,
+                    attempted_targets, successful_targets, stored_targets,
+                    already_present_targets, failed_targets
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_id, pack_hash) DO UPDATE SET
+                    desired_copies = excluded.desired_copies,
+                    pushed_at = excluded.pushed_at,
+                    pack_size_bytes = excluded.pack_size_bytes,
+                    attempted_targets = excluded.attempted_targets,
+                    successful_targets = excluded.successful_targets,
+                    stored_targets = excluded.stored_targets,
+                    already_present_targets = excluded.already_present_targets,
+                    failed_targets = excluded.failed_targets
+            """, (
+                owner,
+                pack,
+                desired,
+                pushed,
+                pack_size,
+                attempted,
+                successful,
+                stored,
+                already_present,
+                failed,
+            ))
+            self._upsert_metadata_pack_custodian_hint_rows(
+                owner_id=owner,
+                pack_hash=pack,
+                node_ids=custodians,
+                last_seen_at=pushed,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(owner_id, pack_hash) DO UPDATE SET
-                desired_copies = excluded.desired_copies,
-                pushed_at = excluded.pushed_at,
-                pack_size_bytes = excluded.pack_size_bytes,
-                attempted_targets = excluded.attempted_targets,
-                successful_targets = excluded.successful_targets,
-                stored_targets = excluded.stored_targets,
-                already_present_targets = excluded.already_present_targets,
-                failed_targets = excluded.failed_targets
-        """, (
-            owner,
-            pack,
-            desired,
-            pushed,
-            pack_size,
-            attempted,
-            successful,
-            stored,
-            already_present,
-            failed,
-        ))
 
     def get_metadata_pack_publication(
         self,
@@ -647,6 +683,129 @@ class MetadataDB:
             ORDER BY pushed_at DESC, pack_hash ASC
         """, (owner, *hashes)).fetchall()
         return [_metadata_pack_publication_record(row) for row in rows]
+
+
+    def upsert_metadata_pack_custodian_hints(
+        self,
+        *,
+        owner_id: str,
+        pack_hash: str,
+        node_ids: Iterable[str],
+        last_seen_at: float | None = None,
+    ) -> int:
+        return self.refresh_metadata_pack_custodian_hints(
+            owner_id=owner_id,
+            observations=((pack_hash, tuple(node_ids)),),
+            last_seen_at=last_seen_at,
+        )
+
+    def refresh_metadata_pack_custodian_hints(
+        self,
+        *,
+        owner_id: str,
+        observations: Iterable[tuple[str, Iterable[str]]],
+        last_seen_at: float | None = None,
+    ) -> int:
+        owner = _require_hash64("owner_id", owner_id)
+        seen_at = time.time() if last_seen_at is None else float(last_seen_at)
+        normalized: dict[str, set[str]] = {}
+        for pack_hash, node_ids in observations:
+            pack = _require_hash64("pack_hash", pack_hash)
+            bucket = normalized.setdefault(pack, set())
+            bucket.update(
+                _require_non_empty_text("node_id", node_id)
+                for node_id in node_ids
+            )
+
+        rows = [
+            (pack_hash, node_id)
+            for pack_hash in sorted(normalized)
+            for node_id in sorted(normalized[pack_hash])
+        ]
+        if not rows:
+            return 0
+
+        with self.transaction(mode=MetadataDBTransactionMode.IMMEDIATE):
+            for pack_hash, node_ids in (
+                (pack_hash, tuple(sorted(normalized[pack_hash])))
+                for pack_hash in sorted(normalized)
+            ):
+                self._upsert_metadata_pack_custodian_hint_rows(
+                    owner_id=owner,
+                    pack_hash=pack_hash,
+                    node_ids=node_ids,
+                    last_seen_at=seen_at,
+                )
+        return len(rows)
+
+    def _upsert_metadata_pack_custodian_hint_rows(
+        self,
+        *,
+        owner_id: str,
+        pack_hash: str,
+        node_ids: Iterable[str],
+        last_seen_at: float,
+    ) -> None:
+        normalized = tuple(node_ids)
+        if not normalized:
+            return
+
+        self.conn.executemany(
+            """
+            INSERT INTO metadata_pack_custodian_hints (
+                owner_id, pack_hash, node_id, last_seen_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(owner_id, pack_hash, node_id) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                (owner_id, pack_hash, node_id, last_seen_at)
+                for node_id in normalized
+            ),
+        )
+
+    def get_metadata_pack_custodian_hints(
+        self,
+        *,
+        owner_id: str,
+        pack_hashes: Iterable[str] | None = None,
+    ) -> list[MetadataPackCustodianHintRecord]:
+        owner = _require_hash64("owner_id", owner_id)
+        if pack_hashes is None:
+            rows = self.conn.execute(
+                """
+                SELECT owner_id, pack_hash, node_id, last_seen_at
+                FROM metadata_pack_custodian_hints
+                WHERE owner_id = ?
+                ORDER BY pack_hash ASC, last_seen_at DESC, node_id ASC
+                """,
+                (owner,),
+            ).fetchall()
+        else:
+            hashes = [_require_hash64("pack_hash", pack_hash) for pack_hash in pack_hashes]
+            if not hashes:
+                return []
+            placeholders = ", ".join("?" for _ in hashes)
+            rows = self.conn.execute(
+                f"""
+                SELECT owner_id, pack_hash, node_id, last_seen_at
+                FROM metadata_pack_custodian_hints
+                WHERE owner_id = ? AND pack_hash IN ({placeholders})
+                ORDER BY pack_hash ASC, last_seen_at DESC, node_id ASC
+                """,
+                (owner, *hashes),
+            ).fetchall()
+
+        return [
+            MetadataPackCustodianHintRecord(
+                owner_id=row["owner_id"],
+                pack_hash=row["pack_hash"],
+                node_id=row["node_id"],
+                last_seen_at=float(row["last_seen_at"]),
+            )
+            for row in rows
+        ]
 
 
     # ------------------------------------------------------------------

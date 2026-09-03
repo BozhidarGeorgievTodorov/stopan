@@ -110,15 +110,14 @@ def is_remote_metadata_pack_member(
     return True
 
 
-def _hrw_score(*, owner_id: str, pack_hash: str, cluster_token: str, node_id: str, address: str) -> int:
+def _hrw_score(*, owner_id: str, pack_hash: str, cluster_token: str, node_id: str) -> int:
     payload = "\x00".join(
         [
-            "stopan.metadata-pack.hrw.v1",
+            "stopan.metadata-pack.hrw.v2",
             str(cluster_token or ""),
             owner_id,
             pack_hash,
             node_id,
-            address,
         ]
     ).encode("utf-8")
     return int.from_bytes(blake3.blake3(payload).digest(), "big", signed=False)
@@ -155,7 +154,6 @@ def select_metadata_pack_targets(
             pack_hash=pack_hash,
             cluster_token=cluster_token,
             node_id=target.node_id,
-            address=target.address,
         ),
         reverse=True,
     )

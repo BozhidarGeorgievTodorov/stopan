@@ -36,6 +36,10 @@ COMMANDS: dict[str, CommandSpec] = {
         module_name="stopan.cli.verify",
         description="Verifica la protección remota",
     ),
+    "snapshot": CommandSpec(
+        module_name="stopan.cli.snapshot",
+        description="Lista e inspecciona snapshots del catálogo local",
+    ),
     "node": CommandSpec(
         module_name="stopan.cli.node",
         description="Arranca, detiene o consulta un nodo de almacenamiento y membership",

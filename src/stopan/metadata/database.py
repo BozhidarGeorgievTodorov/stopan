@@ -193,6 +193,19 @@ class MetadataPackCustodianHintRecord:
     last_seen_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotRecord:
+    id: int
+    uuid: str
+    root_path: str
+    origin_node_id: str
+    status: str
+    error: str | None
+    total_size: int
+    total_files: int
+    created_at: str
+
+
 class MetadataDB:
     """Catálogo operativo local del nodo.
 
@@ -898,6 +911,96 @@ class MetadataDB:
             return None, None
 
         return row["status"], row["error"]
+
+    def list_snapshots(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        root_path: str | None = None,
+        created_from_utc: str | None = None,
+        created_to_utc: str | None = None,
+        limit: int | None = None,
+    ) -> list[SnapshotRecord]:
+        """Lista snapshots del catálogo aplicando filtros de solo lectura."""
+        where: list[str] = []
+        params: list[object] = []
+
+        if statuses is not None:
+            normalized_statuses = tuple(
+                dict.fromkeys(str(status).strip() for status in statuses)
+            )
+            if not normalized_statuses:
+                return []
+            allowed_statuses = {"CREATING", "COMPLETE", "FAILED"}
+            invalid = [
+                status for status in normalized_statuses
+                if status not in allowed_statuses
+            ]
+            if invalid:
+                raise ValueError(f"estado de snapshot no válido: {invalid[0]}")
+            placeholders = ", ".join("?" for _ in normalized_statuses)
+            where.append(f"status IN ({placeholders})")
+            params.extend(normalized_statuses)
+
+        if root_path is not None:
+            where.append("root_path = ?")
+            params.append(str(root_path))
+
+        if created_from_utc is not None:
+            where.append("created_at >= ?")
+            params.append(str(created_from_utc))
+
+        if created_to_utc is not None:
+            where.append("created_at <= ?")
+            params.append(str(created_to_utc))
+
+        if limit is not None:
+            if isinstance(limit, bool) or int(limit) < 1:
+                raise ValueError("limit debe ser >= 1")
+            normalized_limit = int(limit)
+        else:
+            normalized_limit = None
+
+        sql = """
+            SELECT id, uuid, root_path, origin_node_id, status, error,
+                   total_size, total_files, created_at
+            FROM snapshots
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC, id DESC"
+        if normalized_limit is not None:
+            sql += " LIMIT ?"
+            params.append(normalized_limit)
+
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [_snapshot_record_from_row(row) for row in rows]
+
+    def get_snapshot(self, selector: int | str) -> SnapshotRecord | None:
+        """Obtiene un snapshot por ID local o UUID estable."""
+        if isinstance(selector, bool):
+            raise ValueError("selector de snapshot no válido")
+        if isinstance(selector, int):
+            if selector < 1:
+                raise ValueError("snapshot id debe ser >= 1")
+            field = "id"
+            value: object = selector
+        else:
+            value = str(selector).strip()
+            if not value:
+                raise ValueError("snapshot uuid no puede estar vacío")
+            field = "uuid"
+
+        row = self.conn.execute(
+            f"""
+            SELECT id, uuid, root_path, origin_node_id, status, error,
+                   total_size, total_files, created_at
+            FROM snapshots
+            WHERE {field} = ?
+            """,
+            (value,),
+        ).fetchone()
+        return None if row is None else _snapshot_record_from_row(row)
 
 
     def get_snapshot_uuid(self, snapshot_id: int) -> str | None:
@@ -3319,6 +3422,23 @@ class MetadataDB:
 
 
 _HASH64_ALPHABET = set("0123456789abcdef")
+
+
+def _snapshot_record_from_row(row: sqlite3.Row) -> SnapshotRecord:
+    created_at = row["created_at"]
+    if created_at is None:
+        raise MetadataDatabaseError("snapshot con created_at nulo")
+    return SnapshotRecord(
+        id=int(row["id"]),
+        uuid=str(row["uuid"]),
+        root_path=str(row["root_path"]),
+        origin_node_id=str(row["origin_node_id"]),
+        status=str(row["status"]),
+        error=None if row["error"] is None else str(row["error"]),
+        total_size=int(row["total_size"]),
+        total_files=int(row["total_files"]),
+        created_at=str(created_at),
+    )
 
 
 def _unique_hashes(values: Iterable[str]) -> tuple[str, ...]:

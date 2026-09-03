@@ -111,6 +111,13 @@ Crear un snapshot local:
 stopan backup /ruta/a/datos
 ```
 
+Consultar los snapshots registrados en el catálogo local:
+
+```bash
+stopan snapshot list
+stopan snapshot show <SNAPSHOT_ID_O_UUID>
+```
+
 `backup` no envía datos a otros nodos. Para proteger los datos fuera del nodo origen hay que ejecutar `push`:
 
 ```bash

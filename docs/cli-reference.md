@@ -31,6 +31,8 @@ stopan backup --help
 | Comando | Modifica estado | Usa red | Propósito | Nota principal |
 |---|---:|---:|---|---|
 | `backup` | Sí | Opcional | Crea un snapshot local | No replica datos. |
+| `snapshot list` | No | No | Lista snapshots del catálogo local | Admite filtros de estado, raíz, intervalo temporal y cantidad. |
+| `snapshot show` | No | No | Inspecciona un snapshot | Acepta ID local o UUID. |
 | `push` | Sí | Sí | Protege datos en nodos remotos | Usa `replication` o `ec`. |
 | `verify` | Sí | Sí | Audita protección remota | Puede marcar estado degradado. |
 | `restore` | Sí | Opcional | Reconstruye un snapshot | Usa red solo si `--remote-recovery` no es `none`. |
@@ -211,6 +213,67 @@ WORKERS debe ser al menos 1.
 SOURCE_PATH debe existir y ser un directorio.
 --desired-remote-copies puede ser 0 o mayor.
 ```
+
+
+## `stopan snapshot`
+
+`stopan snapshot` consulta los snapshots registrados en el catálogo SQLite local.
+
+### Listado
+
+Uso:
+
+```bash
+stopan snapshot list [opciones]
+```
+
+Sin filtros, devuelve los snapshots del catálogo ordenados del más reciente al más antiguo. La salida incluye ID local, fecha de creación en UTC, estado, número de archivos, tamaño lógico y ruta raíz.
+
+Filtros disponibles:
+
+```bash
+--status CREATING|COMPLETE|FAILED
+--root PATH
+--from DATE_OR_TIMESTAMP
+--to DATE_OR_TIMESTAMP
+--last N
+```
+
+`--status` puede repetirse para combinar varios estados.
+
+`--root` compara la ruta raíz exacta después de resolverla a una ruta absoluta.
+
+`--from` y `--to` aceptan una fecha `YYYY-MM-DD` o un timestamp ISO 8601 con zona horaria. Cuando `--to` recibe solo una fecha, incluye el día UTC completo. Si se proporcionan ambos límites, `--from` no puede ser posterior a `--to`.
+
+`--last N` limita el resultado a los `N` snapshots más recientes después de aplicar los demás filtros y exige `N >= 1`.
+
+Ejemplos:
+
+```bash
+stopan snapshot list
+stopan snapshot list --status COMPLETE --last 5
+stopan snapshot list --root /srv/datos
+stopan snapshot list --from 2026-09-01 --to 2026-09-03
+```
+
+### Inspección
+
+Uso:
+
+```bash
+stopan snapshot show SNAPSHOT
+```
+
+`SNAPSHOT` puede ser un ID local positivo o el UUID estable de la captura. La salida muestra ID, UUID, estado, fecha de creación en UTC, ruta raíz, nodo origen, número de archivos, tamaño lógico y, cuando existe, el error registrado.
+
+Ejemplos:
+
+```bash
+stopan snapshot show 12
+stopan snapshot show <SNAPSHOT_UUID>
+```
+
+Si no existe una captura con el selector indicado, el comando devuelve un error de datos controlado.
 
 ## `stopan push`
 
@@ -1337,6 +1400,8 @@ metadata pack discover
 metadata pack verify
 metadata pack local-list
 node status
+snapshot list
+snapshot show
 gc TARGET --dry-run
 ```
 
